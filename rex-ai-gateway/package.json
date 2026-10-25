@@ -1,0 +1,22 @@
+{
+  "name": "rex-ai-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin allowlisted tool gateway that creates Twenty people, companies, and opportunities.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "start:twenty": "node --env-file=.env --import tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}
