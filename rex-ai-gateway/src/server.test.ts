@@ -174,6 +174,70 @@ describe('POST /v1/ai/act', () => {
     expect(client.created).toHaveLength(0);
   });
 
+  it('refuses a negative opportunity amount and does not create', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Difference Engine', amount: -12000 },
+        },
+      ],
+    });
+
+    expect(response.status).toBe(400);
+    expect(payload).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'invalid_request',
+      toolName: 'create_opportunity',
+    });
+    expect(client.created).toHaveLength(0);
+  });
+
+  it('refuses a non-numeric opportunity amount and does not create', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await openGateway(client);
+
+    const textAmount = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Difference Engine', amount: 'abc' },
+        },
+      ],
+    });
+    const booleanAmount = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Difference Engine', amount: true },
+        },
+      ],
+    });
+
+    expect(textAmount.response.status).toBe(400);
+    expect(textAmount.payload).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'invalid_request',
+      toolName: 'create_opportunity',
+    });
+    expect(booleanAmount.response.status).toBe(400);
+    expect(booleanAmount.payload).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'invalid_request',
+      toolName: 'create_opportunity',
+    });
+    expect(client.created).toHaveLength(0);
+  });
+
   it('refuses an intent that does not name a person fully', async () => {
     const client = createMockTwentyCrmClient();
     const gateway = await openGateway(client);

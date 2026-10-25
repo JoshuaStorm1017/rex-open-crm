@@ -221,19 +221,31 @@ function optionalAmount(
     return undefined;
   }
 
-  const value = args.amount;
-  const numeric =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())
-        ? Number(value.trim())
-        : undefined;
+  const amount = readNonNegativeAmount(args.amount);
 
-  if (numeric === undefined || !Number.isFinite(numeric) || numeric < 0) {
-    return invalidField('create_opportunity', 'amount');
+  if (amount === undefined) {
+    return refusal(
+      'invalid_request',
+      'Refusing create_opportunity: amount must be a finite number greater than or equal to 0.',
+      { toolName: 'create_opportunity' },
+    );
   }
 
-  return numeric;
+  return amount;
+}
+
+// A present amount that is not a finite number >= 0 is refused. Never substitute 0.
+function readNonNegativeAmount(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  }
+
+  if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())) {
+    const numeric = Number(value.trim());
+    return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
+  }
+
+  return undefined;
 }
 
 function readString(
