@@ -17,13 +17,13 @@ export const FIELD_METADATA_NAMES: Record<UpdatableObjectName, Record<string, re
     linkedin: ['linkedinLink'],
     address: ['address'],
     city: ['address'],
-    accountOwner: ['accountOwnerId'],
+    accountOwner: ['accountOwner'],
   },
   opportunity: {
     name: ['name'],
     stage: ['stage'],
     amount: ['amount'],
     closeDate: ['closeDate'],
-    owner: ['ownerId'],
+    owner: ['owner'],
   },
 };
