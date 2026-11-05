@@ -20,6 +20,7 @@ export async function compensate(
 ): Promise<CompensateFailure[]> {
   const remaining: CompensateFailure[] = [];
   const reversedInThisPass = new Set<string>();
+  let halt = false;
 
   for (const { effect, index } of effects
     .map((effect, index) => ({ effect, index }))
@@ -27,18 +28,30 @@ export async function compensate(
     const key = `${effect.objectName}:${effect.id}`;
 
     try {
-      if (!shouldContinue()) {
+      if (halt || !shouldContinue()) {
+        halt = true;
         remaining.push({ index, id: effect.id, reason: 'superseded' });
         continue;
       }
 
       if (effect.kind === 'archived') {
+        if (!shouldContinue()) {
+          halt = true;
+          remaining.push({ index, id: effect.id, reason: 'superseded' });
+          continue;
+        }
+
         await client.restoreRecord({
           workspaceId,
           objectName: effect.objectName,
           id: effect.id,
           ifMatch: effect.etag,
         });
+
+        if (!shouldContinue()) {
+          halt = true;
+        }
+
         continue;
       }
 
@@ -62,12 +75,23 @@ export async function compensate(
           }
         }
 
+        if (!shouldContinue()) {
+          halt = true;
+          remaining.push({ index, id: effect.id, reason: 'superseded' });
+          continue;
+        }
+
         await client.deleteRecord({
           workspaceId,
           objectName: effect.objectName,
           id: effect.id,
           ...(effect.etag ? { ifMatch: effect.etag } : {}),
         });
+
+        if (!shouldContinue()) {
+          halt = true;
+        }
+
         continue;
       }
 
@@ -114,6 +138,12 @@ export async function compensate(
 
       reversedInThisPass.add(key);
 
+      if (!shouldContinue()) {
+        halt = true;
+        remaining.push({ index, id: effect.id, reason: 'superseded' });
+        continue;
+      }
+
       if (effect.previous === null) {
         await client.clearRecordField({
           workspaceId,
@@ -122,6 +152,11 @@ export async function compensate(
           field: effect.field,
           ifMatch: current.etag,
         });
+
+        if (!shouldContinue()) {
+          halt = true;
+        }
+
         continue;
       }
 
@@ -133,6 +168,10 @@ export async function compensate(
         value: effect.previous,
         ifMatch: current.etag,
       });
+
+      if (!shouldContinue()) {
+        halt = true;
+      }
     } catch (error) {
       if (effect.kind === 'created' && error instanceof CrmNotFoundError) {
         continue;

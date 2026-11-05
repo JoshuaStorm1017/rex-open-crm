@@ -43,6 +43,12 @@ export type AiProposalWarning = {
   message: string;
 };
 
+export type AiProposalCreate = {
+  objectName: 'person' | 'company';
+  label: string;
+  summary: string;
+};
+
 export type AiProposal = {
   id: string;
   summary: string;
@@ -51,6 +57,7 @@ export type AiProposal = {
   choice?: AiProposalChoice;
   changes?: AiProposalChange[];
   warnings?: AiProposalWarning[];
+  creates?: AiProposalCreate[];
 };
 
 export type AiAnswerRecord = {
@@ -65,9 +72,15 @@ export type AiAnswer = {
   records: AiAnswerRecord[];
 };
 
+export type AiSkillParameter = {
+  name: string;
+  label: string;
+};
+
 export type AiPlanView = {
   proposal?: AiProposal;
   answer?: AiAnswer;
+  parameters?: AiSkillParameter[];
 };
 
 export type AiRecordLink = {
@@ -97,6 +110,12 @@ export type AiSkill = {
   id: string;
   name: string;
   tools: string[];
+  parameters?: string[];
+};
+
+export type AiCaptureImage = {
+  mediaType: 'image/jpeg' | 'image/png' | 'image/webp';
+  data: string;
 };
 
 export type AiCaptureSource = 'card' | 'voice';
@@ -119,6 +138,7 @@ export const proposeAiCommand = async (
   fetchImpl: FetchImpl,
   openRecord?: AiOpenRecord,
   onPartial?: (lines: AiProposalLine[]) => void,
+  onRead?: (records: AiAnswerRecord[]) => void,
 ): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
@@ -131,6 +151,8 @@ export const proposeAiCommand = async (
     fetchImpl,
     undefined,
     onPartial,
+    undefined,
+    onRead,
   );
 
   if (payload.kind !== 'data') {
@@ -222,13 +244,18 @@ export const proposeAiCapture = async (
   source: AiCaptureSource,
   text: string,
   fetchImpl: FetchImpl,
+  image?: AiCaptureImage,
 ): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/plan',
     {
       workspaceId: config.workspaceId,
-      capture: { source, text },
+      capture: {
+        source,
+        ...(text.length > 0 ? { text } : {}),
+        ...(image ? { image } : {}),
+      },
     },
     fetchImpl,
   );
@@ -240,6 +267,7 @@ export const proposeAiSkill = async (
   config: AiCommandBarConfig,
   skillId: string,
   fetchImpl: FetchImpl,
+  parameterValues?: Record<string, string | number>,
 ): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
@@ -247,6 +275,7 @@ export const proposeAiSkill = async (
     {
       workspaceId: config.workspaceId,
       skillId,
+      ...(parameterValues ? { parameterValues } : {}),
     },
     fetchImpl,
   );
@@ -259,6 +288,7 @@ export const saveAiSkill = async (
   skillName: string,
   confirmedPlanId: string,
   fetchImpl: FetchImpl,
+  blanks?: string[],
 ): Promise<AiCommandOutcome<AiSkill>> => {
   const payload = await postAiCommand(
     config,
@@ -267,6 +297,7 @@ export const saveAiSkill = async (
       workspaceId: config.workspaceId,
       skillName,
       confirmedPlanId,
+      ...(blanks && blanks.length > 0 ? { blanks } : {}),
     },
     fetchImpl,
   );
@@ -402,12 +433,13 @@ const postAiCommand = async (
   idempotencyKey?: string,
   onPartial?: (lines: AiProposalLine[]) => void,
   onProgress?: (message: string) => void,
+  onRead?: (records: AiAnswerRecord[]) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
   };
 
-  if (onPartial || onProgress) {
+  if (onPartial || onProgress || onRead) {
     headers.accept = 'text/event-stream';
   }
 
@@ -439,7 +471,7 @@ const postAiCommand = async (
   if (contentType.includes('text/event-stream')) {
     return onProgress
       ? readActStream(response, onProgress)
-      : readPlanStream(response, onPartial);
+      : readPlanStream(response, onPartial, onRead);
   }
 
   let payload: unknown;
@@ -472,6 +504,7 @@ const postAiCommand = async (
 const readPlanStream = async (
   response: Response,
   onPartial?: (lines: AiProposalLine[]) => void,
+  onRead?: (records: AiAnswerRecord[]) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const body = response.body;
 
@@ -511,6 +544,16 @@ const readPlanStream = async (
 
         if (lines && onPartial) {
           onPartial(lines);
+        }
+
+        continue;
+      }
+
+      if (event.name === 'read') {
+        const records = readReadRecords(event.data);
+
+        if (records && onRead) {
+          onRead(records);
         }
 
         continue;
@@ -689,6 +732,10 @@ const readPlan = (payload: unknown): AiPlanView | undefined => {
     payload.proposal === undefined ? undefined : readProposal(payload);
   const answer =
     payload.answer === undefined ? undefined : readAnswer(payload.answer);
+  const parameters =
+    payload.parameters === undefined
+      ? undefined
+      : readParameters(payload.parameters);
 
   if (payload.proposal !== undefined && !proposal) {
     return undefined;
@@ -698,14 +745,54 @@ const readPlan = (payload: unknown): AiPlanView | undefined => {
     return undefined;
   }
 
-  if (!proposal && !answer) {
+  if (payload.parameters !== undefined && !parameters) {
+    return undefined;
+  }
+
+  if (!proposal && !answer && !parameters) {
     return undefined;
   }
 
   return {
     ...(proposal ? { proposal } : {}),
     ...(answer ? { answer } : {}),
+    ...(parameters ? { parameters } : {}),
   };
+};
+
+const readParameters = (value: unknown): AiSkillParameter[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const parameters: AiSkillParameter[] = [];
+
+  for (const item of value) {
+    if (
+      !isPlainObject(item) ||
+      typeof item.name !== 'string' ||
+      typeof item.label !== 'string'
+    ) {
+      return undefined;
+    }
+
+    parameters.push({ name: item.name, label: item.label });
+  }
+
+  return parameters;
+};
+
+const readReadRecords = (payload: unknown): AiAnswerRecord[] | undefined => {
+  if (!isPlainObject(payload) || !Array.isArray(payload.records)) {
+    return undefined;
+  }
+
+  const answer = readAnswer({
+    summary: 'Reading…',
+    records: payload.records,
+  });
+
+  return answer?.records;
 };
 
 const readAnswer = (value: unknown): AiAnswer | undefined => {
@@ -785,12 +872,17 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
 
   const changes = readChanges(payload.proposal.changes);
   const warnings = readWarnings(payload.proposal.warnings);
+  const creates = readCreates(payload.proposal.creates);
 
   if (payload.proposal.changes !== undefined && !changes) {
     return undefined;
   }
 
   if (payload.proposal.warnings !== undefined && !warnings) {
+    return undefined;
+  }
+
+  if (payload.proposal.creates !== undefined && !creates) {
     return undefined;
   }
 
@@ -802,7 +894,35 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     ...(choice ? { choice } : {}),
     ...(changes && changes.length > 0 ? { changes } : {}),
     ...(warnings && warnings.length > 0 ? { warnings } : {}),
+    ...(creates && creates.length > 0 ? { creates } : {}),
   };
+};
+
+const readCreates = (value: unknown): AiProposalCreate[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const creates: AiProposalCreate[] = [];
+
+  for (const create of value) {
+    if (
+      !isPlainObject(create) ||
+      (create.objectName !== 'person' && create.objectName !== 'company') ||
+      typeof create.label !== 'string' ||
+      typeof create.summary !== 'string'
+    ) {
+      return undefined;
+    }
+
+    creates.push({
+      objectName: create.objectName,
+      label: create.label,
+      summary: create.summary,
+    });
+  }
+
+  return creates;
 };
 
 const readChanges = (value: unknown): AiProposalChange[] | undefined => {
@@ -1037,8 +1157,18 @@ const readSkill = (payload: unknown): AiSkill | undefined => {
   const toolNames = tools.filter(
     (tool): tool is string => typeof tool === 'string',
   );
+  const parameters = Array.isArray(payload.skill.parameters)
+    ? payload.skill.parameters.filter(
+        (parameter): parameter is string => typeof parameter === 'string',
+      )
+    : undefined;
 
-  return { id, name, tools: toolNames };
+  return {
+    id,
+    name,
+    tools: toolNames,
+    ...(parameters && parameters.length > 0 ? { parameters } : {}),
+  };
 };
 
 const readUndo = (payload: unknown): AiUndo | undefined => {

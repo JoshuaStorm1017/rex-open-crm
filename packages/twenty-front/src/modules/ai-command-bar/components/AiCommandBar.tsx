@@ -5,6 +5,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { isPlainObject } from 'twenty-shared/utils';
 import { themeCssVariables } from 'twenty-ui/theme';
 
+import { aiCommandBarCreatePreviewState } from '@/ai-command-bar/states/aiCommandBarCreatePreviewState';
 import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   executeAiCommand,
@@ -16,6 +17,8 @@ import {
   saveAiSkill,
   undoAiCommand,
   type AiAnswer,
+  type AiAnswerRecord,
+  type AiCaptureImage,
   type AiCaptureSource,
   type AiCommandOutcome,
   type AiPlanView,
@@ -23,6 +26,7 @@ import {
   type AiProposalLine,
   type AiRecordLink,
   type AiSkill,
+  type AiSkillParameter,
   type AiUndo,
 } from '@/ai-command-bar/utils/aiCommandBarClient';
 import { useSetAtomState } from '@/ui/utilities/state/jotai/hooks/useSetAtomState';
@@ -39,7 +43,19 @@ import { RootStackingContextZIndices } from '@/ui/layout/constants/RootStackingC
 
 type Phase =
   | { name: 'compose'; draft: string; notice?: string }
-  | { name: 'planning'; draft: string; lines: AiProposalLine[] }
+  | {
+      name: 'planning';
+      draft: string;
+      lines: AiProposalLine[];
+      records: AiAnswerRecord[];
+    }
+  | {
+      name: 'fill';
+      draft: string;
+      skillId: string;
+      parameters: AiSkillParameter[];
+      values: Record<string, string>;
+    }
   | {
       name: 'preview';
       draft: string;
@@ -103,8 +119,32 @@ export const AiCommandBar = ({
   const [captureOpen, setCaptureOpen] = useState(false);
   const [captureSource, setCaptureSource] = useState<AiCaptureSource>('card');
   const [captureText, setCaptureText] = useState('');
+  const [captureImage, setCaptureImage] = useState<
+    AiCaptureImage | undefined
+  >();
+  const [skillBlanks, setSkillBlanks] = useState<string[]>([]);
   const canListen = speechRecognitionAvailable();
+  const parameterLabel = (name: string): string => {
+    if (name === 'city') {
+      return t`City`;
+    }
+
+    if (name === 'amount') {
+      return t`Amount`;
+    }
+
+    if (name === 'stage') {
+      return t`Stage`;
+    }
+
+    return name;
+  };
   const setFieldPreview = useSetAtomState(aiCommandBarFieldPreviewState);
+  const setCreatePreview = useSetAtomState(aiCommandBarCreatePreviewState);
+  const clearPreviews = () => {
+    setFieldPreview([]);
+    setCreatePreview([]);
+  };
   const executing = phase.name === 'executing' || phase.name === 'undoing';
   const busy = phase.name === 'planning' || executing;
 
@@ -126,6 +166,7 @@ export const AiCommandBar = ({
   useEffect(() => {
     if (!open) {
       setFieldPreview([]);
+      setCreatePreview([]);
       setPhase({ name: 'compose', draft: '' });
 
       if (wasOpen) {
@@ -137,7 +178,7 @@ export const AiCommandBar = ({
 
     setWasOpen(true);
     inputRef.current?.focus();
-  }, [open, setFieldPreview, wasOpen]);
+  }, [open, setCreatePreview, setFieldPreview, wasOpen]);
 
   useEffect(() => {
     if (!open) {
@@ -236,8 +277,8 @@ export const AiCommandBar = ({
       input.dataset.generation = generation;
     }
 
-    setFieldPreview([]);
-    setPhase({ name: 'planning', draft, lines: [] });
+    clearPreviews();
+    setPhase({ name: 'planning', draft, lines: [], records: [] });
 
     const outcome = await proposeAiCommand(
       resolvedConfig,
@@ -249,7 +290,20 @@ export const AiCommandBar = ({
           return;
         }
 
-        setPhase({ name: 'planning', draft, lines });
+        setPhase((current) =>
+          current.name === 'planning' ? { ...current, lines } : current,
+        );
+      },
+      (records) => {
+        if (generation !== readGeneration()) {
+          return;
+        }
+
+        setPhase((current) =>
+          current.name === 'planning'
+            ? { ...current, records: [...current.records, ...records] }
+            : current,
+        );
       },
     );
 
@@ -262,7 +316,7 @@ export const AiCommandBar = ({
 
   const showPlan = (draft: string, outcome: AiCommandOutcome<AiPlanView>) => {
     if (outcome.kind === 'message' || outcome.kind === 'stale') {
-      setFieldPreview([]);
+      clearPreviews();
       setPhase({
         name: 'refused',
         draft,
@@ -275,7 +329,7 @@ export const AiCommandBar = ({
     }
 
     if (!outcome.data.proposal) {
-      setFieldPreview([]);
+      clearPreviews();
       setPhase({
         name: 'answer',
         draft,
@@ -288,6 +342,7 @@ export const AiCommandBar = ({
     }
 
     setFieldPreview(outcome.data.proposal.changes ?? []);
+    setCreatePreview(outcome.data.proposal.creates ?? []);
     setPhase({
       name: 'preview',
       draft,
@@ -303,7 +358,12 @@ export const AiCommandBar = ({
   ) => {
     const generation = readGeneration();
 
-    setPhase({ name: 'planning', draft: current.draft, lines: [] });
+    setPhase({
+      name: 'planning',
+      draft: current.draft,
+      lines: [],
+      records: [],
+    });
     const outcome = await reproposeAiCommand(
       resolvedConfig,
       current.proposal.id,
@@ -322,7 +382,7 @@ export const AiCommandBar = ({
   const previewCapture = async () => {
     const text = captureText.trim();
 
-    if (text.length === 0) {
+    if (text.length === 0 && !captureImage) {
       return;
     }
 
@@ -333,13 +393,14 @@ export const AiCommandBar = ({
       input.dataset.generation = generation;
     }
 
-    setFieldPreview([]);
-    setPhase({ name: 'planning', draft: '', lines: [] });
+    clearPreviews();
+    setPhase({ name: 'planning', draft: '', lines: [], records: [] });
     const outcome = await proposeAiCapture(
       resolvedConfig,
       captureSource,
       text,
       fetchImpl,
+      captureImage,
     );
 
     if (generation !== readGeneration()) {
@@ -373,15 +434,97 @@ export const AiCommandBar = ({
       input.dataset.generation = generation;
     }
 
-    setFieldPreview([]);
-    setPhase({ name: 'planning', draft: skill.name, lines: [] });
+    clearPreviews();
+    if (skill.parameters && skill.parameters.length > 0) {
+      setPhase({
+        name: 'fill',
+        draft: skill.name,
+        skillId: skill.id,
+        parameters: skill.parameters.map((name) => ({
+          name,
+          label: parameterLabel(name),
+        })),
+        values: {},
+      });
+      return;
+    }
+
+    setPhase({ name: 'planning', draft: skill.name, lines: [], records: [] });
     const outcome = await proposeAiSkill(resolvedConfig, skill.id, fetchImpl);
 
     if (generation !== readGeneration()) {
       return;
     }
 
+    if (
+      outcome.kind === 'data' &&
+      outcome.data.parameters &&
+      !outcome.data.proposal
+    ) {
+      setPhase({
+        name: 'fill',
+        draft: skill.name,
+        skillId: skill.id,
+        parameters: outcome.data.parameters,
+        values: {},
+      });
+      return;
+    }
+
     showPlan(skill.name, outcome);
+  };
+
+  const previewFilledSkill = async (
+    current: Extract<Phase, { name: 'fill' }>,
+  ) => {
+    const parameterValues: Record<string, string | number> = {};
+
+    for (const parameter of current.parameters) {
+      const raw = current.values[parameter.name]?.trim() ?? '';
+
+      if (raw.length === 0) {
+        return;
+      }
+
+      if (parameter.name === 'amount') {
+        const amount = Number(raw);
+
+        if (!Number.isFinite(amount) || amount < 0) {
+          setPhase({
+            name: 'refused',
+            draft: current.draft,
+            message: t`Amount must be a number.`,
+          });
+          return;
+        }
+
+        parameterValues.amount = amount;
+        continue;
+      }
+
+      parameterValues[parameter.name] = raw;
+    }
+
+    const generation = readGeneration();
+
+    setPhase({
+      name: 'planning',
+      draft: current.draft,
+      lines: [],
+      records: [],
+    });
+    const outcome = await proposeAiSkill(
+      resolvedConfig,
+      current.skillId,
+      fetchImpl,
+      parameterValues,
+    );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    showPlan(current.draft, outcome);
   };
 
   const saveSkill = async (current: Extract<Phase, { name: 'done' }>) => {
@@ -396,6 +539,7 @@ export const AiCommandBar = ({
       name,
       current.confirmedPlanId,
       fetchImpl,
+      skillBlanks,
     );
 
     if (outcome.kind !== 'data') {
@@ -407,6 +551,7 @@ export const AiCommandBar = ({
     }
 
     setSkills((currentSkills) => [outcome.data, ...currentSkills]);
+    setSkillBlanks([]);
     setSkillName('');
     setPhase({
       ...current,
@@ -447,6 +592,41 @@ export const AiCommandBar = ({
   };
 
   const readCardFile = (file: File) => {
+    const imageType = captureImageType(file);
+
+    if (imageType) {
+      if (file.size > 750_000) {
+        setPhase((current) =>
+          current.name === 'compose'
+            ? {
+                ...current,
+                notice: t`That photo is too large. Paste the card text or a vCard.`,
+              }
+            : current,
+        );
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result !== 'string') {
+          return;
+        }
+
+        const data = reader.result.split(',')[1];
+
+        if (!data) {
+          return;
+        }
+
+        setCaptureSource('card');
+        setCaptureText('');
+        setCaptureImage({ mediaType: imageType, data });
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
     const textFile =
       file.type.startsWith('text') ||
       file.name.endsWith('.txt') ||
@@ -457,7 +637,7 @@ export const AiCommandBar = ({
         current.name === 'compose'
           ? {
               ...current,
-              notice: t`Paste the card text. A photo is not read.`,
+              notice: t`Paste the card text or choose a JPEG, PNG, or WebP photo.`,
             }
           : current,
       );
@@ -468,6 +648,7 @@ export const AiCommandBar = ({
     reader.onload = () => {
       if (typeof reader.result === 'string') {
         setCaptureSource('card');
+        setCaptureImage(undefined);
         setCaptureText(reader.result.slice(0, 2000));
       }
     };
@@ -524,12 +705,12 @@ export const AiCommandBar = ({
     }
 
     if (outcome.kind === 'message') {
-      setFieldPreview([]);
+      clearPreviews();
       setPhase({ name: 'refused', draft, message: outcome.message });
       return;
     }
 
-    setFieldPreview([]);
+    clearPreviews();
     setPhase({
       name: 'done',
       links: outcome.data.links,
@@ -600,7 +781,7 @@ export const AiCommandBar = ({
   };
 
   const cancelPreview = (draft: string) => {
-    setFieldPreview([]);
+    clearPreviews();
     setPhase({
       name: 'compose',
       draft,
@@ -721,7 +902,11 @@ export const AiCommandBar = ({
                 text={captureText}
                 canListen={canListen}
                 onSource={setCaptureSource}
-                onText={setCaptureText}
+                onText={(value) => {
+                  setCaptureText(value);
+                  setCaptureImage(undefined);
+                }}
+                hasImage={captureImage !== undefined}
                 onFile={readCardFile}
                 onListen={listen}
                 onPreview={() => void previewCapture()}
@@ -743,6 +928,52 @@ export const AiCommandBar = ({
                     ))}
                   </StyledList>
                 )}
+                {phase.records.length > 0 && (
+                  <StyledList>
+                    {phase.records.map((record) => (
+                      <li key={`${record.objectName}-${record.id}`}>
+                        {record.label}
+                        {record.detail ? ` — ${record.detail}` : ''}
+                      </li>
+                    ))}
+                  </StyledList>
+                )}
+              </>
+            )}
+            {phase.name === 'fill' && (
+              <>
+                <StyledNotice role="status">
+                  {t`Fill the open values before Confirm.`}
+                </StyledNotice>
+                {phase.parameters.map((parameter) => (
+                  <StyledInput
+                    key={parameter.name}
+                    aria-label={parameter.label}
+                    value={phase.values[parameter.name] ?? ''}
+                    onChange={(event) =>
+                      setPhase({
+                        ...phase,
+                        values: {
+                          ...phase.values,
+                          [parameter.name]: event.target.value,
+                        },
+                      })
+                    }
+                  />
+                ))}
+                <StyledActions>
+                  <StyledPrimary
+                    type="button"
+                    disabled={phase.parameters.some(
+                      (parameter) =>
+                        (phase.values[parameter.name]?.trim() ?? '').length ===
+                        0,
+                    )}
+                    onClick={() => void previewFilledSkill(phase)}
+                  >
+                    {t`Preview`}
+                  </StyledPrimary>
+                </StyledActions>
               </>
             )}
             {(phase.name === 'executing' || phase.name === 'undoing') && (
@@ -969,12 +1200,33 @@ export const AiCommandBar = ({
                   </StyledList>
                 )}
                 {phase.confirmedPlanId && (
-                  <StyledInput
-                    aria-label={t`Skill name`}
-                    value={skillName}
-                    placeholder={t`Name this skill`}
-                    onChange={(event) => setSkillName(event.target.value)}
-                  />
+                  <>
+                    <StyledInput
+                      aria-label={t`Skill name`}
+                      value={skillName}
+                      placeholder={t`Name this skill`}
+                      onChange={(event) => setSkillName(event.target.value)}
+                    />
+                    <StyledChoices>
+                      <legend>{t`Leave blank for next time`}</legend>
+                      {['city', 'amount', 'stage'].map((name) => (
+                        <label key={name}>
+                          <input
+                            type="checkbox"
+                            checked={skillBlanks.includes(name)}
+                            onChange={() =>
+                              setSkillBlanks((current) =>
+                                current.includes(name)
+                                  ? current.filter((item) => item !== name)
+                                  : [...current, name],
+                              )
+                            }
+                          />
+                          {parameterLabel(name)}
+                        </label>
+                      ))}
+                    </StyledChoices>
+                  </>
                 )}
                 <StyledActions>
                   {phase.confirmedPlanId && (
@@ -1210,6 +1462,28 @@ type SpeechRecognitionLike = {
   start: () => void;
 };
 
+const captureImageType = (
+  file: File,
+): AiCaptureImage['mediaType'] | undefined => {
+  if (
+    file.type === 'image/jpeg' ||
+    file.name.endsWith('.jpg') ||
+    file.name.endsWith('.jpeg')
+  ) {
+    return 'image/jpeg';
+  }
+
+  if (file.type === 'image/png' || file.name.endsWith('.png')) {
+    return 'image/png';
+  }
+
+  if (file.type === 'image/webp' || file.name.endsWith('.webp')) {
+    return 'image/webp';
+  }
+
+  return undefined;
+};
+
 const speechHost = (): {
   SpeechRecognition?: new () => SpeechRecognitionLike;
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
@@ -1236,6 +1510,7 @@ const CaptureFields = ({
   source,
   text,
   canListen,
+  hasImage,
   onSource,
   onText,
   onFile,
@@ -1245,6 +1520,7 @@ const CaptureFields = ({
   source: AiCaptureSource;
   text: string;
   canListen: boolean;
+  hasImage: boolean;
   onSource: (source: AiCaptureSource) => void;
   onText: (text: string) => void;
   onFile: (file: File) => void;
@@ -1288,7 +1564,7 @@ const CaptureFields = ({
           <input
             aria-label={t`Card file`}
             type="file"
-            accept="text/plain,.txt,.vcf,text/vcard"
+            accept="text/plain,.txt,.vcf,text/vcard,image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
             onChange={(event) => {
               const file = event.target.files?.[0];
 
@@ -1305,7 +1581,7 @@ const CaptureFields = ({
         )}
         <StyledPrimary
           type="button"
-          disabled={text.trim().length === 0}
+          disabled={text.trim().length === 0 && !hasImage}
           onClick={onPreview}
         >
           {t`Preview capture`}
@@ -1335,6 +1611,9 @@ const SkillList = ({
           <span>
             {skill.name}
             {skill.tools.length > 0 ? ` (${skill.tools.join(', ')})` : ''}
+            {skill.parameters && skill.parameters.length > 0
+              ? ` · ${skill.parameters.join(', ')}`
+              : ''}
           </span>{' '}
           <StyledSecondary type="button" onClick={() => onRun(skill)}>
             {t`Run`}

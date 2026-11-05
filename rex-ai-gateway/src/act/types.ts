@@ -1,3 +1,4 @@
+import type { SkillParameterPrompt } from './skill-parameters';
 import type { CreatedRecord } from '../twenty/twenty-crm-client';
 
 export const ALLOWED_TOOL_NAMES = [
@@ -51,8 +52,18 @@ export type ProposalChange = {
 };
 
 export type ProposalWarning = {
-  code: 'duplicate_email' | 'duplicate_name' | 'amount_mismatch';
+  code:
+    | 'duplicate_email'
+    | 'duplicate_name'
+    | 'duplicate_domain'
+    | 'amount_mismatch';
   message: string;
+};
+
+export type ProposalCreate = {
+  objectName: 'person' | 'company';
+  label: string;
+  summary: string;
 };
 
 export type PlanAnswerRecord = {
@@ -63,6 +74,12 @@ export type PlanAnswerRecord = {
 };
 
 export type PlanAnswer = {
+  summary: string;
+  records: PlanAnswerRecord[];
+};
+
+export type ReadEvent = {
+  tool: string;
   summary: string;
   records: PlanAnswerRecord[];
 };
@@ -208,6 +225,7 @@ export type PlanProposal = {
   choice?: PlanChoice;
   changes?: ProposalChange[];
   warnings?: ProposalWarning[];
+  creates?: ProposalCreate[];
 };
 
 export type PlanSuccess = {
@@ -216,6 +234,7 @@ export type PlanSuccess = {
   summary?: string;
   proposal?: PlanProposal;
   answer?: PlanAnswer;
+  parameters?: SkillParameterPrompt[];
 };
 
 export type PlanResult = PlanSuccess | ActRefusal | ActUpstreamFailure;

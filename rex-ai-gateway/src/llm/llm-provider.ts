@@ -1,6 +1,10 @@
+import type { CaptureImage } from '../act/parse-request';
 import type { ToolSchema } from '../act/tool-schema';
 import type { ActRefusal, ToolCall } from '../act/types';
-import type { TwentyCrmClient, TwentyObjectName } from '../twenty/twenty-crm-client';
+import type {
+  TwentyCrmClient,
+  TwentyObjectName,
+} from '../twenty/twenty-crm-client';
 
 export type LlmProposal = {
   ok: true;
@@ -35,5 +39,9 @@ export type LlmPlanInput = {
 
 export type LlmProvider = {
   plan: (input: LlmPlanInput) => Promise<LlmPlan>;
-  planStream?: (input: LlmPlanInput, emit: (tools: PartialToolCall[]) => void) => Promise<LlmPlan>;
+  planStream?: (
+    input: LlmPlanInput,
+    emit: (tools: PartialToolCall[]) => void,
+  ) => Promise<LlmPlan>;
+  readCard?: (image: CaptureImage) => Promise<string>;
 };

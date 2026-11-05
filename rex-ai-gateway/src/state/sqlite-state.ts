@@ -20,6 +20,7 @@ import {
   SkillStore,
   SKILL_LIMIT,
   CONFIRMED_PLAN_LIMIT,
+  CONFIRMED_PLAN_TTL_MS,
   summarize,
   type ConfirmedPlan,
   type SaveSkillResult,
@@ -451,9 +452,7 @@ class SqliteUndoStore extends UndoStore {
     }
 
     this.database
-      .prepare(
-        'DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?',
-      )
+      .prepare('DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?')
       .run(memberId, token);
     this.restrict();
   }
@@ -592,9 +591,7 @@ class SqliteUndoStore extends UndoStore {
       }
 
       this.database
-        .prepare(
-          'DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?',
-        )
+        .prepare('DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?')
         .run(memberId, token);
 
       if (undoId) {
@@ -677,6 +674,7 @@ class SqliteSkillStore extends SkillStore {
     memberId: string,
     workspaceId: string,
     tools: ToolCall[],
+    now = Date.now(),
   ): ConfirmedPlan | undefined {
     const stored = cloneTools(tools);
 
@@ -684,12 +682,13 @@ class SqliteSkillStore extends SkillStore {
       return undefined;
     }
 
+    this.deleteExpiredPlans(now);
     const plan: ConfirmedPlan = {
       id: `confirmed_${randomUUID()}`,
       memberId,
       workspaceId,
       tools: stored,
-      createdAt: Date.now(),
+      createdAt: now,
     };
     this.database
       .prepare(
@@ -718,7 +717,9 @@ class SqliteSkillStore extends SkillStore {
   override readConfirmed(
     id: string,
     memberId: string,
+    now = Date.now(),
   ): ConfirmedPlan | undefined {
+    this.deleteExpiredPlans(now);
     const row = this.database
       .prepare(
         `SELECT workspace_id, tools_json, created_at FROM confirmed_plans
@@ -747,6 +748,13 @@ class SqliteSkillStore extends SkillStore {
     };
   }
 
+  private deleteExpiredPlans(now: number): void {
+    this.database
+      .prepare('DELETE FROM confirmed_plans WHERE created_at <= ?')
+      .run(now - CONFIRMED_PLAN_TTL_MS);
+    this.restrict();
+  }
+
   override saveSkill(
     memberId: string,
     workspaceId: string,
@@ -759,27 +767,6 @@ class SqliteSkillStore extends SkillStore {
       return { ok: false, reason: 'empty' };
     }
 
-    const duplicate = this.database
-      .prepare(
-        `SELECT id FROM skills
-         WHERE member_id = ? AND workspace_id = ? AND lower(name) = lower(?)`,
-      )
-      .get(memberId, workspaceId, name) as { id: string } | undefined;
-
-    if (duplicate) {
-      return { ok: false, reason: 'duplicate' };
-    }
-
-    const count = this.database
-      .prepare(
-        'SELECT COUNT(*) AS count FROM skills WHERE member_id = ? AND workspace_id = ?',
-      )
-      .get(memberId, workspaceId) as { count: number } | undefined;
-
-    if ((count?.count ?? 0) >= SKILL_LIMIT) {
-      return { ok: false, reason: 'full' };
-    }
-
     const skill: StoredSkill = {
       id: `skill_${randomUUID()}`,
       memberId,
@@ -788,19 +775,60 @@ class SqliteSkillStore extends SkillStore {
       tools: stored,
       createdAt: Date.now(),
     };
-    this.database
-      .prepare(
-        `INSERT INTO skills (id, member_id, workspace_id, name, tools_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        skill.id,
-        skill.memberId,
-        skill.workspaceId,
-        skill.name,
-        JSON.stringify(skill.tools),
-        skill.createdAt,
-      );
+    this.database.exec('BEGIN IMMEDIATE');
+
+    try {
+      const duplicate = this.database
+        .prepare(
+          `SELECT id FROM skills
+           WHERE member_id = ? AND workspace_id = ? AND name = ? COLLATE NOCASE`,
+        )
+        .get(memberId, workspaceId, name) as { id: string } | undefined;
+
+      if (duplicate) {
+        this.database.exec('ROLLBACK');
+        return { ok: false, reason: 'duplicate' };
+      }
+
+      const count = this.database
+        .prepare(
+          'SELECT COUNT(*) AS count FROM skills WHERE member_id = ? AND workspace_id = ?',
+        )
+        .get(memberId, workspaceId) as { count: number } | undefined;
+
+      if ((count?.count ?? 0) >= SKILL_LIMIT) {
+        this.database.exec('ROLLBACK');
+        return { ok: false, reason: 'full' };
+      }
+
+      this.database
+        .prepare(
+          `INSERT INTO skills (id, member_id, workspace_id, name, tools_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          skill.id,
+          skill.memberId,
+          skill.workspaceId,
+          skill.name,
+          JSON.stringify(skill.tools),
+          skill.createdAt,
+        );
+      this.database.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // The transaction was already closed.
+      }
+
+      if (isUniqueConstraint(error)) {
+        return { ok: false, reason: 'duplicate' };
+      }
+
+      throw error;
+    }
+
     this.restrict();
 
     return { ok: true, skill };
@@ -1076,6 +1104,16 @@ function migrateGatewayState(database: DatabaseSync): void {
     );
   }
 
+  database.exec(`
+    DELETE FROM skills
+    WHERE rowid NOT IN (
+      SELECT MIN(rowid) FROM skills
+      GROUP BY member_id, workspace_id, name COLLATE NOCASE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS skills_member_name
+      ON skills (member_id, workspace_id, name COLLATE NOCASE);
+  `);
+
   const legacy = database
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'undo_tickets'",
@@ -1091,6 +1129,12 @@ function migrateGatewayState(database: DatabaseSync): void {
     SELECT id, member_id, workspace_id, summary, effects_json, 0 FROM undo_tickets;
     DELETE FROM undo_tickets;
   `);
+}
+
+function isUniqueConstraint(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message.includes('UNIQUE constraint failed')
+  );
 }
 
 function ticketFromRow(

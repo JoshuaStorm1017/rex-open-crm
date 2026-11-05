@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { isRecord } from '../is-record';
+import { parametersIn } from '../act/skill-parameters';
 import type { ToolCall } from '../act/types';
 
 export const SKILL_LIMIT = 20;
 export const CONFIRMED_PLAN_LIMIT = 40;
+export const CONFIRMED_PLAN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type StoredSkill = {
   id: string;
@@ -27,6 +29,7 @@ export type SkillSummary = {
   id: string;
   name: string;
   tools: string[];
+  parameters?: string[];
 };
 
 export type SaveSkillResult =
@@ -41,6 +44,7 @@ export class SkillStore {
     memberId: string,
     workspaceId: string,
     tools: ToolCall[],
+    now = Date.now(),
   ): ConfirmedPlan | undefined {
     const stored = cloneTools(tools);
 
@@ -48,12 +52,13 @@ export class SkillStore {
       return undefined;
     }
 
+    this.dropExpired(now);
     const plan: ConfirmedPlan = {
       id: `confirmed_${randomUUID()}`,
       memberId,
       workspaceId,
       tools: stored,
-      createdAt: Date.now(),
+      createdAt: now,
     };
     this.confirmed.push(plan);
 
@@ -64,7 +69,13 @@ export class SkillStore {
     return plan;
   }
 
-  readConfirmed(id: string, memberId: string): ConfirmedPlan | undefined {
+  readConfirmed(
+    id: string,
+    memberId: string,
+    now = Date.now(),
+  ): ConfirmedPlan | undefined {
+    this.dropExpired(now);
+
     return this.confirmed.find(
       (plan) => plan.id === id && plan.memberId === memberId,
     );
@@ -125,13 +136,28 @@ export class SkillStore {
       (skill) => skill.id === id && skill.memberId === memberId,
     );
   }
+
+  private dropExpired(now: number): void {
+    const cutoff = now - CONFIRMED_PLAN_TTL_MS;
+
+    for (let index = this.confirmed.length - 1; index >= 0; index -= 1) {
+      const plan = this.confirmed[index];
+
+      if (plan && plan.createdAt <= cutoff) {
+        this.confirmed.splice(index, 1);
+      }
+    }
+  }
 }
 
 export function summarize(skill: StoredSkill): SkillSummary {
+  const parameters = parametersIn(skill.tools);
+
   return {
     id: skill.id,
     name: skill.name,
     tools: skill.tools.map((tool) => tool.name),
+    ...(parameters.length > 0 ? { parameters } : {}),
   };
 }
 

@@ -11,6 +11,7 @@ import {
   type ActUpstreamFailure,
   type PlanAnswer,
   type PlanAnswerRecord,
+  type ReadEvent,
 } from './types';
 import type { ValidatedTool } from './validate-tool';
 
@@ -27,27 +28,35 @@ export async function answerReads(
   client: TwentyCrmClient,
   workspaceId: string,
   tools: ValidatedTool[],
+  onRead?: (event: ReadEvent) => void,
 ): Promise<PlanAnswer | ActRefusal | ActUpstreamFailure> {
-  const records: PlanAnswerRecord[] = [];
-  const parts: string[] = [];
+  for (const tool of tools) {
+    if (!isReadTool(tool)) {
+      return refusal(
+        'invalid_request',
+        'A write cannot be answered without Confirm.',
+        { toolName: tool.name },
+      );
+    }
+  }
+
+  let settled: Array<{
+    index: number;
+    summary: string;
+    records: PlanAnswerRecord[];
+  }>;
 
   try {
-    for (const tool of tools) {
-      if (!isReadTool(tool)) {
-        return refusal(
-          'invalid_request',
-          'A write cannot be answered without Confirm.',
-          { toolName: tool.name },
-        );
-      }
+    settled = await Promise.all(
+      tools.map(async (tool, index) => {
+        const found = await runRead(client, workspaceId, tool);
+        const records = found.map(toAnswerRecord);
+        const summary = describeTool(tool).summary.replace(/\.$/, '');
+        onRead?.({ tool: tool.name, summary, records });
 
-      const found = await runRead(client, workspaceId, tool);
-      parts.push(describeTool(tool).summary.replace(/\.$/, ''));
-
-      for (const record of found) {
-        records.push(toAnswerRecord(record));
-      }
-    }
+        return { index, summary, records };
+      }),
+    );
   } catch (error) {
     if (error instanceof UnsafeSearchQueryError) {
       return refusal('invalid_request', error.message, {
@@ -58,6 +67,9 @@ export async function answerReads(
     return upstreamFailure(error, 0);
   }
 
+  settled.sort((left, right) => left.index - right.index);
+  const parts = settled.map((item) => item.summary);
+  const records = settled.flatMap((item) => item.records);
   const summary =
     records.length === 0
       ? `${parts.join(' ')}. No matching records.`

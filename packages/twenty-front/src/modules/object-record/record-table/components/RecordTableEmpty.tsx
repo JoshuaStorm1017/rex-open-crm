@@ -13,6 +13,7 @@ import { RecordTableColumnWidthStyle } from '@/object-record/record-table/compon
 import { getRecordTableHtmlId } from '@/object-record/record-table/utils/getRecordTableHtmlId';
 import { useRecordTableContextOrThrow } from '@/object-record/record-table/contexts/RecordTableContext';
 import { RecordTableEmptyState } from '@/object-record/record-table/empty-state/components/RecordTableEmptyState';
+import { AiRecordTableGhostRowsConnected } from '@/ai-command-bar/components/AiRecordTableGhostRows';
 import { RecordTableHeader } from '@/object-record/record-table/record-table-header/components/RecordTableHeader';
 import { recordTableWidthComponentState } from '@/object-record/record-table/states/recordTableWidthComponentState';
 import { resizedFieldMetadataIdComponentState } from '@/object-record/record-table/states/resizedFieldMetadataIdComponentState';
@@ -132,6 +133,7 @@ export const RecordTableEmpty = ({ tableBodyRef }: RecordTableEmptyProps) => {
         {/* An empty table has no cells to reveal, so the header would only add
             a horizontal scroll to a screen with nothing to scroll to. */}
         {!isMobile && <RecordTableHeader />}
+        <AiRecordTableGhostRowsConnected />
       </RecordTableStyleWrapper>
       <RecordTableEmptyState />
       <RecordTableColumnWidthEffect />

@@ -1,6 +1,10 @@
 import { isRecord } from '../is-record';
 import { WORKSPACE_ID_PATTERN } from './find-foreign-workspace-id';
 import {
+  isSkillParameterName,
+  type SkillParameterName,
+} from './skill-parameters';
+import {
   MAX_TOOLS_PER_REQUEST,
   refusal,
   type ActRefusal,
@@ -15,15 +19,23 @@ const SKILL_ID_PATTERN = /^skill_[0-9a-f-]{36}$/;
 const CONFIRMED_PLAN_ID_PATTERN = /^confirmed_[0-9a-f-]{36}$/;
 const SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .'-]{0,39}$/;
 const MAX_CAPTURE_CHARS = 2000;
+const MAX_IMAGE_CHARS = 1_000_000;
+const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 
 export type OpenRecordContext = {
   objectName: 'person' | 'company' | 'opportunity';
   recordId: string;
 };
 
+export type CaptureImage = {
+  mediaType: (typeof IMAGE_MEDIA_TYPES)[number];
+  data: string;
+};
+
 export type CaptureRequest = {
   source: 'card' | 'voice';
-  text: string;
+  text?: string;
+  image?: CaptureImage;
 };
 
 export type ParsedRequest = {
@@ -40,6 +52,8 @@ export type ParsedRequest = {
   skillId?: string;
   skillName?: string;
   confirmedPlanId?: string;
+  blanks?: SkillParameterName[];
+  parameterValues?: Partial<Record<SkillParameterName, string | number>>;
 };
 
 const MAX_INTENT_CHARS = 500;
@@ -203,6 +217,18 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     );
   }
 
+  const blanks = parseBlanks(body.blanks);
+
+  if (blanks && 'refused' in blanks) {
+    return blanks;
+  }
+
+  const parameterValues = parseParameterValues(body.parameterValues);
+
+  if (parameterValues && 'refused' in parameterValues) {
+    return parameterValues;
+  }
+
   return {
     workspaceId: body.workspaceId,
     ...(tools ? { tools } : {}),
@@ -223,6 +249,8 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     ...(typeof body.confirmedPlanId === 'string'
       ? { confirmedPlanId: body.confirmedPlanId }
       : {}),
+    ...(blanks && blanks.length > 0 ? { blanks } : {}),
+    ...(parameterValues ? { parameterValues } : {}),
   };
 }
 
@@ -239,21 +267,172 @@ function parseCapture(value: unknown): CaptureRequest | undefined | ActRefusal {
     return refusal('invalid_request', 'capture.source must be card or voice.');
   }
 
-  if (typeof value.text !== 'string') {
-    return refusal('invalid_request', 'capture.text must be a string.');
+  const image = parseCaptureImage(value.image);
+
+  if (image && 'refused' in image) {
+    return image;
   }
 
-  const text = value.text.trim();
+  if (image && value.source !== 'card') {
+    return refusal('invalid_request', 'A photo is only read from a card.');
+  }
 
-  if (text.length === 0 || text.length > MAX_CAPTURE_CHARS) {
+  let text: string | undefined;
+
+  if (value.text !== undefined) {
+    if (typeof value.text !== 'string') {
+      return refusal('invalid_request', 'capture.text must be a string.');
+    }
+
+    text = value.text.trim();
+
+    if (text.length === 0 || text.length > MAX_CAPTURE_CHARS) {
+      return refusal(
+        'invalid_request',
+        `capture.text must be 1–${MAX_CAPTURE_CHARS} characters.`,
+      );
+    }
+  }
+
+  if (!text && !image) {
     return refusal(
       'invalid_request',
-      `capture.text must be 1–${MAX_CAPTURE_CHARS} characters.`,
+      'capture needs card text, a vCard, or a photo.',
     );
   }
 
-  return { source: value.source, text };
+  return {
+    source: value.source,
+    ...(text ? { text } : {}),
+    ...(image ? { image } : {}),
+  };
 }
+
+function parseCaptureImage(
+  value: unknown,
+): CaptureImage | undefined | ActRefusal {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    return refusal('invalid_request', 'capture.image must be an object.');
+  }
+
+  if (
+    typeof value.mediaType !== 'string' ||
+    !IMAGE_MEDIA_TYPES.includes(
+      value.mediaType as (typeof IMAGE_MEDIA_TYPES)[number],
+    )
+  ) {
+    return refusal(
+      'invalid_request',
+      'capture.image.mediaType must be image/jpeg, image/png, or image/webp.',
+    );
+  }
+
+  if (
+    typeof value.data !== 'string' ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(value.data)
+  ) {
+    return refusal('invalid_request', 'capture.image.data must be base64.');
+  }
+
+  if (value.data.length > MAX_IMAGE_CHARS) {
+    return refusal(
+      'invalid_request',
+      'That photo is too large. Paste the card text or a vCard.',
+    );
+  }
+
+  return {
+    mediaType: value.mediaType as CaptureImage['mediaType'],
+    data: value.data,
+  };
+}
+
+function parseBlanks(
+  value: unknown,
+): SkillParameterName[] | undefined | ActRefusal {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value) || value.length > SKILL_PARAMETER_LIMIT) {
+    return refusal(
+      'invalid_request',
+      'blanks must list city, amount, or stage.',
+    );
+  }
+
+  const blanks: SkillParameterName[] = [];
+
+  for (const item of value) {
+    if (typeof item !== 'string' || !isSkillParameterName(item)) {
+      return refusal(
+        'invalid_request',
+        'blanks must list city, amount, or stage.',
+      );
+    }
+
+    if (!blanks.includes(item)) {
+      blanks.push(item);
+    }
+  }
+
+  return blanks;
+}
+
+function parseParameterValues(
+  value: unknown,
+):
+  | Partial<Record<SkillParameterName, string | number>>
+  | undefined
+  | ActRefusal {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    return refusal('invalid_request', 'parameterValues must be an object.');
+  }
+
+  const values: Partial<Record<SkillParameterName, string | number>> = {};
+
+  for (const [key, raw] of Object.entries(value)) {
+    if (!isSkillParameterName(key)) {
+      return refusal(
+        'invalid_request',
+        'parameterValues only accepts city, amount, or stage.',
+      );
+    }
+
+    if (key === 'amount') {
+      if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) {
+        return refusal(
+          'invalid_request',
+          'parameterValues.amount must be a non-negative number.',
+        );
+      }
+
+      values.amount = raw;
+      continue;
+    }
+
+    if (typeof raw !== 'string' || raw.trim().length === 0 || raw.length > 80) {
+      return refusal(
+        'invalid_request',
+        `parameterValues.${key} must be 1–80 characters.`,
+      );
+    }
+
+    values[key] = raw.trim();
+  }
+
+  return values;
+}
+
+const SKILL_PARAMETER_LIMIT = 3;
 
 function parseChoices(
   value: unknown,
