@@ -1,16 +1,39 @@
 import { randomUUID } from 'node:crypto';
 
 import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
-import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import type {
+  CreatedRecord,
+  TwentyCrmClient,
+} from '../twenty/twenty-crm-client';
 import type { ProposalStore } from '../http/proposal-store';
 import type { LlmProvider } from '../llm/llm-provider';
 import { bindOpenRecord } from './bind-open-record';
-import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, createToolsForGroup, matchDetail, matchLabel } from './create-new-choice';
+import {
+  CREATE_NEW_CHOICE_ID,
+  createNewLabel,
+  createNewTools,
+  createToolsForGroup,
+  matchDetail,
+  matchLabel,
+} from './create-new-choice';
 import { groundModelPlan } from './ground-model-plan';
 import { loadVisibleSnapshot, publicVisibleRecords } from './visible-snapshot';
-import type { ChoiceGroup, PendingBatch, PendingBatchStep, PendingChoice } from './pending-choice';
-import { assertToolPermitted, catalogForAudience, loadAudience, type AudienceLoad } from './permissions';
+import type {
+  ChoiceGroup,
+  PendingBatch,
+  PendingBatchStep,
+  PendingChoice,
+} from './pending-choice';
+import {
+  assertToolPermitted,
+  catalogForAudience,
+  loadAudience,
+  type AudienceLoad,
+} from './permissions';
+import { answerReads, isReadTool } from './answer-reads';
 import { describeTool, summarizeLines } from './describe-tool';
+import { changesFromSlots } from './preview-changes';
+import { collectWarnings } from './preview-warnings';
 import type { PartialToolCall } from '../llm/llm-provider';
 import { parseGatewayRequest, type OpenRecordContext } from './parse-request';
 import {
@@ -19,10 +42,13 @@ import {
   upstreamFailure,
   type ActRefusal,
   type ActUpstreamFailure,
+  type PlanAnswer,
   type PlanChoiceCandidate,
   type PlanProposal,
   type PlanResult,
+  type ProposalChange,
   type ProposalLine,
+  type ProposalWarning,
   type ToolCall,
 } from './types';
 import { validateTool, type ValidatedTool } from './validate-tool';
@@ -47,7 +73,10 @@ export async function proposeAct(
     return parsed;
   }
 
-  const workspaceRefusal = rejectForeignWorkspace(parsed.workspaceId, options.boundWorkspaceId);
+  const workspaceRefusal = rejectForeignWorkspace(
+    parsed.workspaceId,
+    options.boundWorkspaceId,
+  );
 
   if (workspaceRefusal) {
     return workspaceRefusal;
@@ -60,14 +89,26 @@ export async function proposeAct(
     return catalog;
   }
 
-  const openRecord = await loadOpenRecord(client, parsed.workspaceId, parsed.openRecord, parsed);
+  const openRecord = await loadOpenRecord(
+    client,
+    parsed.workspaceId,
+    parsed.openRecord,
+    parsed,
+  );
 
   if (openRecord && 'refused' in openRecord) {
     return openRecord;
   }
 
   if (parsed.tools && parsed.tools.length > 0) {
-    return previewTools(client, parsed.workspaceId, parsed.tools, options, audience, openRecord);
+    return previewTools(
+      client,
+      parsed.workspaceId,
+      parsed.tools,
+      options,
+      audience,
+      openRecord,
+    );
   }
 
   if (parsed.intent === undefined || parsed.intent.trim().length === 0) {
@@ -75,20 +116,38 @@ export async function proposeAct(
   }
 
   let planned;
-  const snapshot = await loadVisibleSnapshot(client, parsed.workspaceId, audience);
+  const snapshot = await loadVisibleSnapshot(
+    client,
+    parsed.workspaceId,
+    audience,
+  );
+  const allowed = new Set<string>(catalog.tools.map((tool) => tool.name));
   const planInput = {
     intent: parsed.intent,
     workspaceId: parsed.workspaceId,
     client,
     catalog,
     visibleRecords: publicVisibleRecords(snapshot),
-    ...(openRecord ? { openRecord: { objectName: openRecord.objectName, label: openRecord.label } } : {}),
+    ...(openRecord
+      ? {
+          openRecord: {
+            objectName: openRecord.objectName,
+            label: openRecord.label,
+          },
+        }
+      : {}),
   };
+
+  const emitPartial = options.onPartial
+    ? (tools: PartialToolCall[]) => {
+        options.onPartial?.(tools.filter((tool) => allowed.has(tool.name)));
+      }
+    : undefined;
 
   try {
     planned =
-      options.onPartial && llm.planStream
-        ? await llm.planStream(planInput, options.onPartial)
+      emitPartial && llm.planStream
+        ? await llm.planStream(planInput, emitPartial)
         : await llm.plan(planInput);
   } catch (error) {
     return upstreamFailure(error, 0);
@@ -99,7 +158,10 @@ export async function proposeAct(
   }
 
   if (planned.tools.length === 0) {
-    return refusal('unmapped_intent', 'The model response did not include tools.');
+    return refusal(
+      'unmapped_intent',
+      'The model response did not include tools.',
+    );
   }
 
   if (planned.tools.length > MAX_TOOLS_PER_REQUEST) {
@@ -115,7 +177,14 @@ export async function proposeAct(
     return grounded;
   }
 
-  return previewTools(client, parsed.workspaceId, grounded, options, audience, openRecord);
+  return previewTools(
+    client,
+    parsed.workspaceId,
+    grounded,
+    options,
+    audience,
+    openRecord,
+  );
 }
 
 async function loadOpenRecord(
@@ -124,7 +193,10 @@ async function loadOpenRecord(
   openRecord: OpenRecordContext | undefined,
   parsed: { tools?: unknown[]; intent?: string },
 ): Promise<
-  (OpenRecordContext & { label: string }) | undefined | ActRefusal | ActUpstreamFailure
+  | (OpenRecordContext & { label: string })
+  | undefined
+  | ActRefusal
+  | ActUpstreamFailure
 > {
   if (!openRecord) {
     return undefined;
@@ -140,7 +212,8 @@ async function loadOpenRecord(
         typeof (tool as { args?: unknown }).args === 'object' &&
         (tool as { args?: { recordRef?: unknown } }).args?.recordRef === 'open',
     );
-  const intentOnly = parsed.intent !== undefined && (!parsed.tools || parsed.tools.length === 0);
+  const intentOnly =
+    parsed.intent !== undefined && (!parsed.tools || parsed.tools.length === 0);
   const needed = toolsUseOpenRecord || intentOnly;
 
   if (!needed) {
@@ -157,7 +230,9 @@ async function loadOpenRecord(
     return { ...openRecord, label: record.label };
   } catch (error) {
     if (error instanceof CrmNotFoundError) {
-      return refusal('not_found', 'The open record was not found.', { toolName: 'update_record' });
+      return refusal('not_found', 'The open record was not found.', {
+        toolName: 'update_record',
+      });
     }
 
     return upstreamFailure(error, 0);
@@ -196,12 +271,42 @@ async function previewTools(
     validated.push(assignActor(bound, options.actorMemberId));
   }
 
+  const reads = validated.filter(isReadTool);
+  const writes = validated.filter((tool) => !isReadTool(tool));
+  let answer: PlanAnswer | undefined;
+
+  if (reads.length > 0) {
+    const answered = await answerReads(client, workspaceId, reads);
+
+    if ('reason' in answered) {
+      return answered;
+    }
+
+    answer = answered;
+  }
+
+  if (writes.length === 0) {
+    return {
+      ok: true,
+      workspaceId,
+      summary: answer?.summary ?? 'No matching records.',
+      ...(answer ? { answer } : {}),
+    };
+  }
+
   const memberId = options.memberId ?? 'member_direct';
   const slots: PreviewSlot[] = [];
   const bulkTools = new Set<ValidatedTool>();
+  let changes: ProposalChange[] = [];
+  let warnings: ProposalWarning[] = [];
 
   try {
-    const expanded = await expandMatchingUpdates(client, workspaceId, validated, bulkTools);
+    const expanded = await expandMatchingUpdates(
+      client,
+      workspaceId,
+      writes,
+      bulkTools,
+    );
 
     if ('refused' in expanded) {
       return expanded;
@@ -231,13 +336,18 @@ async function previewTools(
         ...(current.record ? { record: current.record } : {}),
       });
     }
+
+    changes = changesFromSlots(slots);
+    warnings = await collectWarnings(client, workspaceId, slots);
   } catch (error) {
     if (error instanceof CrmNotFoundError) {
       return refusal('not_found', error.message, { toolName: 'update_record' });
     }
 
     if (error instanceof CrmPreconditionError) {
-      return refusal('precondition_failed', error.message, { toolName: 'update_record' });
+      return refusal('precondition_failed', error.message, {
+        toolName: 'update_record',
+      });
     }
 
     return upstreamFailure(error, 0);
@@ -245,12 +355,27 @@ async function previewTools(
 
   const choiceCount = slots.filter((slot) => slot.type === 'choice').length;
 
+  const extras = { changes, warnings };
+
   if (choiceCount === 1 && slots.length === 1 && slots[0]?.type === 'choice') {
-    return storeChoice(workspaceId, memberId, slots[0].draft, options.proposals);
+    return withAnswer(
+      storeChoice(workspaceId, memberId, slots[0].draft, options.proposals),
+      answer,
+    );
   }
 
   if (choiceCount > 0) {
-    return storeBatch(workspaceId, memberId, slots, options.proposals, bulkTools);
+    return withAnswer(
+      storeBatch(
+        workspaceId,
+        memberId,
+        slots,
+        options.proposals,
+        bulkTools,
+        extras,
+      ),
+      answer,
+    );
   }
 
   const lines: ProposalLine[] = [];
@@ -263,11 +388,25 @@ async function previewTools(
     }
 
     markChained(slot.tool, seenRecord);
-    lines.push(describeTool(slot.tool, slot.record, { disambiguate: bulkTools.has(slot.tool) }));
+    lines.push(
+      describeTool(slot.tool, slot.record, {
+        disambiguate: bulkTools.has(slot.tool),
+      }),
+    );
     normalized.push(toolCallFromValidated(slot.tool));
   }
 
-  return storePreview(workspaceId, memberId, normalized, lines, options.proposals);
+  return withAnswer(
+    storePreview(
+      workspaceId,
+      memberId,
+      normalized,
+      lines,
+      options.proposals,
+      extras,
+    ),
+    answer,
+  );
 }
 
 async function expandMatchingUpdates(
@@ -292,12 +431,19 @@ async function expandMatchingUpdates(
     });
 
     if (matches.length === 0) {
-      return refusal('not_found', `No ${tool.input.objectName} matches “${tool.input.query ?? ''}”.`, {
-        toolName: tool.name,
-      });
+      return refusal(
+        'not_found',
+        `No ${tool.input.objectName} matches “${tool.input.query ?? ''}”.`,
+        {
+          toolName: tool.name,
+        },
+      );
     }
 
-    if (matches.length > MAX_TOOLS_PER_REQUEST || expanded.length + matches.length > MAX_TOOLS_PER_REQUEST) {
+    if (
+      matches.length > MAX_TOOLS_PER_REQUEST ||
+      expanded.length + matches.length > MAX_TOOLS_PER_REQUEST
+    ) {
       return refusal(
         'invalid_request',
         `This matches ${matches.length} ${tool.input.objectName} records. A preview lists at most ${MAX_TOOLS_PER_REQUEST}. Narrow the query. Nothing was written.`,
@@ -323,7 +469,10 @@ async function expandMatchingUpdates(
   return expanded;
 }
 
-function assignActor(tool: ValidatedTool, actorMemberId: string | undefined): ValidatedTool {
+function assignActor(
+  tool: ValidatedTool,
+  actorMemberId: string | undefined,
+): ValidatedTool {
   if (tool.name !== 'update_record' || tool.input.value !== 'me') {
     return tool;
   }
@@ -363,13 +512,17 @@ async function resolveNamedRecord(
   if (
     !query ||
     hasId ||
-    (tool.name !== 'update_record' && tool.name !== 'create_note' && tool.name !== 'archive_record')
+    (tool.name !== 'update_record' &&
+      tool.name !== 'create_note' &&
+      tool.name !== 'archive_record')
   ) {
     return tool;
   }
 
   const objectName =
-    tool.name === 'create_note' ? tool.input.targetObject : tool.input.objectName;
+    tool.name === 'create_note'
+      ? tool.input.targetObject
+      : tool.input.objectName;
   const matches = await client.searchRecords({
     workspaceId,
     objectName,
@@ -387,15 +540,23 @@ async function resolveNamedRecord(
     const draft: Omit<PendingChoice, 'candidates' | 'createTools' | 'query'> & {
       query: string;
     } = {
-      kind: tool.name === 'create_note' ? 'note' : tool.name === 'archive_record' ? 'archive' : 'update',
+      kind:
+        tool.name === 'create_note'
+          ? 'note'
+          : tool.name === 'archive_record'
+            ? 'archive'
+            : 'update',
       objectName,
       field: tool.name === 'update_record' ? tool.input.field : '',
       value: tool.name === 'update_record' ? tool.input.value : '',
-      ...(tool.name === 'create_note' && tool.input.title ? { title: tool.input.title } : {}),
+      ...(tool.name === 'create_note' && tool.input.title
+        ? { title: tool.input.title }
+        : {}),
       body: tool.name === 'create_note' ? tool.input.body : '',
       query,
     };
-    const createTools = draft.kind === 'archive' ? undefined : createNewTools(draft);
+    const createTools =
+      draft.kind === 'archive' ? undefined : createNewTools(draft);
 
     return {
       choice: {
@@ -409,7 +570,13 @@ async function resolveNamedRecord(
             etag: record.etag,
           })),
           ...(createTools
-            ? [{ id: CREATE_NEW_CHOICE_ID, label: createNewLabel(draft), etag: 'create' }]
+            ? [
+                {
+                  id: CREATE_NEW_CHOICE_ID,
+                  label: createNewLabel(draft),
+                  etag: 'create',
+                },
+              ]
             : []),
         ],
       },
@@ -419,18 +586,29 @@ async function resolveNamedRecord(
   const match = matches[0];
 
   if (!match) {
-    return refusal('not_found', `No ${objectName} matches “${query}”.`, { toolName: tool.name });
+    return refusal('not_found', `No ${objectName} matches “${query}”.`, {
+      toolName: tool.name,
+    });
   }
 
   if (tool.name === 'update_record') {
-    return { ...tool, input: { ...tool.input, id: match.id, query: undefined } };
+    return {
+      ...tool,
+      input: { ...tool.input, id: match.id, query: undefined },
+    };
   }
 
   if (tool.name === 'archive_record') {
-    return { ...tool, input: { ...tool.input, id: match.id, query: undefined } };
+    return {
+      ...tool,
+      input: { ...tool.input, id: match.id, query: undefined },
+    };
   }
 
-  return { ...tool, input: { ...tool.input, targetId: match.id, targetQuery: undefined } };
+  return {
+    ...tool,
+    input: { ...tool.input, targetId: match.id, targetQuery: undefined },
+  };
 }
 
 function storeChoice(
@@ -447,7 +625,10 @@ function storeChoice(
         ? 'companies'
         : 'opportunities';
   const named = choice.query ? ` “${choice.query}”` : '';
-  const createHint = choice.createTools && choice.createTools.length > 0 ? ', or create a new one' : '';
+  const createHint =
+    choice.createTools && choice.createTools.length > 0
+      ? ', or create a new one'
+      : '';
   const summary = `Several ${objectLabel} match${named}. Choose one${createHint}, then confirm.`;
 
   if (proposals && !stored) {
@@ -471,7 +652,9 @@ function storeChoice(
             : choice.kind === 'archive'
               ? 'archive_record'
               : 'update_record',
-        summary: candidate.detail ? `${candidate.label} · ${candidate.detail}` : candidate.label,
+        summary: candidate.detail
+          ? `${candidate.label} · ${candidate.detail}`
+          : candidate.label,
       })),
       choice: {
         prompt: summary,
@@ -479,7 +662,10 @@ function storeChoice(
           id: candidate.id,
           label: candidate.label,
           objectName: choice.objectName,
-          action: candidate.id === CREATE_NEW_CHOICE_ID ? ('create' as const) : ('use' as const),
+          action:
+            candidate.id === CREATE_NEW_CHOICE_ID
+              ? ('create' as const)
+              : ('use' as const),
           ...(candidate.detail ? { detail: candidate.detail } : {}),
         })),
       },
@@ -492,7 +678,10 @@ async function enrichUpdate(
   workspaceId: string,
   tool: ValidatedTool,
 ): Promise<{ record?: CreatedRecord } | ActRefusal> {
-  if ((tool.name !== 'update_record' && tool.name !== 'archive_record') || !tool.input.id) {
+  if (
+    (tool.name !== 'update_record' && tool.name !== 'archive_record') ||
+    !tool.input.id
+  ) {
     return {};
   }
 
@@ -529,12 +718,17 @@ function toolCallFromValidated(tool: ValidatedTool): ToolCall {
     };
   }
 
-  if (tool.name === 'search_notes' || tool.name === 'search_tasks' || tool.name === 'search_activities') {
+  if (
+    tool.name === 'search_notes' ||
+    tool.name === 'search_tasks' ||
+    tool.name === 'search_activities'
+  ) {
     return {
       name: tool.name,
       args: {
         query: tool.input.query,
         limit: tool.input.limit,
+        ...(tool.input.recordId ? { recordId: tool.input.recordId } : {}),
       },
     };
   }
@@ -600,6 +794,7 @@ function storePreview(
   tools: ToolCall[],
   lines: ProposalLine[],
   proposals: ProposalStore | undefined,
+  extras?: PreviewExtras,
 ): PlanResult {
   const stored = proposals?.save(memberId, workspaceId, tools);
 
@@ -618,8 +813,38 @@ function storePreview(
       summary: summarizeLines(lines),
       tools,
       lines,
+      ...previewExtras(extras),
     },
   };
+}
+
+type PreviewExtras = {
+  changes?: ProposalChange[];
+  warnings?: ProposalWarning[];
+};
+
+function previewExtras(
+  extras: PreviewExtras | undefined,
+): Pick<PlanProposal, 'changes' | 'warnings'> {
+  return {
+    ...(extras?.changes && extras.changes.length > 0
+      ? { changes: extras.changes }
+      : {}),
+    ...(extras?.warnings && extras.warnings.length > 0
+      ? { warnings: extras.warnings }
+      : {}),
+  };
+}
+
+function withAnswer(
+  result: PlanResult,
+  answer: PlanAnswer | undefined,
+): PlanResult {
+  if (!result.ok || !answer) {
+    return result;
+  }
+
+  return { ...result, answer };
 }
 
 function storeBatch(
@@ -628,6 +853,7 @@ function storeBatch(
   slots: PreviewSlot[],
   proposals: ProposalStore | undefined,
   bulkTools: Set<ValidatedTool>,
+  extras?: PreviewExtras,
 ): PlanResult {
   const groups: Array<ChoiceGroup & { key: string }> = [];
   const steps: PendingBatchStep[] = [];
@@ -637,7 +863,11 @@ function storeBatch(
   for (const slot of slots) {
     if (slot.type === 'ready') {
       markChained(slot.tool, seenRecord);
-      lines.push(describeTool(slot.tool, slot.record, { disambiguate: bulkTools.has(slot.tool) }));
+      lines.push(
+        describeTool(slot.tool, slot.record, {
+          disambiguate: bulkTools.has(slot.tool),
+        }),
+      );
       steps.push({ type: 'tool', tool: toolCallFromValidated(slot.tool) });
       continue;
     }
@@ -664,14 +894,20 @@ function storeBatch(
     }
 
     group.updates.push({ field: slot.draft.field, value: slot.draft.value });
-    steps.push({ type: 'choice', groupId: group.id, updateIndex: group.updates.length - 1 });
+    steps.push({
+      type: 'choice',
+      groupId: group.id,
+      updateIndex: group.updates.length - 1,
+    });
   }
 
   for (const group of groups) {
     const createTools = createToolsForGroup(group);
     group.createTools = createTools;
     if (!createTools) {
-      group.candidates = group.candidates.filter((candidate) => candidate.id !== CREATE_NEW_CHOICE_ID);
+      group.candidates = group.candidates.filter(
+        (candidate) => candidate.id !== CREATE_NEW_CHOICE_ID,
+      );
     }
   }
 
@@ -716,6 +952,7 @@ function storeBatch(
       summary,
       tools: [],
       lines,
+      ...previewExtras(extras),
       choice: {
         prompt: summary,
         candidates: publicGroups[0]?.candidates ?? [],
@@ -733,7 +970,10 @@ function groupPrompt(group: ChoiceGroup): string {
         ? 'companies'
         : 'opportunities';
   const named = group.query ? ` “${group.query}”` : '';
-  const createHint = group.createTools && group.createTools.length > 0 ? ', or create a new one' : '';
+  const createHint =
+    group.createTools && group.createTools.length > 0
+      ? ', or create a new one'
+      : '';
   const fields =
     group.kind === 'update' && group.updates.length > 1
       ? ` The ${group.updates.length} field changes use the record you pick.`
@@ -747,13 +987,19 @@ function toPublicCandidates(group: ChoiceGroup): PlanChoiceCandidate[] {
     id: candidate.id,
     label: candidate.label,
     objectName: group.objectName,
-    action: candidate.id === CREATE_NEW_CHOICE_ID ? ('create' as const) : ('use' as const),
+    action:
+      candidate.id === CREATE_NEW_CHOICE_ID
+        ? ('create' as const)
+        : ('use' as const),
     ...(candidate.detail ? { detail: candidate.detail } : {}),
   }));
 }
 
 function markChained(tool: ValidatedTool, seen: Set<string>): void {
-  if ((tool.name !== 'update_record' && tool.name !== 'archive_record') || !tool.input.id) {
+  if (
+    (tool.name !== 'update_record' && tool.name !== 'archive_record') ||
+    !tool.input.id
+  ) {
     return;
   }
 

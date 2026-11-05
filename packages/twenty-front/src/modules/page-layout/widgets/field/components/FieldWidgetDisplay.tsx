@@ -10,6 +10,7 @@ import { useRecordShowContainerActions } from '@/object-record/record-show/hooks
 import { getRecordFieldInputInstanceId } from '@/object-record/utils/getRecordFieldInputId';
 import { FieldWidgetCellEditModePortal } from '@/page-layout/widgets/field/components/FieldWidgetCellEditModePortal';
 import { FieldWidgetCellHoveredPortal } from '@/page-layout/widgets/field/components/FieldWidgetCellHoveredPortal';
+import { AiRecordFieldPreview } from '@/ai-command-bar/components/AiRecordFieldPreview';
 import { FieldWidgetInlineCell } from '@/page-layout/widgets/field/components/FieldWidgetInlineCell';
 import { fieldWidgetHoverComponentState } from '@/page-layout/widgets/field/states/fieldWidgetHoverComponentState';
 import { generateFieldWidgetInstanceId } from '@/page-layout/widgets/field/utils/generateFieldWidgetInstanceId';
@@ -100,6 +101,10 @@ export const FieldWidgetDisplay = ({
             }}
           >
             <FieldWidgetInlineCell instanceIdPrefix={instanceId} />
+            <AiRecordFieldPreview
+              recordId={recordId}
+              fieldName={fieldMetadataItem.name}
+            />
           </FieldContext.Provider>
         </StyledContainer>
 

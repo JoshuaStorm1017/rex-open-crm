@@ -50,14 +50,20 @@ describe('gateway guards', () => {
     expect(executed.response.status).toBe(200);
     expect(replayed.response.headers.get('idempotency-replayed')).toBe('true');
     expect(client.created).toHaveLength(3);
-    expect(client.created.some((record) => record.properties.name === 'Not Acme')).toBe(false);
+    expect(
+      client.created.some((record) => record.properties.name === 'Not Acme'),
+    ).toBe(false);
     expect(client.created[2]?.properties.amount).toBe(50000);
     expect(client.created[2]?.properties.companyId).toBe(client.created[0]?.id);
 
     const conflict = await post(
       gateway,
       '/v1/ai/act',
-      { workspaceId: 'ws_demo', confirmed: true, tools: [{ name: 'create_company', args: { name: 'Other' } }] },
+      {
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        tools: [{ name: 'create_company', args: { name: 'Other' } }],
+      },
       { 'idempotency-key': 'command-bar-demo-1' },
     );
 
@@ -96,25 +102,20 @@ describe('gateway guards', () => {
       name: 'Analytical Engines',
       domain: 'analytical.example',
     });
-    const foundPlan = await post(gateway, '/v1/ai/plan', {
+    const found = await post(gateway, '/v1/ai/plan', {
       workspaceId: 'ws_demo',
-      tools: [{ name: 'search_records', args: { object: 'company', query: 'Analytical' } }],
-    });
-    const foundProposalId =
-      isRecord(foundPlan.payload) &&
-      isRecord(foundPlan.payload.proposal) &&
-      typeof foundPlan.payload.proposal.id === 'string'
-        ? foundPlan.payload.proposal.id
-        : undefined;
-    const found = await post(gateway, '/v1/ai/act', {
-      workspaceId: 'ws_demo',
-      confirmed: true,
-      proposalId: foundProposalId,
+      tools: [
+        {
+          name: 'search_records',
+          args: { object: 'company', query: 'Analytical' },
+        },
+      ],
     });
 
     expect(found.response.status).toBe(200);
     expect(found.payload).toMatchObject({
-      results: [{ tool: 'search_records', status: 'found', records: [{ id: company.id, etag: 'v1' }] }],
+      ok: true,
+      answer: { records: [expect.objectContaining({ id: company.id })] },
     });
 
     const planned = await post(gateway, '/v1/ai/plan', {
@@ -161,7 +162,12 @@ describe('gateway guards', () => {
       tools: [
         {
           name: 'update_record',
-          args: { object: 'company', id: company.id, field: 'domain', value: 'old.example' },
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'domain',
+            value: 'old.example',
+          },
         },
       ],
     });
@@ -170,7 +176,10 @@ describe('gateway guards', () => {
     expect(client.created[0]?.properties.domain).toBe('engines.example');
     expect(client.created[0]?.etag).toBe('v3');
     expect(stale.response.status).toBe(412);
-    expect(stale.payload).toMatchObject({ refused: true, reason: 'precondition_failed' });
+    expect(stale.payload).toMatchObject({
+      refused: true,
+      reason: 'precondition_failed',
+    });
     expect(missing.payload).toMatchObject({
       refused: true,
       reason: 'confirmation_required',
@@ -230,7 +239,11 @@ describe('gateway guards', () => {
 
     expect(unchosen.payload).toMatchObject({ reason: 'confirmation_required' });
     expect(chosen.response.status).toBe(200);
-    expect(client.created.filter((record) => record.properties.domain === 'acme.example')).toHaveLength(1);
+    expect(
+      client.created.filter(
+        (record) => record.properties.domain === 'acme.example',
+      ),
+    ).toHaveLength(1);
 
     const locked = await openGateway(client, 'test-gateway-token');
     const denied = await post(locked, '/v1/ai/tools', {});
@@ -259,16 +272,21 @@ describe('gateway guards', () => {
     });
 
     expect(denied.response.status).toBe(401);
-    expect(denied.payload).toMatchObject({ refused: true, reason: 'unauthorized' });
+    expect(denied.payload).toMatchObject({
+      refused: true,
+      reason: 'unauthorized',
+    });
     expect(deniedAudit.status).toBe(401);
     expect(bearerOnly.status).toBe(401);
     expect(allowed.status).toBe(200);
     expect(allowedAudit.status).toBe(200);
     expect(evilOrigin.headers.get('access-control-allow-origin')).toBeNull();
-    expect(appOrigin.headers.get('access-control-allow-origin')).toBe('http://localhost:3001');
-    await expect(startGateway({ client, host: '0.0.0.0', port: 0 })).rejects.toThrow(
-      /REX_AI_GATEWAY_TOKEN/,
+    expect(appOrigin.headers.get('access-control-allow-origin')).toBe(
+      'http://localhost:3001',
     );
+    await expect(
+      startGateway({ client, host: '0.0.0.0', port: 0 }),
+    ).rejects.toThrow(/REX_AI_GATEWAY_TOKEN/);
     expect(catalog).toMatchObject({
       ok: true,
       tools: expect.arrayContaining([

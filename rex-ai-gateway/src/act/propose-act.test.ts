@@ -27,19 +27,29 @@ describe('proposeAct', () => {
         summary: expect.stringContaining('Create company'),
         tools: [
           { name: 'create_company', args: { name: 'Acme Corp' } },
-          { name: 'create_person', args: { firstName: 'Jane', lastName: 'Doe' } },
-          { name: 'create_opportunity', args: { amount: 50000, companyId: '$0', pointOfContactId: '$1' } },
+          {
+            name: 'create_person',
+            args: { firstName: 'Jane', lastName: 'Doe' },
+          },
+          {
+            name: 'create_opportunity',
+            args: { amount: 50000, companyId: '$0', pointOfContactId: '$1' },
+          },
         ],
       },
     });
     expect(client.created).toHaveLength(0);
 
-    if (!planned.ok) {
+    if (!planned.ok || !planned.proposal) {
       return;
     }
 
     const executed = await executeAct(
-      { workspaceId: 'ws_demo', confirmed: true, tools: planned.proposal.tools },
+      {
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        tools: planned.proposal.tools,
+      },
       client,
     );
 
@@ -65,7 +75,11 @@ describe('proposeAct', () => {
       llm,
     );
 
-    expect(planned).toMatchObject({ ok: false, refused: true, reason: 'unsafe_intent' });
+    expect(planned).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'unsafe_intent',
+    });
     expect(client.created).toHaveLength(0);
   });
 
@@ -95,7 +109,8 @@ describe('proposeAct', () => {
     const planned = await proposeAct(
       {
         workspaceId: 'ws_demo',
-        intent: 'update company named Analytical Engines set domain to engines.example',
+        intent:
+          'update company named Analytical Engines set domain to engines.example',
       },
       client,
       llm,
@@ -140,7 +155,11 @@ describe('proposeAct', () => {
       llm,
     );
 
-    expect(stale).toMatchObject({ ok: false, refused: true, reason: 'precondition_failed' });
+    expect(stale).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'precondition_failed',
+    });
     expect(client.created[0]?.properties.domain).toBe('analytical.example');
   });
 
@@ -156,7 +175,9 @@ describe('proposeAct', () => {
       async (url, init) => {
         expect(String(url)).toBe('https://llm.example/v1/chat/completions');
         expect(init?.redirect).toBe('error');
-        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer test-llm-key');
+        expect(new Headers(init?.headers).get('authorization')).toBe(
+          'Bearer test-llm-key',
+        );
         return new Response(
           JSON.stringify({
             choices: [

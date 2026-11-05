@@ -26,7 +26,8 @@ export function describeTool(
           ? ''
           : ` for ${formatMajor(tool.input.amount, tool.input.currencyCode ?? 'USD')}`;
       const linked =
-        tool.input.companyId?.startsWith('$') || tool.input.pointOfContactId?.startsWith('$')
+        tool.input.companyId?.startsWith('$') ||
+        tool.input.pointOfContactId?.startsWith('$')
           ? ' Linked to the records created in this step.'
           : '';
 
@@ -48,17 +49,23 @@ export function describeTool(
     case 'search_notes':
       return {
         tool: tool.name,
-        summary: `Search note titles and bodies for “${tool.input.query}”.`,
+        summary: tool.input.recordId
+          ? 'Read notes on the open record.'
+          : `Search note titles and bodies for “${tool.input.query}”.`,
       };
     case 'search_tasks':
       return {
         tool: tool.name,
-        summary: `Search task titles and bodies for “${tool.input.query}”.`,
+        summary: tool.input.recordId
+          ? 'Read tasks on the open record.'
+          : `Search task titles and bodies for “${tool.input.query}”.`,
       };
     case 'search_activities':
       return {
         tool: tool.name,
-        summary: `Search activities linked to “${tool.input.query}”.`,
+        summary: tool.input.recordId
+          ? 'Read activities on the open record.'
+          : `Search activities linked to “${tool.input.query}”.`,
       };
     case 'archive_record':
       return {
@@ -74,8 +81,10 @@ export function describeTool(
       const previous = current?.properties[tool.input.field];
       const from =
         previous === undefined ? '' : ` from ${formatValue(previous)}`;
-      const label = current?.label ?? tool.input.id ?? tool.input.query ?? 'record';
-      const identity = options?.disambiguate && current ? ` (${current.id})` : '';
+      const label =
+        current?.label ?? tool.input.id ?? tool.input.query ?? 'record';
+      const identity =
+        options?.disambiguate && current ? ` (${current.id})` : '';
 
       return {
         tool: tool.name,
@@ -85,12 +94,20 @@ export function describeTool(
   }
 }
 
-export function describePartialTools(tools: PartialToolCall[], workspaceId: string): ProposalLine[] {
+export function describePartialTools(
+  tools: PartialToolCall[],
+  workspaceId: string,
+): ProposalLine[] {
   return tools.flatMap((tool) => {
     const name = isAllowedToolName(tool.name) ? tool.name : undefined;
 
     if (!name) {
-      return [{ tool: 'search_records' as const, summary: 'Planning the next action…' }];
+      return [
+        {
+          tool: 'search_records' as const,
+          summary: 'Planning the next action…',
+        },
+      ];
     }
 
     if (!tool.complete) {

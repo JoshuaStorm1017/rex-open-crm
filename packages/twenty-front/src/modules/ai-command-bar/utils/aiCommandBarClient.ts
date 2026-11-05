@@ -27,12 +27,47 @@ export type AiProposalChoice = {
   groups?: AiProposalChoiceGroup[];
 };
 
+export type AiProposalChange = {
+  recordId: string;
+  objectName: string;
+  label: string;
+  field?: string;
+  metadataField?: string;
+  current: string | number | null;
+  proposed: string | number | null;
+  summary: string;
+};
+
+export type AiProposalWarning = {
+  code: string;
+  message: string;
+};
+
 export type AiProposal = {
   id: string;
   summary: string;
   tools: unknown[];
   lines: AiProposalLine[];
   choice?: AiProposalChoice;
+  changes?: AiProposalChange[];
+  warnings?: AiProposalWarning[];
+};
+
+export type AiAnswerRecord = {
+  id: string;
+  objectName: string;
+  label: string;
+  detail?: string;
+};
+
+export type AiAnswer = {
+  summary: string;
+  records: AiAnswerRecord[];
+};
+
+export type AiPlanView = {
+  proposal?: AiProposal;
+  answer?: AiAnswer;
 };
 
 export type AiRecordLink = {
@@ -64,7 +99,8 @@ export type AiUndoResult = {
 
 export type AiCommandOutcome<TData> =
   | { kind: 'data'; data: TData }
-  | { kind: 'message'; message: string };
+  | { kind: 'message'; message: string }
+  | { kind: 'stale'; message: string; changes: AiProposalChange[] };
 
 type FetchImpl = typeof fetch;
 
@@ -74,7 +110,7 @@ export const proposeAiCommand = async (
   fetchImpl: FetchImpl,
   openRecord?: AiOpenRecord,
   onPartial?: (lines: AiProposalLine[]) => void,
-): Promise<AiCommandOutcome<AiProposal>> => {
+): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/plan',
@@ -92,16 +128,16 @@ export const proposeAiCommand = async (
     return payload;
   }
 
-  const proposal = readProposal(payload.data);
+  const view = readPlan(payload.data);
 
-  if (!proposal) {
+  if (!view) {
     return {
       kind: 'message',
       message: 'The AI gateway returned an unexpected plan.',
     };
   }
 
-  return { kind: 'data', data: proposal };
+  return { kind: 'data', data: view };
 };
 
 export const executeAiCommand = async (
@@ -111,6 +147,7 @@ export const executeAiCommand = async (
   fetchImpl: FetchImpl,
   choiceId?: string,
   choices?: Record<string, string>,
+  onProgress?: (message: string) => void,
 ): Promise<AiCommandOutcome<AiActResult>> => {
   const payload = await postAiCommand(
     config,
@@ -124,9 +161,11 @@ export const executeAiCommand = async (
     },
     fetchImpl,
     idempotencyKey,
+    undefined,
+    onProgress,
   );
 
-  if (payload.kind === 'message') {
+  if (payload.kind === 'message' || payload.kind === 'stale') {
     return payload;
   }
 
@@ -184,12 +223,13 @@ const postAiCommand = async (
   fetchImpl: FetchImpl,
   idempotencyKey?: string,
   onPartial?: (lines: AiProposalLine[]) => void,
+  onProgress?: (message: string) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
   };
 
-  if (onPartial) {
+  if (onPartial || onProgress) {
     headers.accept = 'text/event-stream';
   }
 
@@ -219,7 +259,9 @@ const postAiCommand = async (
       : '';
 
   if (contentType.includes('text/event-stream')) {
-    return readPlanStream(response, onPartial);
+    return onProgress
+      ? readActStream(response, onProgress)
+      : readPlanStream(response, onPartial);
   }
 
   let payload: unknown;
@@ -231,6 +273,12 @@ const postAiCommand = async (
       kind: 'message',
       message: 'The AI gateway returned an unexpected response.',
     };
+  }
+
+  const stale = readStale(payload);
+
+  if (stale) {
+    return { kind: 'stale', message: readMessage(payload), changes: stale };
   }
 
   if (!isPlainObject(payload) || payload.ok !== true) {
@@ -311,6 +359,100 @@ const readPlanStream = async (
   };
 };
 
+const readActStream = async (
+  response: Response,
+  onProgress: (message: string) => void,
+): Promise<AiCommandOutcome<unknown>> => {
+  const body = response.body;
+
+  if (!body) {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an empty result.',
+    };
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: unknown;
+  let failure: string | undefined;
+  let stale: AiProposalChange[] | undefined;
+
+  while (true) {
+    const chunk = await reader.read();
+
+    if (chunk.done) {
+      break;
+    }
+
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+
+    for (const part of parts) {
+      const event = readSseEvent(part);
+
+      if (!event) {
+        continue;
+      }
+
+      if (event.name === 'progress') {
+        const line = readProgress(event.data);
+
+        if (line) {
+          onProgress(line);
+        }
+
+        continue;
+      }
+
+      if (event.name === 'result') {
+        result = event.data;
+        continue;
+      }
+
+      if (event.name === 'error') {
+        stale = readStale(event.data);
+        failure = readMessage(event.data);
+      }
+    }
+  }
+
+  if (stale) {
+    return {
+      kind: 'stale',
+      message: failure ?? 'Confirm is blocked.',
+      changes: stale,
+    };
+  }
+
+  if (result !== undefined && isPlainObject(result) && result.ok === true) {
+    return { kind: 'data', data: result };
+  }
+
+  return {
+    kind: 'message',
+    message:
+      failure ??
+      readMessage(result) ??
+      'The update stopped before every record settled.',
+  };
+};
+
+const readProgress = (payload: unknown): string | undefined => {
+  if (
+    !isPlainObject(payload) ||
+    typeof payload.index !== 'number' ||
+    typeof payload.total !== 'number' ||
+    typeof payload.label !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return `Updated ${payload.label} (${payload.index} of ${payload.total}).`;
+};
+
 const readSseEvent = (
   chunk: string,
 ): { name: string; data: unknown } | undefined => {
@@ -360,6 +502,68 @@ const readPartialLines = (payload: unknown): AiProposalLine[] | undefined => {
   return lines;
 };
 
+const readPlan = (payload: unknown): AiPlanView | undefined => {
+  if (!isPlainObject(payload)) {
+    return undefined;
+  }
+
+  const proposal =
+    payload.proposal === undefined ? undefined : readProposal(payload);
+  const answer =
+    payload.answer === undefined ? undefined : readAnswer(payload.answer);
+
+  if (payload.proposal !== undefined && !proposal) {
+    return undefined;
+  }
+
+  if (payload.answer !== undefined && !answer) {
+    return undefined;
+  }
+
+  if (!proposal && !answer) {
+    return undefined;
+  }
+
+  return {
+    ...(proposal ? { proposal } : {}),
+    ...(answer ? { answer } : {}),
+  };
+};
+
+const readAnswer = (value: unknown): AiAnswer | undefined => {
+  if (
+    !isPlainObject(value) ||
+    typeof value.summary !== 'string' ||
+    !Array.isArray(value.records)
+  ) {
+    return undefined;
+  }
+
+  const records: AiAnswerRecord[] = [];
+
+  for (const record of value.records) {
+    if (
+      !isPlainObject(record) ||
+      typeof record.id !== 'string' ||
+      typeof record.objectName !== 'string' ||
+      typeof record.label !== 'string'
+    ) {
+      return undefined;
+    }
+
+    records.push({
+      id: record.id,
+      objectName: record.objectName,
+      label: record.label,
+      ...(typeof record.detail === 'string' && record.detail.length > 0
+        ? { detail: record.detail }
+        : {}),
+    });
+  }
+
+  return { summary: value.summary, records };
+};
+
 const readProposal = (payload: unknown): AiProposal | undefined => {
   if (!isPlainObject(payload) || !isPlainObject(payload.proposal)) {
     return undefined;
@@ -401,13 +605,96 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     parsedLines.push({ tool: line.tool, summary: line.summary });
   }
 
+  const changes = readChanges(payload.proposal.changes);
+  const warnings = readWarnings(payload.proposal.warnings);
+
+  if (payload.proposal.changes !== undefined && !changes) {
+    return undefined;
+  }
+
+  if (payload.proposal.warnings !== undefined && !warnings) {
+    return undefined;
+  }
+
   return {
     id,
     summary,
     tools,
     lines: parsedLines,
     ...(choice ? { choice } : {}),
+    ...(changes && changes.length > 0 ? { changes } : {}),
+    ...(warnings && warnings.length > 0 ? { warnings } : {}),
   };
+};
+
+const readChanges = (value: unknown): AiProposalChange[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const changes: AiProposalChange[] = [];
+
+  for (const change of value) {
+    if (
+      !isPlainObject(change) ||
+      typeof change.recordId !== 'string' ||
+      typeof change.objectName !== 'string' ||
+      typeof change.label !== 'string' ||
+      typeof change.summary !== 'string' ||
+      !isDisplayValue(change.current) ||
+      !isDisplayValue(change.proposed)
+    ) {
+      return undefined;
+    }
+
+    changes.push({
+      recordId: change.recordId,
+      objectName: change.objectName,
+      label: change.label,
+      summary: change.summary,
+      current: change.current,
+      proposed: change.proposed,
+      ...(typeof change.field === 'string' ? { field: change.field } : {}),
+      ...(typeof change.metadataField === 'string'
+        ? { metadataField: change.metadataField }
+        : {}),
+    });
+  }
+
+  return changes;
+};
+
+const isDisplayValue = (value: unknown): value is string | number | null =>
+  value === null || typeof value === 'string' || typeof value === 'number';
+
+const readWarnings = (value: unknown): AiProposalWarning[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const warnings: AiProposalWarning[] = [];
+
+  for (const warning of value) {
+    if (
+      !isPlainObject(warning) ||
+      typeof warning.code !== 'string' ||
+      typeof warning.message !== 'string'
+    ) {
+      return undefined;
+    }
+
+    warnings.push({ code: warning.code, message: warning.message });
+  }
+
+  return warnings;
+};
+
+const readStale = (payload: unknown): AiProposalChange[] | undefined => {
+  if (!isPlainObject(payload) || payload.stale === undefined) {
+    return undefined;
+  }
+
+  return readChanges(payload.stale);
 };
 
 const readChoice = (value: unknown): AiProposalChoice | undefined => {

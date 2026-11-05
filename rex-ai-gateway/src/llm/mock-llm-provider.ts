@@ -1,7 +1,12 @@
 import { mapIntentToTool } from '../act/map-intent';
 import { refusal, type ActRefusal, type ToolCall } from '../act/types';
 import type { TwentyObjectName } from '../twenty/twenty-crm-client';
-import type { LlmPlan, LlmPlanInput, LlmProvider, PartialToolCall } from './llm-provider';
+import type {
+  LlmPlan,
+  LlmPlanInput,
+  LlmProvider,
+  PartialToolCall,
+} from './llm-provider';
 
 const UNSAFE_PATTERN =
   /^(?:delete|drop|destroy|wipe|remove|truncate|export|dump)\b|\b(?:password|api key|credential|access token)\b|\b(?:drop table|delete from)\b/i;
@@ -15,9 +20,14 @@ const NOTE_PATTERN =
 const SEARCH_PATTERN =
   /^(?:find|search) (?<object>people|persons|person|companies|company|opportunities|opportunity|deals) (?:named|called|for|matching) (?<query>.+)$/i;
 
-const SEARCH_NOTES_PATTERN = /^(?:find|search) notes? (?:about|matching|for|containing) (?<query>.+)$/i;
+const OPEN_TIMELINE_PATTERN =
+  /^(?:what happened(?: with this (?<object>deal|opportunity|person|company|record))?|show (?<kind>notes|tasks|activities) on this (?<object2>deal|opportunity|person|company|record))\??$/i;
 
-const SEARCH_TASKS_PATTERN = /^(?:find|search) tasks? (?:about|matching|for|named|containing) (?<query>.+)$/i;
+const SEARCH_NOTES_PATTERN =
+  /^(?:find|search) notes? (?:about|matching|for|containing) (?<query>.+)$/i;
+
+const SEARCH_TASKS_PATTERN =
+  /^(?:find|search) tasks? (?:about|matching|for|named|containing) (?<query>.+)$/i;
 
 const SEARCH_ACTIVITIES_PATTERN =
   /^(?:find|search) activities (?:about|matching|for|on|linked to) (?<query>.+)$/i;
@@ -102,8 +112,15 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const compound = COMPOUND_PATTERN.exec(text);
 
-  if (compound?.groups?.company && compound.groups.firstName && compound.groups.lastName) {
-    const amount = parseMoney(compound.groups.amount ?? '', compound.groups.multiplier);
+  if (
+    compound?.groups?.company &&
+    compound.groups.firstName &&
+    compound.groups.lastName
+  ) {
+    const amount = parseMoney(
+      compound.groups.amount ?? '',
+      compound.groups.multiplier,
+    );
 
     if (amount === undefined) {
       return refusal('invalid_request', 'The deal amount is not a number.', {
@@ -155,7 +172,10 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
       tools: [
         {
           name: 'archive_record',
-          args: { object: objectName, query: trimValue(archiveNamed.groups.query) },
+          args: {
+            object: objectName,
+            query: trimValue(archiveNamed.groups.query),
+          },
         },
       ],
     };
@@ -163,13 +183,21 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const thisMulti = THIS_MULTI_UPDATE_PATTERN.exec(text);
 
-  if (thisMulti?.groups?.object && thisMulti.groups.field1 && thisMulti.groups.field2) {
+  if (
+    thisMulti?.groups?.object &&
+    thisMulti.groups.field1 &&
+    thisMulti.groups.field2
+  ) {
     return thisRecordFields(input, thisMulti.groups);
   }
 
   const thisUpdate = THIS_UPDATE_PATTERN.exec(text);
 
-  if (thisUpdate?.groups?.object && thisUpdate.groups.field && thisUpdate.groups.value) {
+  if (
+    thisUpdate?.groups?.object &&
+    thisUpdate.groups.field &&
+    thisUpdate.groups.value
+  ) {
     return thisRecordUpdate(input, thisUpdate.groups);
   }
 
@@ -183,7 +211,9 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
         {
           name: 'create_note',
           args: {
-            ...(note.groups.title ? { title: trimValue(note.groups.title) } : {}),
+            ...(note.groups.title
+              ? { title: trimValue(note.groups.title) }
+              : {}),
             body: note.groups.body.trim(),
             targetObject: objectNameFor(note.groups.object),
             targetQuery: trimValue(note.groups.query),
@@ -201,7 +231,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const bulk = BULK_UPDATE_PATTERN.exec(text);
 
-  if (bulk?.groups?.object && bulk.groups.query && bulk.groups.field && bulk.groups.value) {
+  if (
+    bulk?.groups?.object &&
+    bulk.groups.query &&
+    bulk.groups.field &&
+    bulk.groups.value
+  ) {
     const field = bulk.groups.field;
 
     return {
@@ -221,6 +256,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
     };
   }
 
+  const openTimeline = OPEN_TIMELINE_PATTERN.exec(text);
+
+  if (openTimeline) {
+    return openRecordTimeline(input, openTimeline.groups ?? {});
+  }
+
   const noteSearch = SEARCH_NOTES_PATTERN.exec(text);
 
   if (noteSearch?.groups?.query) {
@@ -236,7 +277,11 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
   const activitySearch = SEARCH_ACTIVITIES_PATTERN.exec(text);
 
   if (activitySearch?.groups?.query) {
-    return timelineSearch('search_activities', 'activities', activitySearch.groups.query);
+    return timelineSearch(
+      'search_activities',
+      'activities',
+      activitySearch.groups.query,
+    );
   }
 
   const search = SEARCH_PATTERN.exec(text);
@@ -259,7 +304,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const twoNamed = TWO_NAMED_UPDATES_PATTERN.exec(text);
 
-  if (twoNamed?.groups?.object1 && twoNamed.groups.object2 && twoNamed.groups.query1 && twoNamed.groups.query2) {
+  if (
+    twoNamed?.groups?.object1 &&
+    twoNamed.groups.object2 &&
+    twoNamed.groups.query1 &&
+    twoNamed.groups.query2
+  ) {
     return {
       ok: true,
       summary: `Update ${twoNamed.groups.object1} named ${trimValue(twoNamed.groups.query1)} and ${twoNamed.groups.object2} named ${trimValue(twoNamed.groups.query2)}.`,
@@ -282,7 +332,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const multiField = MULTI_FIELD_BY_NAME_PATTERN.exec(text);
 
-  if (multiField?.groups?.object && multiField.groups.query && multiField.groups.field1 && multiField.groups.field2) {
+  if (
+    multiField?.groups?.object &&
+    multiField.groups.query &&
+    multiField.groups.field1 &&
+    multiField.groups.field2
+  ) {
     const query = trimValue(multiField.groups.query);
 
     return {
@@ -309,7 +364,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   const updateById = UPDATE_BY_ID_PATTERN.exec(text);
 
-  if (updateById?.groups?.object && updateById.groups.id && updateById.groups.field && updateById.groups.value) {
+  if (
+    updateById?.groups?.object &&
+    updateById.groups.id &&
+    updateById.groups.field &&
+    updateById.groups.value
+  ) {
     return {
       ok: true,
       summary: `Update ${updateById.groups.object} ${updateById.groups.id}.`,
@@ -397,15 +457,17 @@ function thisRecordFields(
   return {
     ok: true,
     summary: `Update the open ${objectName}.`,
-    tools: [groups.field1, groups.field2].filter((field): field is string => Boolean(field)).map((field, index) => ({
-      name: 'update_record',
-      args: {
-        object: objectName,
-        field,
-        value: fieldValue(field, index === 0 ? groups.value1 : groups.value2),
-        recordRef: 'open',
-      },
-    })),
+    tools: [groups.field1, groups.field2]
+      .filter((field): field is string => Boolean(field))
+      .map((field, index) => ({
+        name: 'update_record',
+        args: {
+          object: objectName,
+          field,
+          value: fieldValue(field, index === 0 ? groups.value1 : groups.value2),
+          recordRef: 'open',
+        },
+      })),
   };
 }
 
@@ -430,7 +492,10 @@ function thisRecordUpdate(
         args: {
           object: objectName,
           field,
-          value: field === 'amount' ? Number((groups.value ?? '').replace(/,/g, '')) : trimValue(groups.value ?? ''),
+          value:
+            field === 'amount'
+              ? Number((groups.value ?? '').replace(/,/g, ''))
+              : trimValue(groups.value ?? ''),
           recordRef: 'open',
         },
       },
@@ -498,6 +563,40 @@ function openObject(
   return openRecord.objectName;
 }
 
+function openRecordTimeline(
+  input: LlmPlanInput,
+  groups: Record<string, string | undefined>,
+): LlmPlan {
+  const objectName = openObject(
+    groups.object ?? groups.object2 ?? 'record',
+    input.openRecord,
+  );
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  const kind = groups.kind;
+  const names = kind
+    ? [
+        kind === 'notes'
+          ? 'search_notes'
+          : kind === 'tasks'
+            ? 'search_tasks'
+            : 'search_activities',
+      ]
+    : ['search_notes', 'search_tasks', 'search_activities'];
+
+  return {
+    ok: true,
+    summary: `Read the open ${objectName}.`,
+    tools: names.map((name) => ({
+      name,
+      args: { query: 'record', recordRef: 'open', limit: 8 },
+    })),
+  };
+}
+
 function timelineSearch(
   name: 'search_notes' | 'search_tasks' | 'search_activities',
   label: string,
@@ -538,18 +637,29 @@ function updateTool(groups: Record<string, string | undefined>): ToolCall {
 function objectNameFor(word: string): TwentyObjectName {
   const normalized = word.toLowerCase();
 
-  if (normalized === 'person' || normalized === 'people' || normalized === 'persons') {
+  if (
+    normalized === 'person' ||
+    normalized === 'people' ||
+    normalized === 'persons'
+  ) {
     return 'person';
   }
 
-  if (normalized === 'opportunity' || normalized === 'opportunities' || normalized === 'deals') {
+  if (
+    normalized === 'opportunity' ||
+    normalized === 'opportunities' ||
+    normalized === 'deals'
+  ) {
     return 'opportunity';
   }
 
   return 'company';
 }
 
-function parseMoney(amount: string, multiplier: string | undefined): number | undefined {
+function parseMoney(
+  amount: string,
+  multiplier: string | undefined,
+): number | undefined {
   const numeric = Number(amount.replace(/,/g, ''));
 
   if (!Number.isFinite(numeric) || numeric < 0) {

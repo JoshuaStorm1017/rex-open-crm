@@ -5,8 +5,15 @@ import { DatabaseSync } from 'node:sqlite';
 import type { PendingSelection } from '../act/pending-choice';
 import type { ActEffect, ToolCall } from '../act/types';
 import { AuditLog, type AuditEntry } from '../audit/audit-log';
-import { IdempotencyStore, type IdempotentResponse } from '../http/idempotency-store';
-import { ProposalStore, type ClaimResult, type StoredProposal } from '../http/proposal-store';
+import {
+  IdempotencyStore,
+  type IdempotentResponse,
+} from '../http/idempotency-store';
+import {
+  ProposalStore,
+  type ClaimResult,
+  type StoredProposal,
+} from '../http/proposal-store';
 import {
   summarizeUndo,
   UndoStore,
@@ -67,6 +74,10 @@ export function openGatewayState(filename: string): GatewayState {
       act_audit_id TEXT
     );
     CREATE INDEX IF NOT EXISTS undo_stack_member ON undo_stack (member_id, created_at);
+    CREATE TABLE IF NOT EXISTS undo_generation (
+      member_id TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
       at TEXT NOT NULL,
@@ -87,8 +98,12 @@ export function openGatewayState(filename: string): GatewayState {
   migrateGatewayState(database);
 
   return {
-    proposals: new SqliteProposalStore(database, () => restrictStateFiles(filename)),
-    idempotency: new SqliteIdempotencyStore(database, () => restrictStateFiles(filename)),
+    proposals: new SqliteProposalStore(database, () =>
+      restrictStateFiles(filename),
+    ),
+    idempotency: new SqliteIdempotencyStore(database, () =>
+      restrictStateFiles(filename),
+    ),
     audit: new SqliteAuditLog(database, () => restrictStateFiles(filename)),
     undos: new SqliteUndoStore(database, () => restrictStateFiles(filename)),
     close: () => {
@@ -116,15 +131,21 @@ class SqliteProposalStore extends ProposalStore {
     this.database
       .prepare('DELETE FROM proposals WHERE expires_at <= ?')
       .run(now);
-    const count = this.database.prepare('SELECT COUNT(*) AS count FROM proposals').get() as
-      | { count: number }
-      | undefined;
+    const count = this.database
+      .prepare('SELECT COUNT(*) AS count FROM proposals')
+      .get() as { count: number } | undefined;
 
     if ((count?.count ?? 0) >= 200) {
       return undefined;
     }
 
-    const proposal = this.createProposal(memberId, workspaceId, tools, pendingChoice, now);
+    const proposal = this.createProposal(
+      memberId,
+      workspaceId,
+      tools,
+      pendingChoice,
+      now,
+    );
     this.database
       .prepare(
         `INSERT INTO proposals (id, member_id, workspace_id, tools_json, pending_choice_json, expires_at)
@@ -194,8 +215,60 @@ class SqliteProposalStore extends ProposalStore {
       return claimed;
     }
 
-    this.database.prepare('DELETE FROM proposals WHERE id = ?').run(id);
+    // Two processes can both read the preview. Only the delete that removes the row may write.
+    const removed = this.database
+      .prepare(
+        'DELETE FROM proposals WHERE id = ? AND member_id = ? RETURNING id',
+      )
+      .get(id, memberId) as { id: string } | undefined;
+
+    if (!removed) {
+      return { ok: false, reason: 'missing' };
+    }
+
     return claimed;
+  }
+
+  override peek(
+    id: string,
+    workspaceId: string,
+    memberId: string,
+    choiceId?: string,
+    choices?: Record<string, string>,
+    now = Date.now(),
+  ): ClaimResult {
+    const row = this.database
+      .prepare(
+        `SELECT member_id, workspace_id, tools_json, pending_choice_json, expires_at
+         FROM proposals WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          member_id: string;
+          workspace_id: string;
+          tools_json: string;
+          pending_choice_json: string | null;
+          expires_at: number;
+        }
+      | undefined;
+
+    if (!row || row.member_id !== memberId) {
+      return { ok: false, reason: 'missing' };
+    }
+
+    if (row.expires_at <= now) {
+      return { ok: false, reason: 'expired' };
+    }
+
+    if (row.workspace_id !== workspaceId) {
+      return { ok: false, reason: 'workspace' };
+    }
+
+    try {
+      return this.claimStored(this.proposalFromRow(id, row), choiceId, choices);
+    } catch {
+      return { ok: false, reason: 'missing' };
+    }
   }
 
   private proposalFromRow(
@@ -275,26 +348,75 @@ class SqliteUndoStore extends UndoStore {
   }
 
   override list(memberId: string, workspaceId: string): UndoTicket[] {
-    return this.readAll(memberId).filter((ticket) => ticket.workspaceId === workspaceId);
+    return this.readAll(memberId).filter(
+      (ticket) => ticket.workspaceId === workspaceId,
+    );
   }
 
   override linkAct(id: string, memberId: string, auditId: string): void {
     this.database
-      .prepare('UPDATE undo_stack SET act_audit_id = ? WHERE member_id = ? AND id = ?')
+      .prepare(
+        'UPDATE undo_stack SET act_audit_id = ? WHERE member_id = ? AND id = ?',
+      )
       .run(auditId, memberId, id);
     this.restrict();
   }
 
-  override peek(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+  override begin(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+  ): TakeUndoResult {
+    const result = super.begin(id, memberId, workspaceId);
+
+    if (result.ok) {
+      this.setGenerationAtBegin(memberId, this.readGeneration(memberId));
+    }
+
+    return result;
+  }
+
+  override superseded(memberId: string): boolean {
+    const begun = this.generationAtBegin(memberId);
+
+    if (begun === undefined) {
+      return false;
+    }
+
+    return begun !== this.readGeneration(memberId);
+  }
+
+  protected override noteSaved(memberId: string): void {
+    super.noteSaved(memberId);
+    this.database
+      .prepare(
+        `INSERT INTO undo_generation (member_id, generation) VALUES (?, 1)
+         ON CONFLICT(member_id) DO UPDATE SET generation = undo_generation.generation + 1`,
+      )
+      .run(memberId);
+    this.restrict();
+  }
+
+  override peek(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+  ): TakeUndoResult {
     return this.readTicket(id, memberId, workspaceId);
   }
 
-  override take(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+  override take(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+  ): TakeUndoResult {
     const result = this.readTicket(id, memberId, workspaceId);
 
     if (result.ok) {
       this.release(memberId);
-      this.database.prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?').run(memberId, id);
+      this.database
+        .prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?')
+        .run(memberId, id);
       this.restrict();
     }
 
@@ -309,7 +431,9 @@ class SqliteUndoStore extends UndoStore {
       return;
     }
 
-    this.database.prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?').run(memberId, id);
+    this.database
+      .prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?')
+      .run(memberId, id);
     this.restrict();
   }
 
@@ -326,11 +450,21 @@ class SqliteUndoStore extends UndoStore {
     }
 
     this.database
-      .prepare('UPDATE undo_stack SET summary = ?, effects_json = ? WHERE member_id = ? AND id = ?')
+      .prepare(
+        'UPDATE undo_stack SET summary = ?, effects_json = ? WHERE member_id = ? AND id = ?',
+      )
       .run(summarizeUndo(effects), JSON.stringify(effects), memberId, id);
     this.restrict();
 
     return true;
+  }
+
+  private readGeneration(memberId: string): number {
+    const row = this.database
+      .prepare('SELECT generation FROM undo_generation WHERE member_id = ?')
+      .get(memberId) as { generation: number } | undefined;
+
+    return typeof row?.generation === 'number' ? row.generation : 0;
   }
 
   private readAll(memberId: string): UndoTicket[] {
@@ -348,7 +482,11 @@ class SqliteUndoStore extends UndoStore {
     });
   }
 
-  private readTicket(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+  private readTicket(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+  ): TakeUndoResult {
     const stack = this.readAll(memberId);
     const ticket = stack.find((item) => item.id === id);
 
@@ -390,7 +528,9 @@ class SqliteIdempotencyStore extends IdempotencyStore {
       .prepare(
         'SELECT hash, status, body_json FROM idempotency WHERE member_id = ? AND key = ?',
       )
-      .get(memberId, key) as { hash: string; status: number; body_json: string } | undefined;
+      .get(memberId, key) as
+      | { hash: string; status: number; body_json: string }
+      | undefined;
 
     if (!row) {
       return undefined;
@@ -398,14 +538,17 @@ class SqliteIdempotencyStore extends IdempotencyStore {
 
     return {
       hash: row.hash,
-      response: { status: row.status, body: JSON.parse(row.body_json) as unknown },
+      response: {
+        status: row.status,
+        body: JSON.parse(row.body_json) as unknown,
+      },
     };
   }
 
   protected override countCompleted(): number {
-    const row = this.database.prepare('SELECT COUNT(*) AS count FROM idempotency').get() as
-      | { count: number }
-      | undefined;
+    const row = this.database
+      .prepare('SELECT COUNT(*) AS count FROM idempotency')
+      .get() as { count: number } | undefined;
 
     return row?.count ?? 0;
   }
@@ -514,7 +657,9 @@ function readAuditRow(row: Record<string, unknown>): AuditEntry {
     at: String(row.at),
     memberId: String(row.member_id),
     actor: String(row.actor),
-    ...(typeof row.workspace_id === 'string' ? { workspaceId: row.workspace_id } : {}),
+    ...(typeof row.workspace_id === 'string'
+      ? { workspaceId: row.workspace_id }
+      : {}),
     action: row.action as AuditEntry['action'],
     summary: String(row.summary),
     tools: readJsonStringArray(row.tools_json),
@@ -530,14 +675,18 @@ function readAuditRow(row: Record<string, unknown>): AuditEntry {
 }
 
 function migrateGatewayState(database: DatabaseSync): void {
-  const auditColumns = database.prepare('PRAGMA table_info(audit_log)').all() as Array<{ name?: string }>;
+  const auditColumns = database
+    .prepare('PRAGMA table_info(audit_log)')
+    .all() as Array<{ name?: string }>;
 
   if (!auditColumns.some((column) => column.name === 'reverses')) {
     database.exec('ALTER TABLE audit_log ADD COLUMN reverses TEXT');
   }
 
   const legacy = database
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'undo_tickets'")
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'undo_tickets'",
+    )
     .get() as { name?: string } | undefined;
 
   if (!legacy) {
@@ -551,7 +700,10 @@ function migrateGatewayState(database: DatabaseSync): void {
   `);
 }
 
-function ticketFromRow(memberId: string, row: Record<string, unknown>): UndoTicket | undefined {
+function ticketFromRow(
+  memberId: string,
+  row: Record<string, unknown>,
+): UndoTicket | undefined {
   let effects: unknown;
 
   try {
@@ -560,7 +712,11 @@ function ticketFromRow(memberId: string, row: Record<string, unknown>): UndoTick
     return undefined;
   }
 
-  if (!Array.isArray(effects) || typeof row.id !== 'string' || typeof row.workspace_id !== 'string') {
+  if (
+    !Array.isArray(effects) ||
+    typeof row.id !== 'string' ||
+    typeof row.workspace_id !== 'string'
+  ) {
     return undefined;
   }
 
@@ -571,6 +727,8 @@ function ticketFromRow(memberId: string, row: Record<string, unknown>): UndoTick
     summary: typeof row.summary === 'string' ? row.summary : '',
     effects: effects as ActEffect[],
     createdAt: typeof row.created_at === 'number' ? row.created_at : 0,
-    ...(typeof row.act_audit_id === 'string' ? { actAuditId: row.act_audit_id } : {}),
+    ...(typeof row.act_audit_id === 'string'
+      ? { actAuditId: row.act_audit_id }
+      : {}),
   };
 }

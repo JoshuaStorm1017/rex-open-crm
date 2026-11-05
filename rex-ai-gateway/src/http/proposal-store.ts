@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { CREATE_NEW_CHOICE_ID } from '../act/create-new-choice';
-import { isPendingBatch, type PendingBatch, type PendingChoice, type PendingSelection } from '../act/pending-choice';
+import {
+  isPendingBatch,
+  type PendingBatch,
+  type PendingChoice,
+  type PendingSelection,
+} from '../act/pending-choice';
 import type { ToolCall } from '../act/types';
 
 const PROPOSAL_TTL_MS = 10 * 60 * 1000;
@@ -43,12 +48,42 @@ export class ProposalStore {
       return undefined;
     }
 
-    const proposal = this.createProposal(memberId, workspaceId, tools, pendingChoice, now);
+    const proposal = this.createProposal(
+      memberId,
+      workspaceId,
+      tools,
+      pendingChoice,
+      now,
+    );
     this.proposals.set(proposal.id, proposal);
     return proposal;
   }
 
   claim(
+    id: string,
+    workspaceId: string,
+    memberId: string,
+    choiceId?: string,
+    choices?: Record<string, string>,
+    now = Date.now(),
+  ): ClaimResult {
+    const peeked = this.peek(id, workspaceId, memberId, choiceId, choices, now);
+
+    if (
+      !peeked.ok &&
+      (peeked.reason === 'missing' || peeked.reason === 'workspace')
+    ) {
+      return peeked;
+    }
+
+    if (peeked.ok || peeked.reason !== 'choice') {
+      this.proposals.delete(id);
+    }
+
+    return peeked;
+  }
+
+  peek(
     id: string,
     workspaceId: string,
     memberId: string,
@@ -63,7 +98,6 @@ export class ProposalStore {
     }
 
     if (proposal.expiresAt <= now) {
-      this.proposals.delete(id);
       return { ok: false, reason: 'expired' };
     }
 
@@ -71,13 +105,7 @@ export class ProposalStore {
       return { ok: false, reason: 'workspace' };
     }
 
-    const claimed = this.claimStored(proposal, choiceId, choices);
-
-    if (claimed.ok || claimed.reason !== 'choice') {
-      this.proposals.delete(id);
-    }
-
-    return claimed;
+    return this.claimStored(proposal, choiceId, choices);
   }
 
   protected createProposal(
@@ -119,14 +147,19 @@ export class ProposalStore {
       };
     }
 
-    const candidate = proposal.pendingChoice.candidates.find((item) => item.id === choiceId);
+    const candidate = proposal.pendingChoice.candidates.find(
+      (item) => item.id === choiceId,
+    );
 
     if (!candidate) {
       return { ok: false, reason: 'choice' };
     }
 
     if (candidate.id === CREATE_NEW_CHOICE_ID) {
-      if (!proposal.pendingChoice.createTools || proposal.pendingChoice.createTools.length === 0) {
+      if (
+        !proposal.pendingChoice.createTools ||
+        proposal.pendingChoice.createTools.length === 0
+      ) {
         return { ok: false, reason: 'choice' };
       }
 
@@ -189,7 +222,9 @@ function toolsFromBatch(
       return undefined;
     }
 
-    const candidate = group.candidates.find((item) => item.id === selected[group.id]);
+    const candidate = group.candidates.find(
+      (item) => item.id === selected[group.id],
+    );
 
     if (!candidate) {
       return undefined;
@@ -204,7 +239,9 @@ function toolsFromBatch(
         return undefined;
       }
 
-      tools.push(...group.createTools.map((tool) => shiftRefs(tool, tools.length)));
+      tools.push(
+        ...group.createTools.map((tool) => shiftRefs(tool, tools.length)),
+      );
       created.add(group.id);
       continue;
     }
@@ -212,7 +249,11 @@ function toolsFromBatch(
     if (group.kind === 'archive') {
       tools.push({
         name: 'archive_record',
-        args: { object: group.objectName, id: candidate.id, ifMatch: candidate.etag },
+        args: {
+          object: group.objectName,
+          id: candidate.id,
+          ifMatch: candidate.etag,
+        },
       });
       continue;
     }
@@ -260,7 +301,8 @@ function shiftRefs(tool: ToolCall, offset: number): ToolCall {
 
   for (const key of ['id', 'targetId', 'companyId', 'pointOfContactId']) {
     const value = args[key];
-    const match = typeof value === 'string' ? /^\$(\d+)$/.exec(value) : undefined;
+    const match =
+      typeof value === 'string' ? /^\$(\d+)$/.exec(value) : undefined;
 
     if (match?.[1]) {
       args[key] = `$${Number(match[1]) + offset}`;
@@ -270,7 +312,10 @@ function shiftRefs(tool: ToolCall, offset: number): ToolCall {
   return { name: tool.name, args };
 }
 
-function toolFromChoice(choice: PendingChoice, candidate: ChoiceCandidate): ToolCall {
+function toolFromChoice(
+  choice: PendingChoice,
+  candidate: ChoiceCandidate,
+): ToolCall {
   if (choice.kind === 'archive') {
     return {
       name: 'archive_record',

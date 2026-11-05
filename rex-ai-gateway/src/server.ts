@@ -1,14 +1,35 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 
 import { compensate, partialFailure } from './act/compensate';
 import { describePartialTools } from './act/describe-tool';
-import { executeAct, type ExecuteActOptions } from './act/execute-act';
+import {
+  executeAct,
+  type ExecuteActOptions,
+  type SettledToolEvent,
+} from './act/execute-act';
 import { parseGatewayRequest } from './act/parse-request';
-import { assertCanUndo, catalogForAudience, loadAudience } from './act/permissions';
+import {
+  assertCanUndo,
+  catalogForAudience,
+  loadAudience,
+} from './act/permissions';
+import { findStaleChanges } from './act/live-etag';
 import { proposeAct } from './act/propose-act';
 import { isRecord } from './is-record';
-import { refusal, upstreamFailure, type ActResult, type PlanResult } from './act/types';
-import { createMockAuthenticator, type Authenticator } from './auth/authenticate';
+import {
+  refusal,
+  upstreamFailure,
+  type ActResult,
+  type PlanResult,
+} from './act/types';
+import {
+  createMockAuthenticator,
+  type Authenticator,
+} from './auth/authenticate';
 import { withMemberCredential } from './auth/call-context';
 import type { MemberPrincipal } from './auth/types';
 import { AuditLog, type AuditAction, type AuditEntry } from './audit/audit-log';
@@ -25,7 +46,13 @@ const PLAN_PATH = '/v1/ai/plan';
 const UNDO_PATH = '/v1/ai/undo';
 const TOOLS_PATH = '/v1/ai/tools';
 const AUDIT_PATH = '/v1/ai/audit';
-const KNOWN_PATHS = new Set([ACT_PATH, PLAN_PATH, UNDO_PATH, TOOLS_PATH, AUDIT_PATH]);
+const KNOWN_PATHS = new Set([
+  ACT_PATH,
+  PLAN_PATH,
+  UNDO_PATH,
+  TOOLS_PATH,
+  AUDIT_PATH,
+]);
 const MAX_BODY_BYTES = 64 * 1024;
 
 export type GatewayOptions = ExecuteActOptions & {
@@ -99,7 +126,9 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
         return;
       }
 
-      console.error(error instanceof Error ? error.message : 'Unexpected error');
+      console.error(
+        error instanceof Error ? error.message : 'Unexpected error',
+      );
       sendJson(
         response,
         500,
@@ -207,13 +236,20 @@ async function handleAuthenticated(
   }
 
   if (request.method === 'GET' && url.pathname === AUDIT_PATH) {
-    sendJson(response, 200, { ok: true, entries: runtime.audit.list(principal.memberId) }, cors);
+    sendJson(
+      response,
+      200,
+      { ok: true, entries: runtime.audit.list(principal.memberId) },
+      cors,
+    );
     return;
   }
 
   if (
     request.method !== 'POST' ||
-    (url.pathname !== ACT_PATH && url.pathname !== PLAN_PATH && url.pathname !== UNDO_PATH)
+    (url.pathname !== ACT_PATH &&
+      url.pathname !== PLAN_PATH &&
+      url.pathname !== UNDO_PATH)
   ) {
     sendJson(response, 405, { ok: false, message: 'Method not allowed' }, cors);
     return;
@@ -266,7 +302,9 @@ async function handleAuthenticated(
     return;
   }
 
-  const idempotencyKey = readIdempotencyKey(headerValue(request.headers['idempotency-key']));
+  const idempotencyKey = readIdempotencyKey(
+    headerValue(request.headers['idempotency-key']),
+  );
 
   if (idempotencyKey === 'invalid') {
     const body = refusal(
@@ -286,15 +324,39 @@ async function handleAuthenticated(
     return { status: statusFor(result), body: result };
   };
 
+  if (url.pathname === ACT_PATH && wantsEventStream(request)) {
+    await streamAct(
+      parsed,
+      rawBody,
+      response,
+      runtime,
+      principal,
+      cors,
+      idempotencyKey,
+    );
+    return;
+  }
+
   if (!idempotencyKey) {
     const result = await execute();
-    const entry = rememberOutcome(runtime, principal, url.pathname, confirmed, result.body);
+    const entry = rememberOutcome(
+      runtime,
+      principal,
+      url.pathname,
+      confirmed,
+      result.body,
+    );
     linkUndoToAct(runtime, principal.memberId, result.body, entry, false);
     sendJson(response, result.status, result.body, cors);
     return;
   }
 
-  const stored = await runtime.idempotency.run(principal.memberId, idempotencyKey, rawBody, execute);
+  const stored = await runtime.idempotency.run(
+    principal.memberId,
+    idempotencyKey,
+    rawBody,
+    execute,
+  );
 
   if ('conflict' in stored && stored.conflict) {
     const body = refusal(
@@ -328,17 +390,150 @@ async function handleAuthenticated(
     stored.response.body,
     stored.replayed,
   );
-  linkUndoToAct(runtime, principal.memberId, stored.response.body, entry, stored.replayed);
+  linkUndoToAct(
+    runtime,
+    principal.memberId,
+    stored.response.body,
+    entry,
+    stored.replayed,
+  );
   sendJson(response, stored.response.status, stored.response.body, {
     ...cors,
     ...(stored.replayed ? { 'idempotency-replayed': 'true' } : {}),
   });
 }
 
+async function streamAct(
+  body: unknown,
+  rawBody: string,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+  idempotencyKey: string | undefined,
+): Promise<void> {
+  response.writeHead(200, {
+    ...cors,
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+
+  const confirmed = isRecord(body) && body.confirmed === true;
+  const execute = async () => {
+    const result = await executeConfirmedAct(
+      body,
+      runtime,
+      principal,
+      (event) => {
+        writeEvent(response, 'progress', progressPayload(event));
+      },
+    );
+
+    return { status: statusFor(result), body: result };
+  };
+
+  const finish = (payload: unknown, replayed: boolean) => {
+    const entry = rememberOutcome(
+      runtime,
+      principal,
+      ACT_PATH,
+      confirmed,
+      payload,
+      replayed,
+    );
+    linkUndoToAct(runtime, principal.memberId, payload, entry, replayed);
+    const event = isRecord(payload) && payload.ok === true ? 'result' : 'error';
+    writeEvent(response, event, payload);
+    response.end();
+  };
+
+  if (!idempotencyKey) {
+    const result = await execute();
+    finish(result.body, false);
+    return;
+  }
+
+  const stored = await runtime.idempotency.run(
+    principal.memberId,
+    idempotencyKey,
+    rawBody,
+    execute,
+  );
+
+  if ('conflict' in stored && stored.conflict) {
+    finish(
+      refusal(
+        'idempotency_conflict',
+        'This idempotency key was already used with a different request body.',
+      ),
+      false,
+    );
+    return;
+  }
+
+  if ('full' in stored && stored.full) {
+    finish(
+      refusal(
+        'invalid_request',
+        'The idempotency store is full. New keys are refused so an evicted key cannot run a write twice.',
+      ),
+      false,
+    );
+    return;
+  }
+
+  if (!('response' in stored)) {
+    response.end();
+    return;
+  }
+
+  finish(stored.response.body, stored.replayed);
+}
+
+function progressPayload(event: SettledToolEvent): Record<string, unknown> {
+  const record =
+    event.result.status === 'found' ? undefined : event.result.record;
+
+  return {
+    index: event.index,
+    total: event.total,
+    tool: event.result.tool,
+    status: event.result.status,
+    ...(record
+      ? { id: record.id, objectName: record.objectName, label: record.label }
+      : {}),
+  };
+}
+
+function claimRefusal(
+  reason: 'missing' | 'expired' | 'workspace' | 'choice',
+): ActResult {
+  if (reason === 'workspace') {
+    return refusal(
+      'cross_workspace',
+      'This preview belongs to a different workspace.',
+    );
+  }
+
+  if (reason === 'choice') {
+    return refusal(
+      'confirmation_required',
+      'Choose a record for each name, then confirm. Nothing was written.',
+    );
+  }
+
+  return refusal(
+    'confirmation_required',
+    'This preview expired, was already confirmed, or does not exist. Propose it again.',
+  );
+}
+
 async function executeConfirmedAct(
   body: unknown,
   runtime: GatewayRuntime,
   principal: MemberPrincipal,
+  onSettled?: (event: SettledToolEvent) => void,
 ): Promise<ActResult> {
   const parsed = parseGatewayRequest(body);
 
@@ -346,7 +541,10 @@ async function executeConfirmedAct(
     return parsed;
   }
 
-  if (runtime.boundWorkspaceId && parsed.workspaceId !== runtime.boundWorkspaceId) {
+  if (
+    runtime.boundWorkspaceId &&
+    parsed.workspaceId !== runtime.boundWorkspaceId
+  ) {
     return refusal(
       'cross_workspace',
       `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
@@ -360,6 +558,28 @@ async function executeConfirmedAct(
     );
   }
 
+  const peeked = runtime.proposals.peek(
+    parsed.proposalId,
+    parsed.workspaceId,
+    principal.memberId,
+    parsed.choiceId,
+    parsed.choices,
+  );
+
+  if (!peeked.ok) {
+    return claimRefusal(peeked.reason);
+  }
+
+  const live = await findStaleChanges(
+    runtime.client,
+    parsed.workspaceId,
+    peeked.proposal.tools,
+  );
+
+  if (!live.ok) {
+    return live.failure;
+  }
+
   const claimed = runtime.proposals.claim(
     parsed.proposalId,
     parsed.workspaceId,
@@ -369,21 +589,7 @@ async function executeConfirmedAct(
   );
 
   if (!claimed.ok) {
-    if (claimed.reason === 'workspace') {
-      return refusal('cross_workspace', 'This preview belongs to a different workspace.');
-    }
-
-    if (claimed.reason === 'choice') {
-      return refusal(
-        'confirmation_required',
-        'Choose a record for each name, then confirm. Nothing was written.',
-      );
-    }
-
-    return refusal(
-      'confirmation_required',
-      'This preview expired, was already confirmed, or does not exist. Propose it again.',
-    );
+    return claimRefusal(claimed.reason);
   }
 
   const executed = await executeAct(
@@ -393,7 +599,10 @@ async function executeConfirmedAct(
       tools: claimed.proposal.tools,
     },
     runtime.client,
-    { boundWorkspaceId: runtime.boundWorkspaceId },
+    {
+      boundWorkspaceId: runtime.boundWorkspaceId,
+      ...(onSettled ? { onSettled } : {}),
+    },
   );
 
   if (!executed.ok) {
@@ -406,7 +615,11 @@ async function executeConfirmedAct(
     return publicResult;
   }
 
-  const ticket = runtime.undos.save(principal.memberId, parsed.workspaceId, effects);
+  const ticket = runtime.undos.save(
+    principal.memberId,
+    parsed.workspaceId,
+    effects,
+  );
 
   if (!ticket) {
     return publicResult;
@@ -430,7 +643,10 @@ async function executeConfirmedUndo(
     return parsed;
   }
 
-  if (runtime.boundWorkspaceId && parsed.workspaceId !== runtime.boundWorkspaceId) {
+  if (
+    runtime.boundWorkspaceId &&
+    parsed.workspaceId !== runtime.boundWorkspaceId
+  ) {
     return refusal(
       'cross_workspace',
       `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
@@ -444,15 +660,25 @@ async function executeConfirmedUndo(
     );
   }
 
-  const begun = runtime.undos.begin(parsed.undoId, principal.memberId, parsed.workspaceId);
+  const begun = runtime.undos.begin(
+    parsed.undoId,
+    principal.memberId,
+    parsed.workspaceId,
+  );
 
   if (!begun.ok) {
     if (begun.reason === 'workspace') {
-      return refusal('cross_workspace', 'This undo belongs to a different workspace.');
+      return refusal(
+        'cross_workspace',
+        'This undo belongs to a different workspace.',
+      );
     }
 
     if (begun.reason === 'busy') {
-      return refusal('confirmation_required', 'Undo is already running for this change.');
+      return refusal(
+        'confirmation_required',
+        'Undo is already running for this change.',
+      );
     }
 
     if (begun.reason === 'order') {
@@ -462,10 +688,16 @@ async function executeConfirmedUndo(
       );
     }
 
-    return refusal('not_found', 'There is no matching undo for the last confirmed change.');
+    return refusal(
+      'not_found',
+      'There is no matching undo for the last confirmed change.',
+    );
   }
 
-  const permission = assertCanUndo(begun.ticket.effects, await loadAudience(runtime.client));
+  const permission = assertCanUndo(
+    begun.ticket.effects,
+    await loadAudience(runtime.client),
+  );
 
   if (permission) {
     runtime.undos.release(principal.memberId);
@@ -496,11 +728,18 @@ async function executeConfirmedUndo(
 
   if (failures.some((failure) => failure.reason === 'superseded')) {
     const failedIndexes = new Set(failures.map((failure) => failure.index));
-    const remaining = begun.ticket.effects.filter((_effect, index) => failedIndexes.has(index));
+    const remaining = begun.ticket.effects.filter((_effect, index) =>
+      failedIndexes.has(index),
+    );
     const nothingReversed = remaining.length === begun.ticket.effects.length;
 
     if (!nothingReversed) {
-      runtime.undos.retain(parsed.undoId, principal.memberId, parsed.workspaceId, remaining);
+      runtime.undos.retain(
+        parsed.undoId,
+        principal.memberId,
+        parsed.workspaceId,
+        remaining,
+      );
     }
 
     runtime.undos.release(principal.memberId);
@@ -515,10 +754,17 @@ async function executeConfirmedUndo(
 
   if (failures.length > 0) {
     const failedIndexes = new Set(failures.map((failure) => failure.index));
-    const remaining = begun.ticket.effects.filter((_effect, index) => failedIndexes.has(index));
+    const remaining = begun.ticket.effects.filter((_effect, index) =>
+      failedIndexes.has(index),
+    );
 
     if (remaining.length < begun.ticket.effects.length) {
-      runtime.undos.retain(parsed.undoId, principal.memberId, parsed.workspaceId, remaining);
+      runtime.undos.retain(
+        parsed.undoId,
+        principal.memberId,
+        parsed.workspaceId,
+        remaining,
+      );
     }
 
     runtime.undos.release(principal.memberId);
@@ -568,7 +814,10 @@ async function streamPlan(
     connection: 'keep-alive',
   });
 
-  const workspaceId = isRecord(parsed) && typeof parsed.workspaceId === 'string' ? parsed.workspaceId : 'ws_demo';
+  const workspaceId =
+    isRecord(parsed) && typeof parsed.workspaceId === 'string'
+      ? parsed.workspaceId
+      : 'ws_demo';
 
   const result = await proposeAct(parsed, runtime.client, runtime.llm, {
     boundWorkspaceId: runtime.boundWorkspaceId,
@@ -594,10 +843,16 @@ async function streamPlan(
 }
 
 function wantsEventStream(request: IncomingMessage): boolean {
-  return (headerValue(request.headers.accept) ?? '').includes('text/event-stream');
+  return (headerValue(request.headers.accept) ?? '').includes(
+    'text/event-stream',
+  );
 }
 
-function writeEvent(response: ServerResponse, event: string, data: unknown): void {
+function writeEvent(
+  response: ServerResponse,
+  event: string,
+  data: unknown,
+): void {
   response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
@@ -619,7 +874,14 @@ function linkUndoToAct(
   entry: { id: string; action: string; ok: boolean } | undefined,
   replayed: boolean,
 ): void {
-  if (replayed || !entry || entry.action !== 'act' || !entry.ok || !isRecord(body) || !isRecord(body.undo)) {
+  if (
+    replayed ||
+    !entry ||
+    entry.action !== 'act' ||
+    !entry.ok ||
+    !isRecord(body) ||
+    !isRecord(body.undo)
+  ) {
     return;
   }
 
@@ -652,7 +914,8 @@ function rememberOutcome(
     });
   }
 
-  const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId : undefined;
+  const workspaceId =
+    typeof body.workspaceId === 'string' ? body.workspaceId : undefined;
   const ok = body.ok === true;
   const reason = typeof body.reason === 'string' ? body.reason : undefined;
   const tools = ok ? toolNames(body) : [];
@@ -661,11 +924,15 @@ function rememberOutcome(
     (isRecord(body.proposal) && typeof body.proposal.summary === 'string'
       ? body.proposal.summary
       : undefined) ??
+    (isRecord(body.answer) && typeof body.answer.summary === 'string'
+      ? body.answer.summary
+      : undefined) ??
     (typeof body.summary === 'string' ? body.summary : undefined) ??
     (typeof body.message === 'string' ? body.message : undefined) ??
     (ok ? `${action} completed` : 'Request failed');
 
-  const reverses = typeof body.reversesAuditId === 'string' ? body.reversesAuditId : undefined;
+  const reverses =
+    typeof body.reversesAuditId === 'string' ? body.reversesAuditId : undefined;
 
   return remember(runtime, {
     memberId: principal.memberId,
@@ -673,7 +940,8 @@ function rememberOutcome(
     action,
     workspaceId,
     summary,
-    tools: ok && isRecord(body.proposal) ? proposalToolNames(body.proposal) : tools,
+    tools:
+      ok && isRecord(body.proposal) ? proposalToolNames(body.proposal) : tools,
     recordIds,
     ok,
     confirmed: action === 'act' ? confirmed : undefined,
@@ -689,7 +957,9 @@ function proposalToolNames(proposal: Record<string, unknown>): string[] {
   }
 
   return proposal.tools
-    .map((tool) => (isRecord(tool) && typeof tool.name === 'string' ? tool.name : undefined))
+    .map((tool) =>
+      isRecord(tool) && typeof tool.name === 'string' ? tool.name : undefined,
+    )
     .filter((name): name is string => name !== undefined);
 }
 
@@ -699,7 +969,11 @@ function toolNames(body: Record<string, unknown>): string[] {
   }
 
   return body.results
-    .map((result) => (isRecord(result) && typeof result.tool === 'string' ? result.tool : undefined))
+    .map((result) =>
+      isRecord(result) && typeof result.tool === 'string'
+        ? result.tool
+        : undefined,
+    )
     .filter((name): name is string => name !== undefined);
 }
 
@@ -798,8 +1072,14 @@ function statusFor(result: ActResult | PlanResult): number {
   return 400;
 }
 
-function corsFor(request: IncomingMessage, runtime: GatewayRuntime): Record<string, string> {
-  return corsHeadersFor(headerValue(request.headers.origin), runtime.allowedOrigins);
+function corsFor(
+  request: IncomingMessage,
+  runtime: GatewayRuntime,
+): Record<string, string> {
+  return corsHeadersFor(
+    headerValue(request.headers.origin),
+    runtime.allowedOrigins,
+  );
 }
 
 function sendJson(

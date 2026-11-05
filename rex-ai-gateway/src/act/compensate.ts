@@ -1,5 +1,8 @@
-import { CrmNotFoundError } from '../twenty/crm-errors';
-import type { TwentyCrmClient, TwentyObjectName } from '../twenty/twenty-crm-client';
+import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
+import type {
+  TwentyCrmClient,
+  TwentyObjectName,
+} from '../twenty/twenty-crm-client';
 import { isUpdatableField } from './writable-fields';
 import type { ActEffect, ActPartialFailure } from './types';
 
@@ -18,7 +21,9 @@ export async function compensate(
   const remaining: CompensateFailure[] = [];
   const reversedInThisPass = new Set<string>();
 
-  for (const { effect, index } of effects.map((effect, index) => ({ effect, index })).reverse()) {
+  for (const { effect, index } of effects
+    .map((effect, index) => ({ effect, index }))
+    .reverse()) {
     const key = `${effect.objectName}:${effect.id}`;
 
     try {
@@ -32,6 +37,7 @@ export async function compensate(
           workspaceId,
           objectName: effect.objectName,
           id: effect.id,
+          ifMatch: effect.etag,
         });
         continue;
       }
@@ -60,6 +66,7 @@ export async function compensate(
           workspaceId,
           objectName: effect.objectName,
           id: effect.id,
+          ...(effect.etag ? { ifMatch: effect.etag } : {}),
         });
         continue;
       }
@@ -92,7 +99,10 @@ export async function compensate(
       // A later effect in this same undo already rewrote the row, so its etag moved.
       // Any other etag means the field may no longer hold the value this act wrote.
       if (!reversedInThisPass.has(key) && current.etag !== effect.etag) {
-        const currentValue = Object.prototype.hasOwnProperty.call(current.properties, effect.field)
+        const currentValue = Object.prototype.hasOwnProperty.call(
+          current.properties,
+          effect.field,
+        )
           ? current.properties[effect.field]
           : undefined;
         // A newer undo on this row moves the etag while leaving this act's value in place.
@@ -128,6 +138,11 @@ export async function compensate(
         continue;
       }
 
+      if (error instanceof CrmPreconditionError) {
+        remaining.push({ index, id: effect.id, reason: 'conflict' });
+        continue;
+      }
+
       remaining.push({ index, id: effect.id, reason: 'error' });
     }
   }
@@ -146,7 +161,10 @@ async function readCreatedEtag(
       return note.etag;
     }
 
-    if (effect.objectName === 'noteTarget' || !isWorkspaceObject(effect.objectName)) {
+    if (
+      effect.objectName === 'noteTarget' ||
+      !isWorkspaceObject(effect.objectName)
+    ) {
       return effect.etag ?? 'missing';
     }
 
@@ -167,10 +185,17 @@ async function readCreatedEtag(
 }
 
 function isWorkspaceObject(objectName: string): objectName is TwentyObjectName {
-  return objectName === 'person' || objectName === 'company' || objectName === 'opportunity';
+  return (
+    objectName === 'person' ||
+    objectName === 'company' ||
+    objectName === 'opportunity'
+  );
 }
 
-export function partialFailure(message: string, remainingRecordIds: string[]): ActPartialFailure {
+export function partialFailure(
+  message: string,
+  remainingRecordIds: string[],
+): ActPartialFailure {
   return {
     ok: false,
     refused: false,

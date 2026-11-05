@@ -77,12 +77,14 @@ export type SearchRecordsInput = {
   objectName: TwentyObjectName;
   query: string;
   limit: number;
+  linkedCompanyId?: string;
 };
 
 export type SearchTimelineInput = {
   workspaceId: string;
   query: string;
   limit: number;
+  recordId?: string;
 };
 
 export type GetRecordInput = {
@@ -104,6 +106,7 @@ export type DeleteRecordInput = {
   workspaceId: string;
   objectName: DeletableObjectName;
   id: string;
+  ifMatch?: string;
 };
 
 export type ClearRecordFieldInput = {

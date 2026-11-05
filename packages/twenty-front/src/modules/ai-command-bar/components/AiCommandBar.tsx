@@ -2,17 +2,21 @@ import { useLingui } from '@lingui/react/macro';
 import { styled } from '@linaria/react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { isPlainObject } from 'twenty-shared/utils';
 import { themeCssVariables } from 'twenty-ui/theme';
 
+import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   executeAiCommand,
   proposeAiCommand,
   undoAiCommand,
+  type AiAnswer,
   type AiProposal,
   type AiProposalLine,
   type AiRecordLink,
   type AiUndo,
 } from '@/ai-command-bar/utils/aiCommandBarClient';
+import { useSetAtomState } from '@/ui/utilities/state/jotai/hooks/useSetAtomState';
 import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
 import { isAiCommandBarShortcut } from '@/ai-command-bar/utils/isAiCommandBarShortcut';
 import { sidePanelNavigationStackState } from '@/side-panel/states/sidePanelNavigationStackState';
@@ -34,8 +38,17 @@ type Phase =
       idempotencyKey: string;
       choiceId?: string;
       choiceIds: Record<string, string>;
+      blocked?: boolean;
+      blockMessage?: string;
+      answer?: AiAnswer;
     }
-  | { name: 'executing'; draft: string; proposal: AiProposal }
+  | {
+      name: 'executing';
+      draft: string;
+      proposal: AiProposal;
+      progress?: string;
+    }
+  | { name: 'answer'; draft: string; answer: AiAnswer }
   | {
       name: 'done';
       links: AiRecordLink[];
@@ -73,6 +86,7 @@ export const AiCommandBar = ({
   const openRecord = panelRecord ?? routeRecord;
   const [open, setOpen] = useState(initialOpen);
   const [phase, setPhase] = useState<Phase>({ name: 'compose', draft: '' });
+  const setFieldPreview = useSetAtomState(aiCommandBarFieldPreviewState);
   const executing = phase.name === 'executing' || phase.name === 'undoing';
   const busy = phase.name === 'planning' || executing;
 
@@ -93,6 +107,7 @@ export const AiCommandBar = ({
 
   useEffect(() => {
     if (!open) {
+      setFieldPreview([]);
       setPhase({ name: 'compose', draft: '' });
 
       if (wasOpen) {
@@ -104,7 +119,7 @@ export const AiCommandBar = ({
 
     setWasOpen(true);
     inputRef.current?.focus();
-  }, [open, wasOpen]);
+  }, [open, setFieldPreview, wasOpen]);
 
   useEffect(() => {
     if (!open) {
@@ -203,6 +218,7 @@ export const AiCommandBar = ({
       input.dataset.generation = generation;
     }
 
+    setFieldPreview([]);
     setPhase({ name: 'planning', draft, lines: [] });
 
     const outcome = await proposeAiCommand(
@@ -223,28 +239,52 @@ export const AiCommandBar = ({
       return;
     }
 
-    if (outcome.kind === 'message') {
-      setPhase({ name: 'refused', draft, message: outcome.message });
+    if (outcome.kind === 'message' || outcome.kind === 'stale') {
+      setPhase({
+        name: 'refused',
+        draft,
+        message:
+          outcome.kind === 'message'
+            ? outcome.message
+            : 'The AI gateway returned an unexpected plan.',
+      });
       return;
     }
 
+    if (!outcome.data.proposal) {
+      setPhase({
+        name: 'answer',
+        draft,
+        answer: outcome.data.answer ?? {
+          summary: 'No matching records.',
+          records: [],
+        },
+      });
+      return;
+    }
+
+    setFieldPreview(outcome.data.proposal.changes ?? []);
     setPhase({
       name: 'preview',
       draft,
-      proposal: outcome.data,
+      proposal: outcome.data.proposal,
       idempotencyKey: crypto.randomUUID(),
       choiceIds: {},
+      ...(outcome.data.answer ? { answer: outcome.data.answer } : {}),
     });
   };
 
-  const confirm = async (
-    proposal: AiProposal,
-    idempotencyKey: string,
-    draft: string,
-    choiceId?: string,
-    choiceIds?: Record<string, string>,
-  ) => {
+  const confirm = async (current: Extract<Phase, { name: 'preview' }>) => {
+    if (current.blocked) {
+      return;
+    }
+
     const generation = readGeneration();
+    const { proposal, idempotencyKey, draft } = current;
+    const bulk =
+      proposal.tools.filter(
+        (tool) => isPlainObject(tool) && tool.name === 'update_record',
+      ).length > 1;
 
     setPhase({ name: 'executing', draft, proposal });
 
@@ -253,19 +293,43 @@ export const AiCommandBar = ({
       proposal.id,
       idempotencyKey,
       fetchImpl,
-      choiceId,
-      choiceIds,
+      current.proposal.choice?.groups ? undefined : current.choiceId,
+      current.proposal.choice?.groups ? current.choiceIds : undefined,
+      bulk
+        ? (progress) => {
+            if (generation !== readGeneration()) {
+              return;
+            }
+
+            setPhase({ name: 'executing', draft, proposal, progress });
+          }
+        : undefined,
     );
 
     if (generation !== readGeneration()) {
       return;
     }
 
+    if (outcome.kind === 'stale') {
+      const nextProposal = { ...proposal, changes: outcome.changes };
+
+      setFieldPreview(outcome.changes);
+      setPhase({
+        ...current,
+        proposal: nextProposal,
+        blocked: true,
+        blockMessage: outcome.message,
+      });
+      return;
+    }
+
     if (outcome.kind === 'message') {
+      setFieldPreview([]);
       setPhase({ name: 'refused', draft, message: outcome.message });
       return;
     }
 
+    setFieldPreview([]);
     setPhase({
       name: 'done',
       links: outcome.data.links,
@@ -329,6 +393,7 @@ export const AiCommandBar = ({
   };
 
   const cancelPreview = (draft: string) => {
+    setFieldPreview([]);
     setPhase({
       name: 'compose',
       draft,
@@ -441,12 +506,26 @@ export const AiCommandBar = ({
             )}
             {(phase.name === 'executing' || phase.name === 'undoing') && (
               <StyledNotice role="status">
-                {phase.name === 'undoing' ? t`Undoing…` : t`Working…`}
+                {phase.name === 'undoing'
+                  ? t`Undoing…`
+                  : (phase.progress ?? t`Working…`)}
               </StyledNotice>
             )}
             {(phase.name === 'preview' || phase.name === 'executing') && (
               <>
                 <StyledSummary>{phase.proposal.summary}</StyledSummary>
+                {phase.name === 'preview' && phase.answer && (
+                  <AnswerList answer={phase.answer} />
+                )}
+                {phase.name === 'preview' &&
+                  phase.proposal.warnings?.map((warning) => (
+                    <StyledWarning key={warning.code} role="status">
+                      {warning.message}
+                    </StyledWarning>
+                  ))}
+                {phase.name === 'preview' && phase.blockMessage && (
+                  <StyledError role="alert">{phase.blockMessage}</StyledError>
+                )}
                 {phase.name === 'preview' &&
                   phase.proposal.choice?.groups?.map((group) => (
                     <StyledChoices key={group.id}>
@@ -537,6 +616,14 @@ export const AiCommandBar = ({
                       .map((line, index) => (
                         <li key={`${index}-${line.tool}`}>{line.summary}</li>
                       ))}
+                    {phase.name === 'preview' &&
+                      phase.proposal.changes?.map((change) => (
+                        <li
+                          key={`${change.recordId}-${change.field ?? 'archive'}`}
+                        >
+                          {change.summary}
+                        </li>
+                      ))}
                   </StyledList>
                 )}
               </>
@@ -547,25 +634,14 @@ export const AiCommandBar = ({
                   ref={confirmRef}
                   type="button"
                   disabled={
-                    phase.proposal.choice?.groups
+                    phase.blocked ||
+                    (phase.proposal.choice?.groups
                       ? !phase.proposal.choice.groups.every(
                           (group) => phase.choiceIds[group.id],
                         )
-                      : Boolean(phase.proposal.choice) && !phase.choiceId
+                      : Boolean(phase.proposal.choice) && !phase.choiceId)
                   }
-                  onClick={() =>
-                    void confirm(
-                      phase.proposal,
-                      phase.idempotencyKey,
-                      phase.draft,
-                      phase.proposal.choice?.groups
-                        ? undefined
-                        : phase.choiceId,
-                      phase.proposal.choice?.groups
-                        ? phase.choiceIds
-                        : undefined,
-                    )
-                  }
+                  onClick={() => void confirm(phase)}
                 >
                   {t`Confirm`}
                 </StyledPrimary>
@@ -576,6 +652,19 @@ export const AiCommandBar = ({
                   {t`Cancel`}
                 </StyledSecondary>
               </StyledActions>
+            )}
+            {phase.name === 'answer' && (
+              <>
+                <AnswerList answer={phase.answer} />
+                <StyledNotice role="status">
+                  {t`Nothing was changed.`}
+                </StyledNotice>
+                <StyledActions>
+                  <StyledSecondary type="button" onClick={close}>
+                    {t`Close`}
+                  </StyledSecondary>
+                </StyledActions>
+              </>
             )}
             {phase.name === 'refused' && (
               <>
@@ -812,7 +901,29 @@ const StyledList = styled.ul`
   padding-left: ${themeCssVariables.spacing[4]};
 `;
 
+const AnswerList = ({ answer }: { answer: AiAnswer }) => (
+  <>
+    <StyledSummary>{answer.summary}</StyledSummary>
+    {answer.records.length > 0 && (
+      <StyledList>
+        {answer.records.map((record) => (
+          <li key={`${record.objectName}-${record.id}`}>
+            {record.label}
+            {record.detail ? ` — ${record.detail}` : ''}
+          </li>
+        ))}
+      </StyledList>
+    )}
+  </>
+);
+
 const StyledNotice = styled.p`
+  color: ${themeCssVariables.font.color.secondary};
+  font-size: ${themeCssVariables.font.size.sm};
+  margin: 0;
+`;
+
+const StyledWarning = styled.p`
   color: ${themeCssVariables.font.color.secondary};
   font-size: ${themeCssVariables.font.size.sm};
   margin: 0;
