@@ -32,7 +32,9 @@ import {
   type AudienceLoad,
 } from './permissions';
 import { answerReads, isReadTool } from './answer-reads';
-import { captureToTools } from './capture-text';
+import { captureToTools, resolveCaptureText } from './capture-text';
+import { createsFromSlots } from './preview-creates';
+import { fillSkillParameters } from './skill-parameters';
 import { describeTool, partialsForRole, summarizeLines } from './describe-tool';
 import { changesFromSlots } from './preview-changes';
 import { collectWarnings } from './preview-warnings';
@@ -50,8 +52,10 @@ import {
   type PlanProposal,
   type PlanResult,
   type ProposalChange,
+  type ProposalCreate,
   type ProposalLine,
   type ProposalWarning,
+  type ReadEvent,
   type ToolCall,
 } from './types';
 import { validateTool, type ValidatedTool } from './validate-tool';
@@ -63,6 +67,7 @@ export type ProposeActOptions = ExecuteActOptions & {
   memberId?: string;
   actorMemberId?: string;
   onPartial?: (tools: PartialToolCall[]) => void;
+  onRead?: (event: ReadEvent) => void;
 };
 
 export async function proposeAct(
@@ -116,7 +121,16 @@ export async function proposeAct(
   }
 
   if (parsed.capture) {
-    const captured = captureToTools(parsed.capture, audience);
+    const capturedText = await resolveCaptureText(parsed.capture, llm);
+
+    if ('reason' in capturedText) {
+      return capturedText;
+    }
+
+    const captured = captureToTools(
+      { source: parsed.capture.source, text: capturedText.text },
+      audience,
+    );
 
     if ('refused' in captured) {
       return captured;
@@ -148,10 +162,24 @@ export async function proposeAct(
       );
     }
 
+    const filled = fillSkillParameters(
+      skill.tools,
+      parsed.parameterValues ?? {},
+    );
+
+    if (!filled.ok) {
+      return {
+        ok: true,
+        workspaceId: parsed.workspaceId,
+        summary: `Fill ${filled.missing.map((item) => item.label.toLowerCase()).join(', ')} before Confirm.`,
+        parameters: filled.missing,
+      };
+    }
+
     return previewTools(
       client,
       parsed.workspaceId,
-      withoutLiveEtag(skill.tools),
+      withoutLiveEtag(filled.tools),
       options,
       audience,
       undefined,
@@ -397,7 +425,12 @@ async function previewTools(
   let answer: PlanAnswer | undefined;
 
   if (reads.length > 0) {
-    const answered = await answerReads(client, workspaceId, reads);
+    const answered = await answerReads(
+      client,
+      workspaceId,
+      reads,
+      options.onRead,
+    );
 
     if ('reason' in answered) {
       return answered;
@@ -420,6 +453,7 @@ async function previewTools(
   const bulkTools = new Set<ValidatedTool>();
   let changes: ProposalChange[] = [];
   let warnings: ProposalWarning[] = [];
+  let creates: ProposalCreate[] = [];
 
   try {
     const expanded = await expandMatchingUpdates(
@@ -460,6 +494,7 @@ async function previewTools(
 
     changes = changesFromSlots(slots);
     warnings = await collectWarnings(client, workspaceId, slots);
+    creates = createsFromSlots(slots);
   } catch (error) {
     if (error instanceof CrmNotFoundError) {
       return refusal('not_found', error.message, { toolName: 'update_record' });
@@ -476,7 +511,7 @@ async function previewTools(
 
   const choiceCount = slots.filter((slot) => slot.type === 'choice').length;
 
-  const extras = { changes, warnings };
+  const extras = { changes, warnings, creates };
 
   if (choiceCount === 1 && slots.length === 1 && slots[0]?.type === 'choice') {
     return withAnswer(
@@ -942,17 +977,21 @@ function storePreview(
 type PreviewExtras = {
   changes?: ProposalChange[];
   warnings?: ProposalWarning[];
+  creates?: ProposalCreate[];
 };
 
 function previewExtras(
   extras: PreviewExtras | undefined,
-): Pick<PlanProposal, 'changes' | 'warnings'> {
+): Pick<PlanProposal, 'changes' | 'warnings' | 'creates'> {
   return {
     ...(extras?.changes && extras.changes.length > 0
       ? { changes: extras.changes }
       : {}),
     ...(extras?.warnings && extras.warnings.length > 0
       ? { warnings: extras.warnings }
+      : {}),
+    ...(extras?.creates && extras.creates.length > 0
+      ? { creates: extras.creates }
       : {}),
   };
 }

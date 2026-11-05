@@ -13,6 +13,8 @@ import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFro
 import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
 import { AiRecordFieldPreview } from '@/ai-command-bar/components/AiRecordFieldPreview';
 import { AiRecordTableFieldPreview } from '@/ai-command-bar/components/AiRecordTableFieldPreview';
+import { AiRecordTableGhostRows } from '@/ai-command-bar/components/AiRecordTableGhostRows';
+import { aiCommandBarCreatePreviewState } from '@/ai-command-bar/states/aiCommandBarCreatePreviewState';
 import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   readAiCommandBarConfig,
@@ -1368,6 +1370,290 @@ describe('round 8 command bar', () => {
     expect(screen.getByText(/city: Current city “Lisbon”/)).toBeInTheDocument();
   });
 });
+
+describe('round 9 command bar', () => {
+  it('shows each timeline record as the read stream arrives', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const fetchImpl = jest.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: read\ndata: ${JSON.stringify({
+                tool: 'search_notes',
+                summary: 'Read notes on the open record',
+                records: [
+                  {
+                    id: 'note_1',
+                    objectName: 'note',
+                    label: 'Buyer call',
+                    detail: 'Talked about the pilot',
+                  },
+                ],
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+
+      return {
+        headers: { get: () => 'text/event-stream' },
+        body: stream,
+      } as unknown as Response;
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'what happened with this deal',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(await screen.findByText(/Buyer call/)).toBeInTheDocument();
+    expect(screen.queryByText(/Send proposal/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm' }),
+    ).not.toBeInTheDocument();
+
+    streamController?.enqueue(
+      encoder.encode(
+        `event: read\ndata: ${JSON.stringify({
+          tool: 'search_tasks',
+          summary: 'Read tasks on the open record',
+          records: [
+            {
+              id: 'task_1',
+              objectName: 'task',
+              label: 'Send proposal',
+            },
+          ],
+        })}\n\n`,
+      ),
+    );
+
+    expect(await screen.findByText('Send proposal')).toBeInTheDocument();
+
+    streamController?.enqueue(
+      encoder.encode(
+        `event: proposal\ndata: ${JSON.stringify({
+          ok: true,
+          workspaceId: 'ws_demo',
+          summary: 'Read notes. 2 matches.',
+          answer: {
+            summary: 'Read notes. 2 matches.',
+            records: [
+              {
+                id: 'note_1',
+                objectName: 'note',
+                label: 'Buyer call',
+                detail: 'Talked about the pilot',
+              },
+              { id: 'task_1', objectName: 'task', label: 'Send proposal' },
+            ],
+          },
+        })}\n\n`,
+      ),
+    );
+    streamController?.close();
+
+    expect(
+      await screen.findByText('Read notes. 2 matches.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('leaves city blank on a saved skill and fills it before confirm', async () => {
+    const user = userEvent.setup();
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        bodies.push(body);
+
+        if (url.endsWith('/v1/ai/skills') && init?.method !== 'GET') {
+          return jsonResponse({
+            ok: true,
+            skill: {
+              id: 'skill_44444444-4444-4444-8444-444444444444',
+              name: 'Move city',
+              tools: ['update_record'],
+              parameters: ['city'],
+            },
+          });
+        }
+
+        if (url.endsWith('/v1/ai/skills')) {
+          return jsonResponse({
+            ok: true,
+            skills: [
+              {
+                id: 'skill_44444444-4444-4444-8444-444444444444',
+                name: 'Move city',
+                tools: ['update_record'],
+                parameters: ['city'],
+              },
+            ],
+          });
+        }
+
+        if (url.endsWith('/v1/ai/plan') && body.parameterValues) {
+          return jsonResponse(updateProposal);
+        }
+
+        if (url.endsWith('/v1/ai/plan')) {
+          return jsonResponse(updateProposal);
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          results: [],
+          confirmedPlanId: 'confirmed_55555555-5555-4555-8555-555555555555',
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+    await user.type(
+      await screen.findByRole('textbox', { name: 'Skill name' }),
+      'Move city',
+    );
+    await user.click(screen.getByRole('checkbox', { name: 'City' }));
+    await user.click(screen.getByRole('button', { name: 'Save skill' }));
+    expect(
+      bodies.some((body) => {
+        const blanks = body.blanks;
+
+        return Array.isArray(blanks) && blanks.includes('city');
+      }),
+    ).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: 'Close' }));
+    await user.click(screen.getByRole('button', { name: /AI command/ }));
+    await user.click(screen.getByRole('button', { name: 'Saved skills' }));
+    await user.click(await screen.findByRole('button', { name: 'Run' }));
+    await user.type(
+      await screen.findByRole('textbox', { name: 'City' }),
+      'Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeEnabled();
+    const filled = bodies.find((body) => isPlainParameter(body));
+    expect(filled?.parameterValues).toEqual({ city: 'Faro' });
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+  });
+
+  it('draws a proposed person and company on the record table', () => {
+    getDefaultStore().set(aiCommandBarCreatePreviewState.atom, [
+      {
+        objectName: 'person',
+        label: 'Ada Lovelace',
+        summary: 'ada@analytical.example',
+      },
+      {
+        objectName: 'company',
+        label: 'Analytical Engines',
+        summary: 'analytical.example',
+      },
+    ]);
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <AiRecordTableGhostRows objectName="person" />
+        <AiRecordTableGhostRows objectName="company" />
+        <AiRecordTableGhostRows objectName="opportunity" />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getByRole('row', { name: /Proposed person Ada Lovelace/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('row', { name: /Proposed company Analytical Engines/ }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+  });
+
+  it('does not keep another record id on a ghost row', async () => {
+    getDefaultStore().set(aiCommandBarCreatePreviewState.atom, []);
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async () =>
+      jsonResponse({
+        ok: true,
+        workspaceId: 'ws_demo',
+        proposal: {
+          id: 'proposal_11111111-1111-4111-8111-111111111111',
+          summary: 'Create person Ada Lovelace.',
+          tools: [
+            {
+              name: 'create_person',
+              args: { firstName: 'Ada', lastName: 'Lovelace' },
+            },
+          ],
+          lines: [
+            {
+              tool: 'create_person',
+              summary: 'Create person Ada Lovelace.',
+            },
+          ],
+          creates: [
+            {
+              objectName: 'person',
+              label: 'Ada Lovelace',
+              summary: 'ada@analytical.example',
+              id: 'person_victim',
+            },
+          ],
+        },
+      }),
+    );
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <MemoryRouter>
+          <AiCommandBar config={config} fetchImpl={fetchImpl} initialOpen />
+          <AiRecordTableGhostRows objectName="person" />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'create person Ada Lovelace',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    const row = await screen.findByRole('row', {
+      name: /Proposed person Ada Lovelace/,
+    });
+
+    expect(row).not.toHaveAttribute('data-selectable-id');
+    expect(row).not.toHaveAttribute('data-record-table-record-id');
+    expect(document.body.textContent).not.toContain('person_victim');
+  });
+});
+
+const isPlainParameter = (body: Record<string, unknown>): boolean =>
+  typeof body.parameterValues === 'object' && body.parameterValues !== null;
 
 describe('readOpenRecordFromPath', () => {
   it('reads a person, company, or opportunity show page', () => {

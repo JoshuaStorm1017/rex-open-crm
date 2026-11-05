@@ -14,6 +14,7 @@ import { getRecordTableHtmlId } from '@/object-record/record-table/utils/getReco
 import { useRecordTableContextOrThrow } from '@/object-record/record-table/contexts/RecordTableContext';
 import { RecordTableNoRecordGroupBody } from '@/object-record/record-table/record-table-body/components/RecordTableNoRecordGroupBody';
 import { RecordTableRecordGroupsBody } from '@/object-record/record-table/record-table-body/components/RecordTableRecordGroupsBody';
+import { AiRecordTableGhostRowsConnected } from '@/ai-command-bar/components/AiRecordTableGhostRows';
 import { RecordTableHeader } from '@/object-record/record-table/record-table-header/components/RecordTableHeader';
 import { useMoveHoverToCurrentCell } from '@/object-record/record-table/record-table-cell/hooks/useMoveHoverToCurrentCell';
 import { RecordSelectionDragSelect } from '@/object-record/record-selection/components/RecordSelectionDragSelect';
@@ -157,6 +158,7 @@ export const RecordTableContent = ({
         />
         <RecordTableColumnVirtualizationItemsProvider>
           <RecordTableHeader />
+          <AiRecordTableGhostRowsConnected />
           {hasRecordGroups ? (
             <RecordTableRecordGroupsBody />
           ) : (

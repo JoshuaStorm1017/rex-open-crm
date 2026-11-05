@@ -20,6 +20,7 @@ import {
 import { findStaleChanges } from './act/live-etag';
 import { WORKSPACE_ID_PATTERN } from './act/find-foreign-workspace-id';
 import { proposeAct, reproposeAct } from './act/propose-act';
+import { blankSkillTools, parametersIn } from './act/skill-parameters';
 import { withoutLiveEtag } from './act/strip-live-etag';
 import { isRecord } from './is-record';
 import {
@@ -62,6 +63,7 @@ const KNOWN_PATHS = new Set([
   REPROPOSE_PATH,
 ]);
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_PLAN_BODY_BYTES = 1_500_000;
 
 export type GatewayOptions = ExecuteActOptions & {
   client: TwentyCrmClient;
@@ -281,7 +283,9 @@ async function handleAuthenticated(
     return;
   }
 
-  const rawBody = await readBody(request);
+  const maxBytes =
+    url.pathname === PLAN_PATH ? MAX_PLAN_BODY_BYTES : MAX_BODY_BYTES;
+  const rawBody = await readBody(request, maxBytes);
 
   if (rawBody === undefined) {
     sendJson(
@@ -291,7 +295,7 @@ async function handleAuthenticated(
         ok: false,
         refused: true,
         reason: 'invalid_request',
-        message: `Body exceeds ${MAX_BODY_BYTES} bytes.`,
+        message: `Body exceeds ${maxBytes} bytes.`,
       },
       cors,
     );
@@ -810,7 +814,9 @@ async function postSkill(
     principal.memberId,
     parsed.workspaceId,
     parsed.skillName,
-    plan.tools,
+    parsed.blanks && parsed.blanks.length > 0
+      ? blankSkillTools(plan.tools, parsed.blanks)
+      : plan.tools,
   );
 
   if (!saved.ok) {
@@ -835,6 +841,7 @@ async function postSkill(
       id: saved.skill.id,
       name: saved.skill.name,
       tools: saved.skill.tools.map((tool) => tool.name),
+      parameters: parametersIn(saved.skill.tools),
     },
   };
   rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
@@ -1089,6 +1096,9 @@ async function streamPlan(
         partial: true,
         lines: describePartialTools(tools, workspaceId),
       });
+    },
+    onRead: (event) => {
+      writeEvent(response, 'read', event);
     },
   });
   rememberOutcome(runtime, principal, PLAN_PATH, false, result);
@@ -1365,7 +1375,10 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
-async function readBody(request: IncomingMessage): Promise<string | undefined> {
+async function readBody(
+  request: IncomingMessage,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<string | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
 
@@ -1373,7 +1386,7 @@ async function readBody(request: IncomingMessage): Promise<string | undefined> {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
 
-    if (size > MAX_BODY_BYTES) {
+    if (size > maxBytes) {
       return undefined;
     }
 

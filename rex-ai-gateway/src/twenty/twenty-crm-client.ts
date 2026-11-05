@@ -78,6 +78,7 @@ export type SearchRecordsInput = {
   query: string;
   limit: number;
   linkedCompanyId?: string;
+  domainHost?: string;
 };
 
 export type SearchTimelineInput = {

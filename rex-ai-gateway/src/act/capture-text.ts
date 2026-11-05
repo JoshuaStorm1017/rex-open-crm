@@ -1,12 +1,57 @@
+import type { LlmProvider } from '../llm/llm-provider';
 import { canonicalLinkedinUrl } from '../twenty/linkedin-url';
 import { parsePhone } from '../twenty/parse-phone';
 import { canCreateObject, canSetField, type AudienceLoad } from './permissions';
-import { refusal, type ActRefusal, type ToolCall } from './types';
+import type { CaptureRequest } from './parse-request';
+import {
+  refusal,
+  upstreamFailure,
+  type ActRefusal,
+  type ActUpstreamFailure,
+  type ToolCall,
+} from './types';
 
 export type CaptureInput = {
   source: 'card' | 'voice';
   text: string;
 };
+
+export async function resolveCaptureText(
+  capture: CaptureRequest,
+  llm: LlmProvider,
+): Promise<{ text: string } | ActRefusal | ActUpstreamFailure> {
+  if (!capture.image) {
+    return capture.text
+      ? { text: capture.text }
+      : refusal(
+          'invalid_request',
+          'capture needs card text, a vCard, or a photo.',
+        );
+  }
+
+  if (!llm.readCard) {
+    return refusal(
+      'invalid_request',
+      'No vision model is configured. Paste the card text or a vCard.',
+    );
+  }
+
+  try {
+    const text = (await llm.readCard(capture.image)).trim();
+
+    if (text.length === 0) {
+      return refusal(
+        'missing_required_fields',
+        'The card photo did not include a person or company name.',
+        { missingFields: ['firstName', 'lastName'] },
+      );
+    }
+
+    return { text };
+  } catch (error) {
+    return upstreamFailure(error, 0);
+  }
+}
 
 type CaptureFields = {
   firstName?: string;

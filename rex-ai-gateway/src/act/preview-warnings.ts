@@ -2,6 +2,8 @@ import type {
   CreatedRecord,
   TwentyCrmClient,
 } from '../twenty/twenty-crm-client';
+import { domainHostKey } from '../twenty/map-to-twenty-payload';
+import { isSafeSearchQuery } from '../twenty/safe-search';
 import type { ProposalWarning } from './types';
 import type { ValidatedTool } from './validate-tool';
 
@@ -16,9 +18,97 @@ export async function collectWarnings(
   return [
     ...(await duplicateEmailWarnings(client, workspaceId, slots)),
     ...(await duplicateNameWarnings(client, workspaceId, slots)),
+    ...(await duplicateDomainWarnings(client, workspaceId, slots)),
     ...inPreviewAmountWarnings(slots),
     ...(await companyAmountWarnings(client, workspaceId, slots)),
   ];
+}
+
+async function duplicateDomainWarnings(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  slots: PreviewSlot[],
+): Promise<ProposalWarning[]> {
+  const warnings: ProposalWarning[] = [];
+  const seen = new Set<string>();
+
+  for (const slot of slots) {
+    if (slot.type !== 'ready') {
+      continue;
+    }
+
+    const target = domainTarget(slot);
+
+    if (!target) {
+      continue;
+    }
+
+    const key = domainHostKey(target.domain);
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    // A host the filter cannot quote must not abort the preview.
+    if (!isSafeSearchQuery(key)) {
+      continue;
+    }
+
+    // The name search cannot see a domain that is not in the company name.
+    const matches = await client.searchRecords({
+      workspaceId,
+      objectName: 'company',
+      query: key,
+      domainHost: key,
+      limit: 10,
+    });
+    const duplicate = matches.find((record) => {
+      if (record.id === target.selfId) {
+        return false;
+      }
+
+      const domain = record.properties.domain;
+      const website = record.properties.website;
+
+      return (
+        (typeof domain === 'string' && domainHostKey(domain) === key) ||
+        (typeof website === 'string' && domainHostKey(website) === key)
+      );
+    });
+
+    if (!duplicate) {
+      continue;
+    }
+
+    seen.add(key);
+    warnings.push({
+      code: 'duplicate_domain',
+      message: `Another company already uses ${target.domain} (${duplicate.label}). This preview still proposes that domain.`,
+    });
+  }
+
+  return warnings;
+}
+
+function domainTarget(
+  slot: ReadySlot,
+): { domain: string; selfId?: string } | undefined {
+  if (slot.tool.name === 'create_company' && slot.tool.input.domain) {
+    return { domain: slot.tool.input.domain };
+  }
+
+  if (
+    slot.tool.name === 'update_record' &&
+    slot.tool.input.objectName === 'company' &&
+    (slot.tool.input.field === 'domain' || slot.tool.input.field === 'website')
+  ) {
+    return {
+      domain: String(slot.tool.input.value),
+      selfId: slot.tool.input.id,
+    };
+  }
+
+  return undefined;
 }
 
 async function duplicateEmailWarnings(

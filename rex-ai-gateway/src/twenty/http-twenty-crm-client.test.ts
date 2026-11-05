@@ -9,6 +9,10 @@ import {
   createHttpTwentyCrmClient,
   readTwentyApiOrigin,
 } from './http-twenty-crm-client';
+import {
+  graphqlDomainHostFilter,
+  restDomainHostFilter,
+} from './map-to-twenty-payload';
 import { startGateway } from '../server';
 
 type CapturedRequest = {
@@ -1197,6 +1201,54 @@ describe('createHttpTwentyCrmClient', () => {
         .map((entry) => entry.url)
         .some((url) => url?.includes('updatedAt')),
     ).toBe(true);
+  });
+
+  it('looks up a duplicate company by domain host, not by name', async () => {
+    const twenty = await startFakeTwenty((_captured, response) => {
+      sendJson(response, 200, { data: { companies: [] } });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await client.searchRecords({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      query: 'acme.example',
+      domainHost: 'acme.example',
+      limit: 10,
+    });
+
+    const filter = decodeURIComponent(twenty.captured[0]?.url ?? '');
+
+    expect(filter).toContain(
+      'domainName.primaryLinkUrl[eq]:"https://acme.example"',
+    );
+    expect(filter).toContain(
+      'domainName.primaryLinkUrl[eq]:"https://www.acme.example"',
+    );
+    expect(filter).not.toContain('name[ilike]');
+    expect(filter).toContain(restDomainHostFilter('acme.example'));
+    expect(graphqlDomainHostFilter('acme.example')).toEqual({
+      or: [
+        { domainName: { primaryLinkUrl: { eq: 'https://acme.example' } } },
+        { domainName: { primaryLinkUrl: { eq: 'http://acme.example' } } },
+        {
+          domainName: { primaryLinkUrl: { eq: 'https://www.acme.example' } },
+        },
+        { domainName: { primaryLinkUrl: { eq: 'http://www.acme.example' } } },
+        { domainName: { primaryLinkUrl: { eq: 'acme.example' } } },
+      ],
+    });
+
+    await expect(
+      client.searchRecords({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        query: 'acme.example',
+        domainHost: 'acme.example",name[eq]:"x',
+        limit: 10,
+      }),
+    ).rejects.toThrow(/unsafe search query/);
+    expect(twenty.captured).toHaveLength(1);
   });
 });
 

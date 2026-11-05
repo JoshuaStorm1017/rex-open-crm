@@ -2,7 +2,13 @@ import { assertPublicProviderBaseUrl } from '../http/public-url';
 
 export type LlmConfig =
   | { provider: 'mock' }
-  | { provider: 'openai'; baseUrl: string; apiKey: string; model: string };
+  | {
+      provider: 'openai';
+      baseUrl: string;
+      apiKey: string;
+      model: string;
+      vision?: boolean;
+    };
 
 export function readLlmConfigFromEnv(env: NodeJS.ProcessEnv): LlmConfig {
   const provider = env.REX_AI_PROVIDER?.trim() || 'mock';
@@ -27,5 +33,11 @@ export function readLlmConfigFromEnv(env: NodeJS.ProcessEnv): LlmConfig {
 
   assertPublicProviderBaseUrl(baseUrl);
 
-  return { provider: 'openai', baseUrl, apiKey, model };
+  return {
+    provider: 'openai',
+    baseUrl,
+    apiKey,
+    model,
+    vision: env.REX_AI_VISION?.trim() === 'true',
+  };
 }
