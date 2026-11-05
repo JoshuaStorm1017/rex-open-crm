@@ -194,8 +194,9 @@ describe('gateway guards', () => {
       proposal: {
         choice: {
           candidates: [
-            expect.objectContaining({ label: 'Acme North' }),
-            expect.objectContaining({ label: 'Acme South' }),
+            expect.objectContaining({ label: 'Acme North', action: 'use' }),
+            expect.objectContaining({ label: 'Acme South', action: 'use' }),
+            expect.objectContaining({ id: 'create_new', action: 'create' }),
           ],
         },
       },

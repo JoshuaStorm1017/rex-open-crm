@@ -1,3 +1,4 @@
+import { fetchWithPinnedDns } from '../http/pinned-fetch';
 import { isRecord } from '../is-record';
 import { twentyAuthHeaders } from './call-context';
 import type { MemberPrincipal, TwentyCredential } from './types';
@@ -20,15 +21,21 @@ export async function verifyMemberCredential(
   let response: Response;
 
   try {
-    response = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/metadata`, {
-      method: 'POST',
-      redirect: 'error',
-      headers: {
-        ...twentyAuthHeaders(credential),
-        'content-type': 'application/json',
+    response = await fetchWithPinnedDns(
+      `${apiUrl.replace(/\/+$/, '')}/metadata`,
+      {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          ...twentyAuthHeaders(credential),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ query: WHOAMI_QUERY }),
+        signal: AbortSignal.timeout(10_000),
       },
-      body: JSON.stringify({ query: WHOAMI_QUERY }),
-    });
+      fetchImpl,
+      'TWENTY_API_URL',
+    );
   } catch {
     return undefined;
   }

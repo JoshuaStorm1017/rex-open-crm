@@ -82,6 +82,26 @@ export type DeleteRecordInput = {
   id: string;
 };
 
+export type ClearRecordFieldInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+  field: string;
+  ifMatch: string;
+};
+
+export type ObjectCapabilityName = TwentyObjectName | 'note';
+
+export type MemberCapabilities = {
+  unavailable?: boolean;
+  objects: Array<{
+    objectName: ObjectCapabilityName;
+    canRead: boolean;
+    canUpdate: boolean;
+    canSoftDelete: boolean;
+  }>;
+};
+
 export type TwentyCrmClient = {
   createPerson: (input: CreatePersonInput) => Promise<CreatedRecord>;
   createCompany: (input: CreateCompanyInput) => Promise<CreatedRecord>;
@@ -90,7 +110,9 @@ export type TwentyCrmClient = {
   searchRecords: (input: SearchRecordsInput) => Promise<CreatedRecord[]>;
   getRecord: (input: GetRecordInput) => Promise<CreatedRecord>;
   updateRecord: (input: UpdateRecordInput) => Promise<CreatedRecord>;
+  clearRecordField: (input: ClearRecordFieldInput) => Promise<CreatedRecord>;
   deleteRecord: (input: DeleteRecordInput) => Promise<void>;
+  loadCapabilities?: () => Promise<MemberCapabilities>;
 };
 
 function withDefinedStrings(

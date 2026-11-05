@@ -1,3 +1,4 @@
+import type { TwentyObjectName } from '../twenty/twenty-crm-client';
 import { ALLOWED_TOOL_NAMES } from './types';
 import { UPDATABLE_FIELDS } from './writable-fields';
 
@@ -7,21 +8,36 @@ export type ToolSchema = {
   inputSchema: Record<string, unknown>;
 };
 
+export type ToolAudience = {
+  canRead: ReadonlySet<TwentyObjectName>;
+  canUpdate: ReadonlySet<TwentyObjectName | 'note'>;
+  canSoftDelete: ReadonlySet<TwentyObjectName | 'note'>;
+};
+
 const stringProperty = (description: string) => ({
   type: 'string',
   description,
 });
 
-export function toolCatalog(): { tools: ToolSchema[] } {
-  return {
-    tools: [
+export function toolCatalog(audience?: ToolAudience): { tools: ToolSchema[] } {
+  const tools = fullCatalog();
+
+  if (!audience) {
+    return { tools };
+  }
+
+  return { tools: tools.filter((tool) => isVisible(tool, audience)).map((tool) => narrow(tool, audience)) };
+}
+
+function fullCatalog(): ToolSchema[] {
+  return [
       {
         name: 'create_person',
         description:
           'Create a person. firstName and lastName are required. companyId may be a record id or $n, where n is the index of an earlier create or update in the same request.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['firstName', 'lastName'],
           properties: {
             firstName: stringProperty('Given name.'),
@@ -38,7 +54,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
         description: 'Create a company. name is required.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['name'],
           properties: {
             name: stringProperty('Company name.'),
@@ -52,7 +68,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
           'Create an opportunity. name is required. amount is major currency units, not micros. stage defaults to NEW. companyId and pointOfContactId accept a record id or $n.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['name'],
           properties: {
             name: stringProperty('Opportunity name.'),
@@ -73,7 +89,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
           'Add a note to one person, company, or opportunity. body is markdown. targetId may be a record id or $n. targetQuery names the record when the id is not known; several matches become choices.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['body', 'targetObject'],
           properties: {
             title: stringProperty('Note title. Defaults to Note.'),
@@ -84,6 +100,11 @@ export function toolCatalog(): { tools: ToolSchema[] } {
             },
             targetId: stringProperty('Record id, or $n for an earlier tool result.'),
             targetQuery: stringProperty('Name to search when targetId is omitted.'),
+            recordRef: {
+              type: 'string',
+              enum: ['open'],
+              description: 'Set to open to use the record on screen. Do not send an id.',
+            },
           },
         },
       },
@@ -93,7 +114,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
           'Find people, companies, or opportunities by a case-insensitive name, email, or domain fragment. Read-only.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['object', 'query'],
           properties: {
             object: {
@@ -121,23 +142,84 @@ export function toolCatalog(): { tools: ToolSchema[] } {
           '.',
         inputSchema: {
           type: 'object',
-          additionalProperties: true,
+          additionalProperties: false,
           required: ['object', 'field', 'value'],
           properties: {
             object: {
               type: 'string',
               enum: ['person', 'company', 'opportunity'],
             },
-            id: stringProperty('Record id from this workspace. Omit when query is set.'),
+            id: stringProperty('Record id from this workspace. Omit when query or recordRef is set.'),
             query: stringProperty('Name fragment when the id is not known. Several matches become choices.'),
             field: stringProperty('One writable field for that object.'),
             value: {
               description: 'New value. amount is a number. Every other field is a string.',
             },
             ifMatch: stringProperty('Current etag. The write is refused when it does not match.'),
+            recordRef: {
+              type: 'string',
+              enum: ['open'],
+              description: 'Set to open to use the record on screen. Do not send an id.',
+            },
           },
         },
       },
-    ],
-  };
+  ];
+}
+
+function isVisible(tool: ToolSchema, audience: ToolAudience): boolean {
+  switch (tool.name) {
+    case 'create_person':
+      return audience.canUpdate.has('person');
+    case 'create_company':
+      return audience.canUpdate.has('company');
+    case 'create_opportunity':
+      return audience.canUpdate.has('opportunity');
+    case 'create_note':
+      return audience.canUpdate.has('note') && readableNames(audience).length > 0;
+    case 'search_records':
+      return readableNames(audience).length > 0;
+    case 'update_record':
+      return updatableNames(audience).length > 0;
+  }
+}
+
+function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
+  if (tool.name === 'search_records') {
+    return withEnum(tool, 'object', readableNames(audience));
+  }
+
+  if (tool.name === 'update_record') {
+    return withEnum(tool, 'object', updatableNames(audience));
+  }
+
+  if (tool.name === 'create_note') {
+    return withEnum(tool, 'targetObject', readableNames(audience));
+  }
+
+  return tool;
+}
+
+function withEnum(tool: ToolSchema, key: string, values: string[]): ToolSchema {
+  const properties = isProperties(tool.inputSchema.properties)
+    ? { ...tool.inputSchema.properties }
+    : {};
+  const current = properties[key];
+  properties[key] = isProperties(current) ? { ...current, enum: values } : { type: 'string', enum: values };
+
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
+}
+
+function readableNames(audience: ToolAudience): TwentyObjectName[] {
+  return (['person', 'company', 'opportunity'] as const).filter((name) => audience.canRead.has(name));
+}
+
+function updatableNames(audience: ToolAudience): TwentyObjectName[] {
+  return (['person', 'company', 'opportunity'] as const).filter(
+    (name) => audience.canRead.has(name) && audience.canUpdate.has(name),
+  );
+}
+
+function isProperties(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

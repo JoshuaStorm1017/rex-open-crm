@@ -15,6 +15,12 @@ const NOTE_PATTERN =
 const SEARCH_PATTERN =
   /^(?:find|search) (?<object>people|persons|person|companies|company|opportunities|opportunity|deals) (?:named|called|for|matching) (?<query>.+)$/i;
 
+const THIS_UPDATE_PATTERN =
+  /^(?:update|set|change) this (?<object>deal|opportunity|person|company|record)(?:['’]s)? (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+)$/i;
+
+const THIS_NOTE_PATTERN =
+  /^add (?:a )?note(?: titled (?<title>[^:]+?))?(?: to this (?<object>deal|opportunity|person|company|record))?: (?<body>.+)$/i;
+
 const UPDATE_BY_ID_PATTERN =
   /^update (?<object>person|company|opportunity) (?<id>[A-Za-z0-9_-]+) set (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+?)(?: ifMatch (?<ifMatch>\S+))?$/i;
 
@@ -83,6 +89,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
     };
   }
 
+  const thisUpdate = THIS_UPDATE_PATTERN.exec(text);
+
+  if (thisUpdate?.groups?.object && thisUpdate.groups.field && thisUpdate.groups.value) {
+    return thisRecordUpdate(input, thisUpdate.groups);
+  }
+
   const note = NOTE_PATTERN.exec(text);
 
   if (note?.groups?.object && note.groups.query && note.groups.body) {
@@ -101,6 +113,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
         },
       ],
     };
+  }
+
+  const thisNote = THIS_NOTE_PATTERN.exec(text);
+
+  if (thisNote?.groups?.body && (thisNote.groups.object || input.openRecord)) {
+    return thisRecordNote(input, thisNote.groups);
   }
 
   const search = SEARCH_PATTERN.exec(text);
@@ -177,6 +195,95 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
   }
 
   return mapped;
+}
+
+function thisRecordUpdate(
+  input: LlmPlanInput,
+  groups: Record<string, string | undefined>,
+): LlmPlan {
+  const objectName = openObject(groups.object ?? '', input.openRecord);
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  const field = groups.field ?? '';
+
+  return {
+    ok: true,
+    summary: `Update the open ${objectName}.`,
+    tools: [
+      {
+        name: 'update_record',
+        args: {
+          object: objectName,
+          field,
+          value: field === 'amount' ? Number((groups.value ?? '').replace(/,/g, '')) : trimValue(groups.value ?? ''),
+          recordRef: 'open',
+        },
+      },
+    ],
+  };
+}
+
+function thisRecordNote(
+  input: LlmPlanInput,
+  groups: Record<string, string | undefined>,
+): LlmPlan {
+  const objectName = openObject(groups.object ?? 'record', input.openRecord);
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  return {
+    ok: true,
+    summary: `Add a note to the open ${objectName}.`,
+    tools: [
+      {
+        name: 'create_note',
+        args: {
+          ...(groups.title ? { title: trimValue(groups.title) } : {}),
+          body: (groups.body ?? '').trim(),
+          targetObject: objectName,
+          recordRef: 'open',
+        },
+      },
+    ],
+  };
+}
+
+function openObject(
+  word: string,
+  openRecord: LlmPlanInput['openRecord'],
+): TwentyObjectName | ActRefusal {
+  if (!openRecord) {
+    return refusal(
+      'ambiguous_intent',
+      'Open the record first, then refer to it as "this deal", "this person", or "this company".',
+    );
+  }
+
+  const normalized = word.toLowerCase();
+  const expected =
+    normalized === 'deal' || normalized === 'opportunity'
+      ? 'opportunity'
+      : normalized === 'record'
+        ? openRecord.objectName
+        : normalized === 'person'
+          ? 'person'
+          : normalized === 'company'
+            ? 'company'
+            : undefined;
+
+  if (!expected || expected !== openRecord.objectName) {
+    return refusal(
+      'invalid_request',
+      `The open record is a ${openRecord.objectName}. "${word}" does not match it.`,
+    );
+  }
+
+  return openRecord.objectName;
 }
 
 function updateTool(groups: Record<string, string | undefined>): ToolCall {

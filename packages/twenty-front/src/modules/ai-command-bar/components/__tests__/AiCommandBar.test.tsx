@@ -4,6 +4,8 @@ import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 
+import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
+
 import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
 import {
   readAiCommandBarConfig,
@@ -78,10 +80,14 @@ const jsonResponse = (body: unknown) =>
     json: async () => body,
   } as Response);
 
-const renderBar = (fetchImpl: typeof fetch, initialOpen = false) =>
+const renderBar = (
+  fetchImpl: typeof fetch,
+  initialOpen = false,
+  initialPath = '/',
+) =>
   render(
     <I18nProvider i18n={i18n}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[initialPath]}>
         <AiCommandBar
           config={config}
           fetchImpl={fetchImpl}
@@ -252,13 +258,15 @@ describe('AiCommandBar', () => {
         },
       },
     };
-    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
-      if (String(input).endsWith('/v1/ai/plan')) {
-        return jsonResponse(choiceProposal);
-      }
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        if (String(input).endsWith('/v1/ai/plan')) {
+          return jsonResponse(choiceProposal);
+        }
 
-      return jsonResponse({ ok: true, results: [] });
-    });
+        return jsonResponse({ ok: true, results: [] });
+      },
+    );
 
     renderBar(fetchImpl, true);
 
@@ -285,6 +293,174 @@ describe('AiCommandBar', () => {
       proposalId: 'proposal_22222222-2222-4222-8222-222222222222',
       choiceId: 'company_south',
     });
+  });
+});
+
+describe('record page and undo', () => {
+  it('sends the open record and can undo the confirmed act', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        const url = String(input);
+
+        if (url.endsWith('/v1/ai/plan')) {
+          return jsonResponse(proposal);
+        }
+
+        if (url.endsWith('/v1/ai/undo')) {
+          return jsonResponse({
+            ok: true,
+            summary: 'Reversed the last confirmed change.',
+          });
+        }
+
+        return jsonResponse({
+          ...created,
+          undo: {
+            id: 'undo_33333333-3333-4333-8333-333333333333',
+            summary: 'Undo 3 created records.',
+          },
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true, '/object/opportunity/opportunity_1');
+
+    expect(screen.getByRole('textbox', { name: 'Command' })).toHaveAttribute(
+      'placeholder',
+      "Update this deal's stage to Proposal",
+    );
+
+    await user.type(screen.getByRole('textbox', { name: 'Command' }), INTENT);
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await screen.findByRole('button', { name: 'Confirm' });
+
+    const planCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/plan'),
+    );
+
+    expect(JSON.parse(String(planCall?.[1]?.body))).toEqual({
+      workspaceId: 'ws_demo',
+      intent: INTENT,
+      context: { objectName: 'opportunity', recordId: 'opportunity_1' },
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(await screen.findByRole('button', { name: 'Undo' }));
+
+    expect(
+      await screen.findByText('Undone. The last change was reversed.'),
+    ).toBeInTheDocument();
+
+    const undoCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/undo'),
+    );
+
+    expect(JSON.parse(String(undoCall?.[1]?.body))).toEqual({
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      undoId: 'undo_33333333-3333-4333-8333-333333333333',
+    });
+  });
+
+  it('offers creating a new record when several names match', async () => {
+    const user = userEvent.setup();
+    const choiceProposal = {
+      ok: true,
+      workspaceId: 'ws_demo',
+      proposal: {
+        id: 'proposal_22222222-2222-4222-8222-222222222222',
+        summary:
+          'Several people match “Jane Doe”. Choose one, or create a new one, then confirm.',
+        tools: [],
+        lines: [
+          {
+            tool: 'create_note',
+            summary: 'Jane Doe · jane.north@example.test',
+          },
+          {
+            tool: 'create_note',
+            summary: 'Jane Doe · jane.south@example.test',
+          },
+          {
+            tool: 'create_note',
+            summary: 'Create new person “Jane Doe” and add the note',
+          },
+        ],
+        choice: {
+          prompt:
+            'Several people match “Jane Doe”. Choose one, or create a new one, then confirm.',
+          candidates: [
+            {
+              id: 'person_north',
+              label: 'Jane Doe · jane.north@example.test',
+              objectName: 'person',
+              action: 'use',
+            },
+            {
+              id: 'person_south',
+              label: 'Jane Doe · jane.south@example.test',
+              objectName: 'person',
+              action: 'use',
+            },
+            {
+              id: 'create_new',
+              label: 'Create new person “Jane Doe” and add the note',
+              objectName: 'person',
+              action: 'create',
+            },
+          ],
+        },
+      },
+    };
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        if (String(input).endsWith('/v1/ai/plan')) {
+          return jsonResponse(choiceProposal);
+        }
+
+        return jsonResponse({ ok: true, results: [] });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'add a note to person named Jane Doe: Met at the fair',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(await screen.findByText('New record')).toBeInTheDocument();
+    await user.click(
+      screen.getByRole('radio', {
+        name: 'Create new person “Jane Doe” and add the note',
+      }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+
+    const actCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/act'),
+    );
+
+    expect(JSON.parse(String(actCall?.[1]?.body))).toMatchObject({
+      choiceId: 'create_new',
+    });
+  });
+});
+
+describe('readOpenRecordFromPath', () => {
+  it('reads a person, company, or opportunity show page', () => {
+    expect(readOpenRecordFromPath('/object/opportunity/opp_1')).toEqual({
+      objectName: 'opportunity',
+      recordId: 'opp_1',
+    });
+    expect(readOpenRecordFromPath('/object/person/person_1/timeline')).toEqual({
+      objectName: 'person',
+      recordId: 'person_1',
+    });
+    expect(readOpenRecordFromPath('/objects/companies')).toBeUndefined();
+    expect(readOpenRecordFromPath('/object/note/note_1')).toBeUndefined();
   });
 });
 

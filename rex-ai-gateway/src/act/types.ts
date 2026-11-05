@@ -29,6 +29,7 @@ export type RefusalReason =
   | 'not_found'
   | 'precondition_failed'
   | 'unauthorized'
+  | 'forbidden'
   | 'idempotency_conflict'
   | 'confirmation_required';
 
@@ -76,10 +77,34 @@ export type UpdatedToolResult = {
 
 export type ToolResult = CreatedToolResult | SearchToolResult | UpdatedToolResult;
 
+export type ActEffect =
+  | {
+      kind: 'created';
+      objectName: 'person' | 'company' | 'opportunity' | 'note' | 'noteTarget';
+      id: string;
+      etag?: string;
+    }
+  | {
+      kind: 'updated';
+      objectName: 'person' | 'company' | 'opportunity';
+      id: string;
+      field: string;
+      previous: string | number | null;
+      etag: string;
+    };
+
+export type ActUndo = {
+  id: string;
+  summary: string;
+};
+
 export type ActSuccess = {
   ok: true;
   workspaceId: string;
   results: ToolResult[];
+  effects?: ActEffect[];
+  undo?: ActUndo;
+  summary?: string;
 };
 
 export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure | ActPartialFailure;
@@ -95,6 +120,7 @@ export type PlanChoice = {
     id: string;
     label: string;
     objectName: 'person' | 'company' | 'opportunity';
+    action: 'use' | 'create';
   }>;
 };
 

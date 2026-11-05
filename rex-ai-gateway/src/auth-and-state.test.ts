@@ -148,6 +148,21 @@ describe('signed-in member auth', () => {
 
     expect(principal).toBeUndefined();
   });
+
+  it('does not send the session cookie to a link-local Twenty address', async () => {
+    const authenticator = createTwentyAuthenticator('https://169.254.169.254');
+    const principal = await authenticator.authenticate(
+      {
+        headers: {
+          cookie: 'twenty-session=sess_member_token',
+          origin: 'http://localhost:3001',
+        },
+      } as never,
+      { allowedOrigins: new Set(['http://localhost:3001']) },
+    );
+
+    expect(principal).toBeUndefined();
+  });
 });
 
 describe('session cookie', () => {

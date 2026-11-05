@@ -11,7 +11,8 @@ export function preflightRefs(tools: ValidatedTool[]): ActRefusal | undefined {
       !tool ||
       (tool.name !== 'create_opportunity' &&
         tool.name !== 'create_person' &&
-        tool.name !== 'create_note')
+        tool.name !== 'create_note' &&
+        tool.name !== 'update_record')
     ) {
       continue;
     }
@@ -82,6 +83,10 @@ function relationRefs(tool: ValidatedTool): string[] {
 
   if (tool.name === 'create_note') {
     return tool.input.targetId ? [tool.input.targetId] : [];
+  }
+
+  if (tool.name === 'update_record' && tool.input.id?.startsWith('$')) {
+    return [tool.input.id];
   }
 
   return [];

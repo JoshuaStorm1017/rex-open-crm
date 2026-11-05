@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
+import { compensate, partialFailure } from './act/compensate';
 import { executeAct, type ExecuteActOptions } from './act/execute-act';
 import { parseGatewayRequest } from './act/parse-request';
+import { assertCanUndo, catalogForAudience, loadAudience } from './act/permissions';
 import { proposeAct } from './act/propose-act';
-import { toolCatalog } from './act/tool-schema';
 import { isRecord } from './is-record';
 import { refusal, type ActResult, type PlanResult } from './act/types';
 import { createMockAuthenticator, type Authenticator } from './auth/authenticate';
@@ -13,15 +14,17 @@ import { AuditLog, type AuditAction, type AuditEntry } from './audit/audit-log';
 import { corsHeadersFor, DEFAULT_ALLOWED_ORIGINS } from './http/cors';
 import { IdempotencyStore, readIdempotencyKey } from './http/idempotency-store';
 import { ProposalStore } from './http/proposal-store';
+import { UndoStore } from './http/undo-store';
 import { createMockLlmProvider } from './llm/mock-llm-provider';
 import type { LlmProvider } from './llm/llm-provider';
 import type { TwentyCrmClient } from './twenty/twenty-crm-client';
 
 const ACT_PATH = '/v1/ai/act';
 const PLAN_PATH = '/v1/ai/plan';
+const UNDO_PATH = '/v1/ai/undo';
 const TOOLS_PATH = '/v1/ai/tools';
 const AUDIT_PATH = '/v1/ai/audit';
-const KNOWN_PATHS = new Set([ACT_PATH, PLAN_PATH, TOOLS_PATH, AUDIT_PATH]);
+const KNOWN_PATHS = new Set([ACT_PATH, PLAN_PATH, UNDO_PATH, TOOLS_PATH, AUDIT_PATH]);
 const MAX_BODY_BYTES = 64 * 1024;
 
 export type GatewayOptions = ExecuteActOptions & {
@@ -33,6 +36,7 @@ export type GatewayOptions = ExecuteActOptions & {
   audit?: AuditLog;
   idempotency?: IdempotencyStore;
   proposals?: ProposalStore;
+  undos?: UndoStore;
   allowedOrigins?: string[];
   authenticator?: Authenticator;
   onClose?: () => void;
@@ -52,6 +56,7 @@ type GatewayRuntime = {
   audit: AuditLog;
   idempotency: IdempotencyStore;
   proposals: ProposalStore;
+  undos: UndoStore;
   allowedOrigins: ReadonlySet<string>;
   authenticator: Authenticator;
   onClose?: () => void;
@@ -81,6 +86,7 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
     audit: options.audit ?? new AuditLog(),
     idempotency: options.idempotency ?? new IdempotencyStore(),
     proposals: options.proposals ?? new ProposalStore(),
+    undos: options.undos ?? new UndoStore(),
     allowedOrigins: new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS),
     authenticator: options.authenticator ?? createMockAuthenticator(),
     onClose: options.onClose,
@@ -188,7 +194,14 @@ async function handleAuthenticated(
   cors: Record<string, string>,
 ): Promise<void> {
   if (request.method === 'GET' && url.pathname === TOOLS_PATH) {
-    sendJson(response, 200, { ok: true, ...toolCatalog() }, cors);
+    const catalog = catalogForAudience(await loadAudience(runtime.client));
+
+    if ('refused' in catalog) {
+      sendJson(response, statusFor(catalog), catalog, cors);
+      return;
+    }
+
+    sendJson(response, 200, { ok: true, ...catalog }, cors);
     return;
   }
 
@@ -197,7 +210,10 @@ async function handleAuthenticated(
     return;
   }
 
-  if (request.method !== 'POST' || (url.pathname !== ACT_PATH && url.pathname !== PLAN_PATH)) {
+  if (
+    request.method !== 'POST' ||
+    (url.pathname !== ACT_PATH && url.pathname !== PLAN_PATH && url.pathname !== UNDO_PATH)
+  ) {
     sendJson(response, 405, { ok: false, message: 'Method not allowed' }, cors);
     return;
   }
@@ -251,19 +267,22 @@ async function handleAuthenticated(
       'invalid_request',
       'Idempotency-Key must be 8–200 characters of letters, numbers, dot, colon, underscore, or hyphen.',
     );
-    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, url.pathname, confirmed, body);
     sendJson(response, 400, body, cors);
     return;
   }
 
   const execute = async () => {
-    const result = await executeConfirmedAct(parsed, runtime, principal);
+    const result =
+      url.pathname === UNDO_PATH
+        ? await executeConfirmedUndo(parsed, runtime, principal)
+        : await executeConfirmedAct(parsed, runtime, principal);
     return { status: statusFor(result), body: result };
   };
 
   if (!idempotencyKey) {
     const result = await execute();
-    rememberOutcome(runtime, principal, ACT_PATH, confirmed, result.body);
+    rememberOutcome(runtime, principal, url.pathname, confirmed, result.body);
     sendJson(response, result.status, result.body, cors);
     return;
   }
@@ -275,7 +294,7 @@ async function handleAuthenticated(
       'idempotency_conflict',
       'This idempotency key was already used with a different request body.',
     );
-    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, url.pathname, confirmed, body);
     sendJson(response, 409, body, cors);
     return;
   }
@@ -285,7 +304,7 @@ async function handleAuthenticated(
       'invalid_request',
       'The idempotency store is full. New keys are refused so an evicted key cannot run a write twice.',
     );
-    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, url.pathname, confirmed, body);
     sendJson(response, 503, body, cors);
     return;
   }
@@ -294,7 +313,7 @@ async function handleAuthenticated(
     return;
   }
 
-  rememberOutcome(runtime, principal, ACT_PATH, confirmed, stored.response.body, stored.replayed);
+  rememberOutcome(runtime, principal, url.pathname, confirmed, stored.response.body, stored.replayed);
   sendJson(response, stored.response.status, stored.response.body, {
     ...cors,
     ...(stored.replayed ? { 'idempotency-replayed': 'true' } : {}),
@@ -351,7 +370,7 @@ async function executeConfirmedAct(
     );
   }
 
-  return executeAct(
+  const executed = await executeAct(
     {
       workspaceId: parsed.workspaceId,
       confirmed: true,
@@ -360,6 +379,99 @@ async function executeConfirmedAct(
     runtime.client,
     { boundWorkspaceId: runtime.boundWorkspaceId },
   );
+
+  if (!executed.ok) {
+    return executed;
+  }
+
+  const { effects, ...publicResult } = executed;
+
+  if (!effects || effects.length === 0) {
+    return publicResult;
+  }
+
+  const ticket = runtime.undos.save(principal.memberId, parsed.workspaceId, effects);
+
+  if (!ticket) {
+    return publicResult;
+  }
+
+  return { ...publicResult, undo: { id: ticket.id, summary: ticket.summary } };
+}
+
+async function executeConfirmedUndo(
+  body: unknown,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+): Promise<ActResult> {
+  const parsed = parseGatewayRequest(body);
+
+  if ('refused' in parsed) {
+    return parsed;
+  }
+
+  if (runtime.boundWorkspaceId && parsed.workspaceId !== runtime.boundWorkspaceId) {
+    return refusal(
+      'cross_workspace',
+      `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
+    );
+  }
+
+  if (!parsed.confirmed || !parsed.undoId) {
+    return refusal(
+      'confirmation_required',
+      'Nothing is reversed until Undo sends the last undo id with confirmed true.',
+    );
+  }
+
+  const peeked = runtime.undos.peek(parsed.undoId, principal.memberId, parsed.workspaceId);
+
+  if (!peeked.ok) {
+    if (peeked.reason === 'workspace') {
+      return refusal('cross_workspace', 'This undo belongs to a different workspace.');
+    }
+
+    return refusal('not_found', 'There is no matching undo for the last confirmed change.');
+  }
+
+  const permission = assertCanUndo(peeked.ticket.effects, await loadAudience(runtime.client));
+
+  if (permission) {
+    return permission;
+  }
+
+  const taken = runtime.undos.take(parsed.undoId, principal.memberId, parsed.workspaceId);
+
+  if (!taken.ok) {
+    return refusal('not_found', 'There is no matching undo for the last confirmed change.');
+  }
+
+  const failures = await compensate(runtime.client, parsed.workspaceId, taken.ticket.effects);
+
+  if (failures.length > 0) {
+    const leftEveryChange =
+      failures.length === taken.ticket.effects.length &&
+      failures.every((failure) => failure.reason === 'conflict');
+
+    if (leftEveryChange) {
+      return refusal(
+        'precondition_failed',
+        'The record changed after that action, so nothing was reversed.',
+      );
+    }
+
+    return partialFailure(
+      'Undo could not reverse every change.',
+      failures.map((failure) => failure.id),
+    );
+  }
+
+  return {
+    ok: true,
+    workspaceId: parsed.workspaceId,
+    results: [],
+    summary: 'Reversed the last confirmed change.',
+  };
 }
 
 function rememberOutcome(
@@ -396,6 +508,7 @@ function rememberOutcome(
     (isRecord(body.proposal) && typeof body.proposal.summary === 'string'
       ? body.proposal.summary
       : undefined) ??
+    (typeof body.summary === 'string' ? body.summary : undefined) ??
     (typeof body.message === 'string' ? body.message : undefined) ??
     (ok ? `${action} completed` : 'Request failed');
 
@@ -482,6 +595,10 @@ function actionForPath(pathname: string): AuditAction {
     return 'audit';
   }
 
+  if (pathname === UNDO_PATH) {
+    return 'undo';
+  }
+
   return 'act';
 }
 
@@ -504,6 +621,10 @@ function statusFor(result: ActResult | PlanResult): number {
 
   if (result.reason === 'unauthorized') {
     return 401;
+  }
+
+  if (result.reason === 'forbidden') {
+    return 403;
   }
 
   if (result.reason === 'not_found') {

@@ -132,6 +132,20 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       record.etag = nextVersionEtag(record.etag);
       return cloneRecord(record);
     },
+    async clearRecordField(input) {
+      const record = findStored(input.workspaceId, input.objectName, input.id);
+
+      if (record.etag !== input.ifMatch) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${record.etag}.`,
+          record.etag,
+        );
+      }
+
+      applyField(record, input.field, null);
+      record.etag = nextVersionEtag(record.etag);
+      return cloneRecord(record);
+    },
     async deleteRecord(input) {
       const index = created.findIndex(
         (record) => record.workspaceId === input.workspaceId && record.id === input.id,

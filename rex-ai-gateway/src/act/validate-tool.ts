@@ -37,6 +37,7 @@ export type UpdateRecordToolInput = {
   field: string;
   value: string | number;
   ifMatch?: string;
+  useOpenRecord?: boolean;
 };
 
 export type ValidatedTool =
@@ -46,7 +47,10 @@ export type ValidatedTool =
       name: 'create_opportunity';
       input: Omit<CreateOpportunityInput, 'workspaceId'>;
     }
-  | { name: 'create_note'; input: Omit<CreateNoteInput, 'workspaceId'> }
+  | {
+      name: 'create_note';
+      input: Omit<CreateNoteInput, 'workspaceId'> & { useOpenRecord?: boolean };
+    }
   | { name: 'search_records'; input: SearchRecordsToolInput }
   | { name: 'update_record'; input: UpdateRecordToolInput };
 
@@ -75,6 +79,12 @@ export function validateTool(
       `Refusing ${tool.name}: args reference workspace "${foreignWorkspaceId}", which is not the request workspace "${requestWorkspaceId}".`,
       { toolName: tool.name },
     );
+  }
+
+  const unknownArg = rejectUnknownArgs(tool.name, tool.args);
+
+  if (unknownArg) {
+    return unknownArg;
   }
 
   switch (tool.name) {
@@ -226,7 +236,7 @@ function validateOpportunity(
 }
 
 const RELATION_ID_PATTERN = /^(\$[0-9]+|[A-Za-z0-9_-]{1,80})$/;
-const RECORD_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const RECORD_ID_PATTERN = /^(\$[0-9]+|[A-Za-z0-9_-]{1,80})$/;
 const IF_MATCH_PATTERN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;
 const MEMBER_ID_PATTERN =
   /^(me|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
@@ -289,7 +299,13 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
     return query;
   }
 
-  if (!id && !query) {
+  const useOpenRecord = readOpenRecordFlag(args, 'update_record');
+
+  if (typeof useOpenRecord !== 'boolean') {
+    return useOpenRecord;
+  }
+
+  if (!id && !query && !useOpenRecord) {
     return refusal(
       'missing_required_fields',
       'Refusing update_record: missing required fields: id.',
@@ -299,6 +315,23 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
 
   if (id && !RECORD_ID_PATTERN.test(id)) {
     return invalidField('update_record', 'id');
+  }
+
+  if (id?.startsWith('$')) {
+    // The etag of a record created earlier in this request is not known yet.
+    const createdMatch = optionalString(args, 'update_record', 'ifMatch');
+
+    if (isRefusal(createdMatch)) {
+      return createdMatch;
+    }
+
+    if (createdMatch !== 'created') {
+      return refusal(
+        'invalid_request',
+        'An update that points at $n must set ifMatch to "created". The etag is taken from that earlier create.',
+        { toolName: 'update_record' },
+      );
+    }
   }
 
   if (query && !isSafeSearchQuery(query)) {
@@ -345,11 +378,12 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
     name: 'update_record',
     input: {
       objectName,
-      ...(id ? { id } : {}),
-      ...(query && !id ? { query } : {}),
+      ...(id && !useOpenRecord ? { id } : {}),
+      ...(query && !id && !useOpenRecord ? { query } : {}),
       field,
       value,
       ...(ifMatch ? { ifMatch } : {}),
+      ...(useOpenRecord ? { useOpenRecord: true } : {}),
     },
   };
 }
@@ -429,7 +463,13 @@ function validateNote(args: Record<string, unknown>): ValidatedTool | ActRefusal
     return targetQuery;
   }
 
-  if (!targetId && !targetQuery) {
+  const useOpenRecord = readOpenRecordFlag(args, 'create_note');
+
+  if (typeof useOpenRecord !== 'boolean') {
+    return useOpenRecord;
+  }
+
+  if (!targetId && !targetQuery && !useOpenRecord) {
     return refusal(
       'missing_required_fields',
       'Refusing create_note: missing required fields: targetId.',
@@ -451,8 +491,9 @@ function validateNote(args: Record<string, unknown>): ValidatedTool | ActRefusal
       body,
       ...(title ? { title } : {}),
       targetObject,
-      ...(targetId ? { targetId } : {}),
-      ...(targetQuery && !targetId ? { targetQuery } : {}),
+      ...(targetId && !useOpenRecord ? { targetId } : {}),
+      ...(targetQuery && !targetId && !useOpenRecord ? { targetQuery } : {}),
+      ...(useOpenRecord ? { useOpenRecord: true } : {}),
     },
   };
 }
@@ -718,6 +759,55 @@ function readString(
   }
 
   return trimmed.length === 0 ? undefined : trimmed;
+}
+
+const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
+  create_person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone', 'companyId'],
+  create_company: ['name', 'domain'],
+  create_opportunity: [
+    'name',
+    'amount',
+    'currencyCode',
+    'stage',
+    'companyId',
+    'pointOfContactId',
+    'closeDate',
+  ],
+  create_note: ['title', 'body', 'targetObject', 'targetId', 'targetQuery', 'recordRef'],
+  search_records: ['object', 'query', 'limit'],
+  update_record: ['object', 'id', 'query', 'field', 'value', 'ifMatch', 'recordRef'],
+};
+
+function rejectUnknownArgs(
+  toolName: AllowedToolName,
+  args: Record<string, unknown>,
+): ActRefusal | undefined {
+  for (const key of Object.keys(args)) {
+    if (!TOOL_ARG_KEYS[toolName].includes(key)) {
+      return refusal(
+        'invalid_request',
+        `${toolName} field "${key}" is not allowlisted.`,
+        { toolName },
+      );
+    }
+  }
+
+  return undefined;
+}
+
+function readOpenRecordFlag(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName,
+): boolean | ActRefusal {
+  if (!Object.prototype.hasOwnProperty.call(args, 'recordRef') || args.recordRef == null) {
+    return false;
+  }
+
+  if (args.recordRef !== 'open') {
+    return invalidField(toolName, 'recordRef');
+  }
+
+  return true;
 }
 
 function invalidField(toolName: AllowedToolName, field: string): ActRefusal {
