@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { CREATE_NEW_CHOICE_ID } from '../act/create-new-choice';
-import type { PendingChoice } from '../act/pending-choice';
+import { isPendingBatch, type PendingBatch, type PendingChoice, type PendingSelection } from '../act/pending-choice';
 import type { ToolCall } from '../act/types';
 
 const PROPOSAL_TTL_MS = 10 * 60 * 1000;
@@ -19,7 +19,7 @@ export type StoredProposal = {
   memberId: string;
   workspaceId: string;
   tools: ToolCall[];
-  pendingChoice?: PendingChoice;
+  pendingChoice?: PendingSelection;
   expiresAt: number;
 };
 
@@ -34,7 +34,7 @@ export class ProposalStore {
     memberId: string,
     workspaceId: string,
     tools: ToolCall[],
-    pendingChoice?: PendingChoice,
+    pendingChoice?: PendingSelection,
     now = Date.now(),
   ): StoredProposal | undefined {
     this.prune(now);
@@ -53,6 +53,7 @@ export class ProposalStore {
     workspaceId: string,
     memberId: string,
     choiceId?: string,
+    choices?: Record<string, string>,
     now = Date.now(),
   ): ClaimResult {
     const proposal = this.proposals.get(id);
@@ -70,7 +71,7 @@ export class ProposalStore {
       return { ok: false, reason: 'workspace' };
     }
 
-    const claimed = this.claimStored(proposal, choiceId);
+    const claimed = this.claimStored(proposal, choiceId, choices);
 
     if (claimed.ok || claimed.reason !== 'choice') {
       this.proposals.delete(id);
@@ -83,7 +84,7 @@ export class ProposalStore {
     memberId: string,
     workspaceId: string,
     tools: ToolCall[],
-    pendingChoice: PendingChoice | undefined,
+    pendingChoice: PendingSelection | undefined,
     now: number,
   ): StoredProposal {
     return {
@@ -96,9 +97,26 @@ export class ProposalStore {
     };
   }
 
-  protected claimStored(proposal: StoredProposal, choiceId: string | undefined): ClaimResult {
+  protected claimStored(
+    proposal: StoredProposal,
+    choiceId: string | undefined,
+    choices?: Record<string, string>,
+  ): ClaimResult {
     if (!proposal.pendingChoice) {
       return { ok: true, proposal };
+    }
+
+    if (isPendingBatch(proposal.pendingChoice)) {
+      const tools = toolsFromBatch(proposal.pendingChoice, choiceId, choices);
+
+      if (!tools) {
+        return { ok: false, reason: 'choice' };
+      }
+
+      return {
+        ok: true,
+        proposal: { ...proposal, tools, pendingChoice: undefined },
+      };
     }
 
     const candidate = proposal.pendingChoice.candidates.find((item) => item.id === choiceId);
@@ -139,6 +157,117 @@ export class ProposalStore {
       }
     }
   }
+}
+
+function toolsFromBatch(
+  batch: PendingBatch,
+  choiceId: string | undefined,
+  choices: Record<string, string> | undefined,
+): ToolCall[] | undefined {
+  const selected: Record<string, string> = { ...(choices ?? {}) };
+
+  if (batch.groups.length === 1 && choiceId) {
+    const only = batch.groups[0];
+
+    if (only && selected[only.id] === undefined) {
+      selected[only.id] = choiceId;
+    }
+  }
+
+  const tools: ToolCall[] = [];
+  const created = new Set<string>();
+
+  for (const step of batch.steps) {
+    if (step.type === 'tool') {
+      tools.push(step.tool);
+      continue;
+    }
+
+    const group = batch.groups.find((item) => item.id === step.groupId);
+
+    if (!group) {
+      return undefined;
+    }
+
+    const candidate = group.candidates.find((item) => item.id === selected[group.id]);
+
+    if (!candidate) {
+      return undefined;
+    }
+
+    if (candidate.id === CREATE_NEW_CHOICE_ID) {
+      if (created.has(group.id)) {
+        continue;
+      }
+
+      if (!group.createTools || group.createTools.length === 0) {
+        return undefined;
+      }
+
+      tools.push(...group.createTools.map((tool) => shiftRefs(tool, tools.length)));
+      created.add(group.id);
+      continue;
+    }
+
+    if (group.kind === 'archive') {
+      tools.push({
+        name: 'archive_record',
+        args: { object: group.objectName, id: candidate.id, ifMatch: candidate.etag },
+      });
+      continue;
+    }
+
+    if (group.kind === 'note') {
+      tools.push({
+        name: 'create_note',
+        args: {
+          ...(group.title ? { title: group.title } : {}),
+          body: group.body,
+          targetObject: group.objectName,
+          targetId: candidate.id,
+        },
+      });
+      continue;
+    }
+
+    const update = group.updates[step.updateIndex];
+
+    if (!update) {
+      return undefined;
+    }
+
+    tools.push({
+      name: 'update_record',
+      args: {
+        object: group.objectName,
+        id: candidate.id,
+        field: update.field,
+        value: update.value,
+        ifMatch: step.updateIndex > 0 ? 'chained' : candidate.etag,
+      },
+    });
+  }
+
+  return tools;
+}
+
+function shiftRefs(tool: ToolCall, offset: number): ToolCall {
+  if (offset === 0) {
+    return tool;
+  }
+
+  const args = { ...tool.args };
+
+  for (const key of ['id', 'targetId', 'companyId', 'pointOfContactId']) {
+    const value = args[key];
+    const match = typeof value === 'string' ? /^\$(\d+)$/.exec(value) : undefined;
+
+    if (match?.[1]) {
+      args[key] = `$${Number(match[1]) + offset}`;
+    }
+  }
+
+  return { name: tool.name, args };
 }
 
 function toolFromChoice(choice: PendingChoice, candidate: ChoiceCandidate): ToolCall {

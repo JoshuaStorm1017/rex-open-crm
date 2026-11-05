@@ -7,15 +7,24 @@ export type AiProposalLine = {
   summary: string;
 };
 
+export type AiProposalCandidate = {
+  id: string;
+  label: string;
+  objectName: string;
+  action?: 'use' | 'create';
+  detail?: string;
+};
+
+export type AiProposalChoiceGroup = {
+  id: string;
+  prompt: string;
+  candidates: AiProposalCandidate[];
+};
+
 export type AiProposalChoice = {
   prompt: string;
-  candidates: Array<{
-    id: string;
-    label: string;
-    objectName: string;
-    action?: 'use' | 'create';
-    detail?: string;
-  }>;
+  candidates: AiProposalCandidate[];
+  groups?: AiProposalChoiceGroup[];
 };
 
 export type AiProposal = {
@@ -45,6 +54,12 @@ export type AiUndo = {
 export type AiActResult = {
   links: AiRecordLink[];
   undo?: AiUndo;
+  undos?: AiUndo[];
+};
+
+export type AiUndoResult = {
+  next?: AiUndo;
+  undos?: AiUndo[];
 };
 
 export type AiCommandOutcome<TData> =
@@ -92,6 +107,7 @@ export const executeAiCommand = async (
   idempotencyKey: string,
   fetchImpl: FetchImpl,
   choiceId?: string,
+  choices?: Record<string, string>,
 ): Promise<AiCommandOutcome<AiActResult>> => {
   const payload = await postAiCommand(
     config,
@@ -101,6 +117,7 @@ export const executeAiCommand = async (
       confirmed: true,
       proposalId,
       ...(choiceId ? { choiceId } : {}),
+      ...(choices && Object.keys(choices).length > 0 ? { choices } : {}),
     },
     fetchImpl,
     idempotencyKey,
@@ -111,12 +128,14 @@ export const executeAiCommand = async (
   }
 
   const undo = readUndo(payload.data);
+  const undos = readUndos(payload.data);
 
   return {
     kind: 'data',
     data: {
       links: readRecordLinks(payload.data),
       ...(undo ? { undo } : {}),
+      ...(undos ? { undos } : {}),
     },
   };
 };
@@ -126,7 +145,7 @@ export const undoAiCommand = async (
   undoId: string,
   idempotencyKey: string,
   fetchImpl: FetchImpl,
-): Promise<AiCommandOutcome<true>> => {
+): Promise<AiCommandOutcome<AiUndoResult>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/undo',
@@ -143,7 +162,16 @@ export const undoAiCommand = async (
     return payload;
   }
 
-  return { kind: 'data', data: true };
+  const next = readUndo(payload.data);
+  const undos = readUndos(payload.data);
+
+  return {
+    kind: 'data',
+    data: {
+      ...(next ? { next } : {}),
+      ...(undos ? { undos } : {}),
+    },
+  };
 };
 
 const postAiCommand = async (
@@ -221,7 +249,7 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     return undefined;
   }
 
-  if (lines.length === 0) {
+  if (lines.length === 0 && !choice?.groups) {
     return undefined;
   }
 
@@ -249,17 +277,71 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
 };
 
 const readChoice = (value: unknown): AiProposalChoice | undefined => {
-  if (
-    !isPlainObject(value) ||
-    typeof value.prompt !== 'string' ||
-    !Array.isArray(value.candidates)
-  ) {
+  if (!isPlainObject(value) || typeof value.prompt !== 'string') {
     return undefined;
   }
 
-  const candidates: AiProposalChoice['candidates'] = [];
+  const groups = readChoiceGroups(value.groups);
 
-  for (const candidate of value.candidates) {
+  if (Array.isArray(value.groups) && !groups) {
+    return undefined;
+  }
+
+  const candidates = readCandidates(value.candidates);
+
+  if (!groups && (!candidates || candidates.length < 2)) {
+    return undefined;
+  }
+
+  if (groups && groups.length === 0) {
+    return undefined;
+  }
+
+  return {
+    prompt: value.prompt,
+    candidates: candidates ?? groups?.[0]?.candidates ?? [],
+    ...(groups ? { groups } : {}),
+  };
+};
+
+const readChoiceGroups = (
+  value: unknown,
+): AiProposalChoiceGroup[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const groups: AiProposalChoiceGroup[] = [];
+
+  for (const group of value) {
+    if (
+      !isPlainObject(group) ||
+      typeof group.id !== 'string' ||
+      typeof group.prompt !== 'string'
+    ) {
+      return undefined;
+    }
+
+    const candidates = readCandidates(group.candidates);
+
+    if (!candidates || candidates.length < 2) {
+      return undefined;
+    }
+
+    groups.push({ id: group.id, prompt: group.prompt, candidates });
+  }
+
+  return groups;
+};
+
+const readCandidates = (value: unknown): AiProposalCandidate[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const candidates: AiProposalCandidate[] = [];
+
+  for (const candidate of value) {
     if (
       !isPlainObject(candidate) ||
       typeof candidate.id !== 'string' ||
@@ -282,11 +364,7 @@ const readChoice = (value: unknown): AiProposalChoice | undefined => {
     });
   }
 
-  if (candidates.length < 2) {
-    return undefined;
-  }
-
-  return { prompt: value.prompt, candidates };
+  return candidates;
 };
 
 const readRecordLinks = (payload: unknown): AiRecordLink[] => {
@@ -351,6 +429,30 @@ const readUndo = (payload: unknown): AiUndo | undefined => {
   }
 
   return { id, summary };
+};
+
+const readUndos = (payload: unknown): AiUndo[] | undefined => {
+  if (!isPlainObject(payload) || !Array.isArray(payload.undos)) {
+    return undefined;
+  }
+
+  const undos: AiUndo[] = [];
+
+  for (const undo of payload.undos) {
+    if (
+      !isPlainObject(undo) ||
+      typeof undo.id !== 'string' ||
+      !UNDO_ID_PATTERN.test(undo.id) ||
+      typeof undo.summary !== 'string' ||
+      undo.summary.trim().length === 0
+    ) {
+      return undefined;
+    }
+
+    undos.push({ id: undo.id, summary: undo.summary });
+  }
+
+  return undos.length > 0 ? undos : undefined;
 };
 
 const readMessage = (payload: unknown): string => {

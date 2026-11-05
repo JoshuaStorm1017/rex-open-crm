@@ -84,12 +84,16 @@ export function groundModelPlan(
   return grounded;
 }
 
+const UUID_TOKEN =
+  /^(?:[A-Za-z]+_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function intentIncludesId(intent: string, id: string): boolean {
-  if (id.length < 8) {
+  // Only a UUID the member typed is an id. A long word in the sentence is not.
+  if (!UUID_TOKEN.test(id)) {
     return false;
   }
 
   const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  return new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:[^A-Za-z0-9_-]|$)`).test(intent);
+  return new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:[^A-Za-z0-9_-]|$)`, 'i').test(intent);
 }

@@ -97,6 +97,7 @@ export type ActEffect =
       id: string;
       field: string;
       previous: string | number | null;
+      written?: string | number;
       etag: string;
     }
   | {
@@ -117,6 +118,8 @@ export type ActSuccess = {
   results: ToolResult[];
   effects?: ActEffect[];
   undo?: ActUndo;
+  undos?: ActUndo[];
+  reversesAuditId?: string;
   summary?: string;
 };
 
@@ -127,15 +130,24 @@ export type ProposalLine = {
   summary: string;
 };
 
+export type PlanChoiceCandidate = {
+  id: string;
+  label: string;
+  objectName: 'person' | 'company' | 'opportunity';
+  action: 'use' | 'create';
+  detail?: string;
+};
+
+export type PlanChoiceGroup = {
+  id: string;
+  prompt: string;
+  candidates: PlanChoiceCandidate[];
+};
+
 export type PlanChoice = {
   prompt: string;
-  candidates: Array<{
-    id: string;
-    label: string;
-    objectName: 'person' | 'company' | 'opportunity';
-    action: 'use' | 'create';
-    detail?: string;
-  }>;
+  candidates: PlanChoiceCandidate[];
+  groups?: PlanChoiceGroup[];
 };
 
 export type PlanProposal = {

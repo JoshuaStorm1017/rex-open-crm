@@ -5,10 +5,10 @@ import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client
 import type { ProposalStore } from '../http/proposal-store';
 import type { LlmProvider } from '../llm/llm-provider';
 import { bindOpenRecord } from './bind-open-record';
-import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, matchDetail, matchLabel } from './create-new-choice';
+import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, createToolsForGroup, matchDetail, matchLabel } from './create-new-choice';
 import { groundModelPlan } from './ground-model-plan';
 import { loadVisibleSnapshot, publicVisibleRecords } from './visible-snapshot';
-import type { PendingChoice } from './pending-choice';
+import type { ChoiceGroup, PendingBatch, PendingBatchStep, PendingChoice } from './pending-choice';
 import { assertToolPermitted, catalogForAudience, loadAudience, type AudienceLoad } from './permissions';
 import { describeTool, summarizeLines } from './describe-tool';
 import { parseGatewayRequest, type OpenRecordContext } from './parse-request';
@@ -18,6 +18,7 @@ import {
   upstreamFailure,
   type ActRefusal,
   type ActUpstreamFailure,
+  type PlanChoiceCandidate,
   type PlanProposal,
   type PlanResult,
   type ProposalLine,
@@ -189,20 +190,20 @@ async function previewTools(
     validated.push(assignActor(bound, options.actorMemberId));
   }
 
-  const lines: ProposalLine[] = [];
-  const normalized: ToolCall[] = [];
   const memberId = options.memberId ?? 'member_direct';
+  const slots: PreviewSlot[] = [];
 
   try {
     for (const tool of validated) {
-      const named = await resolveNamedRecord(client, workspaceId, tool, validated.length);
+      const named = await resolveNamedRecord(client, workspaceId, tool);
 
       if ('refused' in named) {
         return named;
       }
 
       if ('choice' in named) {
-        return storeChoice(workspaceId, memberId, named.choice, options.proposals);
+        slots.push({ type: 'choice', draft: named.choice });
+        continue;
       }
 
       const current = await enrichUpdate(client, workspaceId, named);
@@ -211,8 +212,11 @@ async function previewTools(
         return current;
       }
 
-      lines.push(describeTool(named, current.record));
-      normalized.push(toolCallFromValidated(named));
+      slots.push({
+        type: 'ready',
+        tool: named,
+        ...(current.record ? { record: current.record } : {}),
+      });
     }
   } catch (error) {
     if (error instanceof CrmNotFoundError) {
@@ -226,23 +230,31 @@ async function previewTools(
     return upstreamFailure(error, 0);
   }
 
-  const stored = options.proposals?.save(memberId, workspaceId, normalized);
+  const choiceCount = slots.filter((slot) => slot.type === 'choice').length;
 
-  if (options.proposals && !stored) {
-    return refusal(
-      'invalid_request',
-      'Too many pending previews. Confirm or discard one before proposing another.',
-    );
+  if (choiceCount === 1 && slots.length === 1 && slots[0]?.type === 'choice') {
+    return storeChoice(workspaceId, memberId, slots[0].draft, options.proposals);
   }
 
-  const proposal: PlanProposal = {
-    id: stored?.id ?? `proposal_${randomUUID()}`,
-    summary: summarizeLines(lines),
-    tools: normalized,
-    lines,
-  };
+  if (choiceCount > 0) {
+    return storeBatch(workspaceId, memberId, slots, options.proposals);
+  }
 
-  return { ok: true, workspaceId, proposal };
+  const lines: ProposalLine[] = [];
+  const normalized: ToolCall[] = [];
+  const seenRecord = new Set<string>();
+
+  for (const slot of slots) {
+    if (slot.type !== 'ready') {
+      continue;
+    }
+
+    markChained(slot.tool, seenRecord);
+    lines.push(describeTool(slot.tool, slot.record));
+    normalized.push(toolCallFromValidated(slot.tool));
+  }
+
+  return storePreview(workspaceId, memberId, normalized, lines, options.proposals);
 }
 
 function assignActor(tool: ValidatedTool, actorMemberId: string | undefined): ValidatedTool {
@@ -268,7 +280,6 @@ async function resolveNamedRecord(
   client: TwentyCrmClient,
   workspaceId: string,
   tool: ValidatedTool,
-  toolCount: number,
 ): Promise<ValidatedTool | { choice: PendingChoice } | ActRefusal> {
   const query =
     tool.name === 'update_record' || tool.name === 'archive_record'
@@ -307,14 +318,6 @@ async function resolveNamedRecord(
   }
 
   if (matches.length > 1) {
-    if (toolCount > 1) {
-      return refusal(
-        'ambiguous_intent',
-        `Several ${objectName} records match “${query}”. Name one record id before combining actions.`,
-        { toolName: tool.name },
-      );
-    }
-
     const draft: Omit<PendingChoice, 'candidates' | 'createTools' | 'query'> & {
       query: string;
     } = {
@@ -497,6 +500,181 @@ function toolCallFromValidated(tool: ValidatedTool): ToolCall {
   }
 
   return { name: tool.name, args: { ...tool.input } };
+}
+
+type PreviewSlot =
+  | { type: 'ready'; tool: ValidatedTool; record?: CreatedRecord }
+  | { type: 'choice'; draft: PendingChoice };
+
+function storePreview(
+  workspaceId: string,
+  memberId: string,
+  tools: ToolCall[],
+  lines: ProposalLine[],
+  proposals: ProposalStore | undefined,
+): PlanResult {
+  const stored = proposals?.save(memberId, workspaceId, tools);
+
+  if (proposals && !stored) {
+    return refusal(
+      'invalid_request',
+      'Too many pending previews. Confirm or discard one before proposing another.',
+    );
+  }
+
+  return {
+    ok: true,
+    workspaceId,
+    proposal: {
+      id: stored?.id ?? `proposal_${randomUUID()}`,
+      summary: summarizeLines(lines),
+      tools,
+      lines,
+    },
+  };
+}
+
+function storeBatch(
+  workspaceId: string,
+  memberId: string,
+  slots: PreviewSlot[],
+  proposals: ProposalStore | undefined,
+): PlanResult {
+  const groups: Array<ChoiceGroup & { key: string }> = [];
+  const steps: PendingBatchStep[] = [];
+  const lines: ProposalLine[] = [];
+  const seenRecord = new Set<string>();
+
+  for (const slot of slots) {
+    if (slot.type === 'ready') {
+      markChained(slot.tool, seenRecord);
+      lines.push(describeTool(slot.tool, slot.record));
+      steps.push({ type: 'tool', tool: toolCallFromValidated(slot.tool) });
+      continue;
+    }
+
+    const key =
+      slot.draft.kind === 'update'
+        ? `update:${slot.draft.objectName}:${slot.draft.query ?? ''}`
+        : `solo:${groups.length}:${slot.draft.kind}:${slot.draft.objectName}:${slot.draft.query ?? ''}`;
+    let group = groups.find((item) => item.key === key);
+
+    if (!group) {
+      group = {
+        key,
+        id: String(groups.length),
+        kind: slot.draft.kind,
+        objectName: slot.draft.objectName,
+        query: slot.draft.query ?? '',
+        updates: [],
+        ...(slot.draft.title ? { title: slot.draft.title } : {}),
+        body: slot.draft.body,
+        candidates: slot.draft.candidates,
+      };
+      groups.push(group);
+    }
+
+    group.updates.push({ field: slot.draft.field, value: slot.draft.value });
+    steps.push({ type: 'choice', groupId: group.id, updateIndex: group.updates.length - 1 });
+  }
+
+  for (const group of groups) {
+    const createTools = createToolsForGroup(group);
+    group.createTools = createTools;
+    if (!createTools) {
+      group.candidates = group.candidates.filter((candidate) => candidate.id !== CREATE_NEW_CHOICE_ID);
+    }
+  }
+
+  const publicGroups = groups.map((group) => ({
+    id: group.id,
+    prompt: groupPrompt(group),
+    candidates: toPublicCandidates(group),
+  }));
+  const summary = publicGroups.map((group) => group.prompt).join(' ');
+
+  if (lines.length === 0) {
+    lines.push({
+      tool:
+        groups[0]?.kind === 'note'
+          ? 'create_note'
+          : groups[0]?.kind === 'archive'
+            ? 'archive_record'
+            : 'update_record',
+      summary,
+    });
+  }
+
+  const pending: PendingBatch = {
+    kind: 'batch',
+    groups: groups.map(({ key: _key, ...group }) => group),
+    steps,
+  };
+  const stored = proposals?.save(memberId, workspaceId, [], pending);
+
+  if (proposals && !stored) {
+    return refusal(
+      'invalid_request',
+      'Too many pending previews. Confirm or discard one before proposing another.',
+    );
+  }
+
+  return {
+    ok: true,
+    workspaceId,
+    proposal: {
+      id: stored?.id ?? `proposal_${randomUUID()}`,
+      summary,
+      tools: [],
+      lines,
+      choice: {
+        prompt: summary,
+        candidates: publicGroups[0]?.candidates ?? [],
+        groups: publicGroups,
+      },
+    },
+  };
+}
+
+function groupPrompt(group: ChoiceGroup): string {
+  const objectLabel =
+    group.objectName === 'person'
+      ? 'people'
+      : group.objectName === 'company'
+        ? 'companies'
+        : 'opportunities';
+  const named = group.query ? ` “${group.query}”` : '';
+  const createHint = group.createTools && group.createTools.length > 0 ? ', or create a new one' : '';
+  const fields =
+    group.kind === 'update' && group.updates.length > 1
+      ? ` The ${group.updates.length} field changes use the record you pick.`
+      : '';
+
+  return `Several ${objectLabel} match${named}. Choose one${createHint}, then confirm.${fields}`;
+}
+
+function toPublicCandidates(group: ChoiceGroup): PlanChoiceCandidate[] {
+  return group.candidates.map((candidate) => ({
+    id: candidate.id,
+    label: candidate.label,
+    objectName: group.objectName,
+    action: candidate.id === CREATE_NEW_CHOICE_ID ? ('create' as const) : ('use' as const),
+    ...(candidate.detail ? { detail: candidate.detail } : {}),
+  }));
+}
+
+function markChained(tool: ValidatedTool, seen: Set<string>): void {
+  if ((tool.name !== 'update_record' && tool.name !== 'archive_record') || !tool.input.id) {
+    return;
+  }
+
+  const key = `${tool.input.objectName}:${tool.input.id}`;
+
+  if (seen.has(key)) {
+    tool.input.ifMatch = 'chained';
+  }
+
+  seen.add(key);
 }
 
 function rejectForeignWorkspace(

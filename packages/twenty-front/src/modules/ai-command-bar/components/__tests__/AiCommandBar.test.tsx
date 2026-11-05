@@ -2,7 +2,11 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { createStore, Provider } from 'jotai';
 import { MemoryRouter } from 'react-router-dom';
+import { SidePanelPages } from 'twenty-shared/types';
+
+import { sidePanelNavigationStackState } from '@/side-panel/states/sidePanelNavigationStackState';
 
 import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
 
@@ -457,7 +461,8 @@ describe('picker detail and undo retry', () => {
       workspaceId: 'ws_demo',
       proposal: {
         id: 'proposal_22222222-2222-4222-8222-222222222222',
-        summary: 'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
+        summary:
+          'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
         tools: [],
         lines: [
           { tool: 'update_record', summary: 'Acme' },
@@ -465,7 +470,8 @@ describe('picker detail and undo retry', () => {
           { tool: 'update_record', summary: 'Create new company “Acme”' },
         ],
         choice: {
-          prompt: 'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
+          prompt:
+            'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
           candidates: [
             {
               id: 'company_north',
@@ -503,7 +509,8 @@ describe('picker detail and undo retry', () => {
           ok: false,
           refused: true,
           reason: 'precondition_failed',
-          message: 'The record changed after that action, so it was not reversed. Undo is still available.',
+          message:
+            'The record changed after that action, so it was not reversed. Undo is still available.',
         });
       }
 
@@ -513,7 +520,11 @@ describe('picker detail and undo retry', () => {
           {
             tool: 'update_record',
             status: 'updated',
-            record: { id: 'company_north', objectName: 'company', label: 'Acme' },
+            record: {
+              id: 'company_north',
+              objectName: 'company',
+              label: 'Acme',
+            },
           },
         ],
         undo: {
@@ -531,17 +542,238 @@ describe('picker detail and undo retry', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Propose' }));
 
-    expect(await screen.findByText('north.example · Lisbon')).toBeInTheDocument();
+    expect(
+      await screen.findByText('north.example · Lisbon'),
+    ).toBeInTheDocument();
     expect(screen.getByText('south.example · Porto')).toBeInTheDocument();
     expect(screen.getByText('New record')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('radio', { name: /north\.example · Lisbon/ }));
+    await user.click(
+      screen.getByRole('radio', { name: /north\.example · Lisbon/ }),
+    );
     await user.click(screen.getByRole('button', { name: 'Confirm' }));
     await user.click(await screen.findByRole('button', { name: 'Undo' }));
 
     expect(
       await screen.findByText(
         'The record changed after that action, so it was not reversed. Undo is still available.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled();
+  });
+});
+
+describe('side panel and several choices', () => {
+  it('sends the record open in the side panel when the page is a list', async () => {
+    const user = userEvent.setup();
+    const store = createStore();
+    store.set(sidePanelNavigationStackState.atom, [
+      {
+        page: SidePanelPages.RoutedPage,
+        pageTitle: 'Ada',
+        pageIcon: () => null,
+        pageId: 'panel-page',
+        routedLocation: {
+          pathname: '/object/person/person_side',
+          search: '',
+          hash: '',
+          state: null,
+          key: 'side',
+        },
+      },
+    ] as never);
+    const fetchImpl = jest.fn(async () => jsonResponse(proposal));
+
+    render(
+      <Provider store={store}>
+        <I18nProvider i18n={i18n}>
+          <MemoryRouter initialEntries={['/objects/people']}>
+            <AiCommandBar config={config} fetchImpl={fetchImpl} initialOpen />
+          </MemoryRouter>
+        </I18nProvider>
+      </Provider>,
+    );
+
+    expect(screen.getByRole('textbox', { name: 'Command' })).toHaveAttribute(
+      'placeholder',
+      'Add a note to this person: Followed up',
+    );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'add a note',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    const planCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/plan'),
+    );
+
+    expect(JSON.parse(String(planCall?.[1]?.body))).toEqual({
+      workspaceId: 'ws_demo',
+      intent: 'add a note',
+      context: { objectName: 'person', recordId: 'person_side' },
+    });
+  });
+
+  it('asks for every ambiguous name before confirm', async () => {
+    const user = userEvent.setup();
+    const choiceProposal = {
+      ok: true,
+      workspaceId: 'ws_demo',
+      proposal: {
+        id: 'proposal_22222222-2222-4222-8222-222222222222',
+        summary: 'Choose a person and a company.',
+        tools: [],
+        lines: [
+          { tool: 'update_record', summary: 'Choose a person and a company.' },
+        ],
+        choice: {
+          prompt: 'Choose a person and a company.',
+          candidates: [
+            {
+              id: 'person_north',
+              label: 'Ada North',
+              objectName: 'person',
+              action: 'use',
+            },
+            {
+              id: 'person_south',
+              label: 'Ada South',
+              objectName: 'person',
+              action: 'use',
+            },
+          ],
+          groups: [
+            {
+              id: '0',
+              prompt: 'Several people match “Ada”. Choose one, then confirm.',
+              candidates: [
+                {
+                  id: 'person_north',
+                  label: 'Ada North',
+                  objectName: 'person',
+                  action: 'use',
+                },
+                {
+                  id: 'person_south',
+                  label: 'Ada South',
+                  objectName: 'person',
+                  action: 'use',
+                },
+              ],
+            },
+            {
+              id: '1',
+              prompt:
+                'Several companies match “Acme”. Choose one, then confirm.',
+              candidates: [
+                {
+                  id: 'company_north',
+                  label: 'Acme North',
+                  objectName: 'company',
+                  action: 'use',
+                },
+                {
+                  id: 'company_south',
+                  label: 'Acme South',
+                  objectName: 'company',
+                  action: 'use',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    };
+    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/ai/plan')) {
+        return jsonResponse(choiceProposal);
+      }
+
+      return jsonResponse({ ok: true, results: [] });
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update both',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(await screen.findByText(/Several people match/)).toBeInTheDocument();
+    expect(screen.getByText(/Several companies match/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+    await user.click(screen.getByRole('radio', { name: 'Ada North' }));
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+    await user.click(screen.getByRole('radio', { name: 'Acme South' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+
+    const actCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/act'),
+    );
+
+    expect(JSON.parse(String(actCall?.[1]?.body))).toMatchObject({
+      choices: { '0': 'person_north', '1': 'company_south' },
+    });
+  });
+
+  it('undoes the newest act and keeps the older one available', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+
+      if (url.endsWith('/v1/ai/plan')) {
+        return jsonResponse(proposal);
+      }
+
+      if (url.endsWith('/v1/ai/undo')) {
+        return jsonResponse({
+          ok: true,
+          summary: 'Reversed the last confirmed change.',
+          undo: {
+            id: 'undo_44444444-4444-4444-8444-444444444444',
+            summary: 'Undo 1 field change.',
+          },
+          undos: [
+            {
+              id: 'undo_44444444-4444-4444-8444-444444444444',
+              summary: 'Undo 1 field change.',
+            },
+          ],
+        });
+      }
+
+      return jsonResponse({
+        ...created,
+        undo: {
+          id: 'undo_33333333-3333-4333-8333-333333333333',
+          summary: 'Undo 1 field change.',
+        },
+        undos: [
+          {
+            id: 'undo_33333333-3333-4333-8333-333333333333',
+            summary: 'Undo 1 field change.',
+          },
+          {
+            id: 'undo_44444444-4444-4444-8444-444444444444',
+            summary: 'Undo 1 created record.',
+          },
+        ],
+      });
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(screen.getByRole('textbox', { name: 'Command' }), INTENT);
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+    expect(
+      await screen.findByText('Undo 1 created record.'),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Undo' }));
+
+    expect(
+      await screen.findByText(
+        'Undone. The next recent change can still be reversed.',
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled();

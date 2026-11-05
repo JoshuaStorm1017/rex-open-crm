@@ -8,7 +8,7 @@ Fictional data only. The samples below use `ws_demo` and `*.example` addresses.
 
 ## Run
 
-Requires Node.js 22 or newer. From this directory:
+Requires Node.js 22 or newer. The Twenty web app in this repo requires Node.js 24.5. From this directory:
 
 ```bash
 npm install
@@ -101,7 +101,7 @@ Only these tools run. Anything else is refused before the client is called.
 | `update_record` | `object`, `field`, `value`, and either `id` or `query` | `ifMatch` (filled from the current record when the preview can load it) |
 | `archive_record` | `object`, and either `id` or `query` | `ifMatch` (filled from the current record). Soft-delete only |
 
-`GET /v1/ai/tools` returns the same allowlist as JSON Schema for an external agent. It uses the same bearer check as act and audit. `ifMatch` is the record etag (`v1` on the mock, `updatedAt` from Twenty). A mismatch is HTTP 412 and does not write. Twenty's REST API ignores an `If-Match` header, so the HTTP client sends the etag as `updatedAt[eq]` on an update-many filter. Zero matched rows means nothing was written.
+`GET /v1/ai/tools` returns the same allowlist as JSON Schema for an external agent. It uses the same bearer check as act and audit. `ifMatch` is the record etag (`v1` on the mock, `updatedAt` from Twenty). A mismatch is HTTP 412 and does not write. Twenty's REST API ignores an `If-Match` header, so the HTTP client sends the etag as `updatedAt[eq]` on an update-many filter. Archive uses the same filter on soft-delete many (`DELETE` with `soft_delete=true`). Zero matched rows means nothing was written. Several field writes on one record in one preview keep the first etag and mark the later writes `chained`. Confirm refreshes If-Match from the etag the previous write in that act just returned.
 
 Writable fields: person `firstName`, `lastName`, `email`, `jobTitle`, `phone`, `linkedin`; company `name`, `domain`, `website` (the same link as `domain`), `linkedin`, `address` (street), `city`, `accountOwner` (also accepted as `owner`); opportunity `name`, `stage`, `amount`, `closeDate`, `owner`. `stage` must be one of the Twenty opportunity values above. `closeDate` is `YYYY-MM-DD`. `linkedin` is a `linkedin.com` URL and is stored as `https`. `owner` and `accountOwner` are `me` (the signed-in member) or a workspace member id. `phone` is a calling code the gateway knows (`+1`, `+33`, `+44`, `+49`, `+61`) plus the national number.
 
@@ -181,7 +181,7 @@ npm run start:twenty
 
 Leave `REX_AI_PROVIDER` unset, or set it to `mock`, to keep the deterministic planner. A public `TWENTY_API_URL` hostname is resolved and the connection is pinned to that address so a later DNS answer cannot move the member credential onto a private host. Loopback origins are not pinned.
 
-`GET /v1/ai/tools` returns only the tools the signed-in member can perform. Create and update are separate gates. Twenty's object permission has no create flag, so the HTTP reader fills `canCreate` from `canUpdateObjectRecords`. A caller that supplies both can refuse creates while still allowing updates. Search and update also require read. Archive requires read and soft-delete, not update. Notes require create on `note` and read on the target. Field permissions stay out of scope. Plan and act refuse a hidden tool with `forbidden` even if a model asks for it. When permissions cannot be read, the catalog is empty and nothing is proposed.
+`GET /v1/ai/tools` returns only the tools the signed-in member can perform. Create and update are separate gates. Twenty's object permission has no create flag, so the HTTP reader fills `canCreate` from `canUpdateObjectRecords`. A caller that supplies both can refuse creates while still allowing updates. Search and update also require read. Archive requires read and soft-delete, not update. Undoing an archive uses that same soft-delete gate. Notes require create on `note` and read on the target. Field permissions come from `objectPermissions.restrictedFields`, matched to Twenty field names (`emails` for `email`, `domainName` for `domain` and `website`, and so on). A field with `canUpdate: false` or `canRead: false` is left out of the update tool and refused on plan and on confirm. If the field list or `restrictedFields` cannot be read, every field write is refused. Object permissions that omit field data, which is how the in-memory tests model a role, still allow the allowlisted fields. Plan and act refuse a hidden tool with `forbidden` even if a model asks for it. When object permissions cannot be read, the catalog is empty and nothing is proposed.
 
 ## Plan, then confirm
 
@@ -204,19 +204,24 @@ Other mock sentences:
 find companies named Acme
 update company <id> set domain to acme.example
 update company named Acme set domain to acme.example
+update person named Ada Lovelace set email to ada@analytical.example and jobTitle to Analyst
+update person named Ada Lovelace set jobTitle to Analyst and update company named Acme set city to Lisbon
 update this deal's stage to Proposal
+update this person's email to ada@analytical.example and jobTitle to Analyst
 add a note: Called the buyer
 ```
 
-The last two need `context` for the open record. "this deal" means the open opportunity.
+The "this" sentences need `context` for the open record. "this deal" means the open opportunity. Two fields on one named record are two writes. The second If-Match is chained to the first.
 
 A named update that matches zero records is `not_found`. More than one person, company, or opportunity is a preview with one radio per match. The name stays on the radio. The detail line shows email, domain, and city when those fields exist, or stage and amount for an opportunity. People and companies also get a "create new" choice. Confirm sends `choiceId`. `create_new` creates the person or company, then applies the note or the field change. Opportunities can be chosen but not created from that picker. Nothing is written until one choice is confirmed. Hard deletes, exports, and credential requests are `unsafe_intent`. `archive company named Acme` soft-deletes.
 
-On a record page the command bar sends `context: { objectName, recordId }` for the open person, company, or opportunity. The mock planner accepts "update this deal's stage to Proposal" and "add a note: …". The model is told to set `recordRef` to `open` and is not given the record id. The gateway loads the open record and substitutes its id before the preview is stored.
+A plan can name two ambiguous records. The preview then has one group per name (`choice.groups`). Confirm sends `choices: { "0": "<id>", "1": "<id>" }`. One group still accepts `choiceId`. A missing choice writes nothing. Two field changes that share one ambiguous name are one group, and the chosen record receives every field.
 
-Before a real model plans, the gateway also loads a short list of records that the member can already read (up to five recent people, companies, and opportunities). The prompt contains a handle (`p1`, `c1`, `o1`), the label, and the same detail the picker shows. It does not contain the record id. The model may set `recordRef` to that handle. The gateway replaces the handle with the id it loaded. An id the model invents, and that the member did not type in the intent, is refused. A name query is still allowed when the record is not in the list, and several matches still open the picker.
+On a record page, and when that record is open in the side panel while the main page is a list, the command bar sends `context: { objectName, recordId }` for the open person, company, or opportunity. The side panel wins when both are present. The mock planner accepts "update this deal's stage to Proposal" and "add a note: …". The model is told to set `recordRef` to `open` and is not given the record id. The gateway loads the open record and substitutes its id before the preview is stored.
 
-A successful write returns `undo: { id, summary }` when the act created records, changed fields, or archived a record. `POST /v1/ai/undo` with that id and `confirmed: true` soft-deletes created records, writes the previous field values back (including clearing a field that was empty), and restores an archived record. Created notes are compared to their etag first. If the note changed, nothing is deleted and the same undo id stays available for a retry. A conflicting field undo is kept the same way. The command bar leaves the Undo button in place and shows the refusal. The undo is audited as `undo`. Only the last reversible act for that member is kept. Search-only acts do not replace it.
+Before a real model plans, the gateway also loads a short list of records that the member can already read (up to five recent people, companies, and opportunities). The prompt contains a handle (`p1`, `c1`, `o1`), the label, and the same detail the picker shows. It does not contain the record id. The model may set `recordRef` to that handle. The gateway replaces the handle with the id it loaded. An id the model invents is refused unless the member typed that id and the id is UUID-shaped (a UUID, or a short prefix plus a UUID, such as the mock's `company_<uuid>`). A name query is still allowed when the record is not in the list, and several matches still open the picker.
+
+A successful write returns `undo: { id, summary }` and `undos`, newest first, when the act created records, changed fields, or archived a record. Up to eight reversible acts are kept per member. `POST /v1/ai/undo` with the newest id and `confirmed: true` soft-deletes created records, writes the previous field values back (including clearing a field that was empty), and restores an archived record. An older id is refused until the newer one is undone. The response then includes the next undo, so the command bar can keep going in order. Created notes are compared to their etag first. If the note changed, nothing is deleted and the same undo id stays available for a retry. A conflicting field undo is kept the same way. A later undo that only moves the etag still reverses an older field change when the field still holds the value that act wrote. The command bar leaves the Undo button in place and shows the refusal. The undo is audited as `undo`, and that row's `reverses` is the audit id of the act it reversed. Search-only acts do not change the stack.
 
 A multi-tool act is not a Twenty transaction. If a later tool fails, the gateway deletes the records created earlier in that act and restores updated fields to the value loaded before the write. When a rollback itself fails, the response is `partial_failure` (HTTP 409) and names the records that remain.
 

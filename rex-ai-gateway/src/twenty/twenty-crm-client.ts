@@ -126,6 +126,13 @@ export type ArchiveRecordInput = {
 
 export type ObjectCapabilityName = TwentyObjectName | 'note';
 
+export type FieldCapability = {
+  name: string;
+  canUpdate: boolean;
+  // The metadata id for this field could not be read, so the write is refused.
+  unreadable?: boolean;
+};
+
 export type MemberCapabilities = {
   unavailable?: boolean;
   objects: Array<{
@@ -135,6 +142,8 @@ export type MemberCapabilities = {
     // Twenty has no create flag. Omit this and create follows canUpdate.
     canCreate?: boolean;
     canSoftDelete: boolean;
+    // Omit on a mock that only models object permissions. 'unavailable' fails closed.
+    fieldPermissions?: 'unavailable' | FieldCapability[];
   }>;
 };
 

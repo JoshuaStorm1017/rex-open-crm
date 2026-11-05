@@ -1,6 +1,6 @@
 import type { TwentyObjectName } from '../twenty/twenty-crm-client';
 import { ALLOWED_TOOL_NAMES } from './types';
-import { UPDATABLE_FIELDS } from './writable-fields';
+import { UPDATABLE_FIELDS, type UpdatableObjectName } from './writable-fields';
 
 export type ToolSchema = {
   name: (typeof ALLOWED_TOOL_NAMES)[number];
@@ -13,6 +13,9 @@ export type ToolAudience = {
   canCreate: ReadonlySet<TwentyObjectName | 'note'>;
   canUpdate: ReadonlySet<TwentyObjectName | 'note'>;
   canSoftDelete: ReadonlySet<TwentyObjectName | 'note'>;
+  writableFields?: ReadonlyMap<TwentyObjectName, ReadonlySet<string>>;
+  unreadableFields?: ReadonlyMap<TwentyObjectName, ReadonlySet<string>>;
+  fieldPermissionsUnreadable?: ReadonlySet<TwentyObjectName>;
 };
 
 const stringProperty = (description: string) => ({
@@ -141,10 +144,8 @@ function fullCatalog(): ToolSchema[] {
       {
         name: 'update_record',
         description:
-          'Update one allowlisted field. id or query is required. ifMatch is the record etag (If-Match). A mismatch does not write. owner and accountOwner accept "me" or a workspace member id. stage must be NEW, SCREENING, MEETING, PROPOSAL, or CUSTOMER. phone looks like +1 4155550134. Writable fields: ' +
-          Object.entries(UPDATABLE_FIELDS)
-            .map(([objectName, fields]) => `${objectName} (${fields.join(', ')})`)
-            .join('; ') +
+          'Update one allowlisted field. id or query is required. ifMatch is the record etag (If-Match). A mismatch does not write. Several updates of one record in one preview refresh If-Match after each write. owner and accountOwner accept "me" or a workspace member id. stage must be NEW, SCREENING, MEETING, PROPOSAL, or CUSTOMER. phone looks like +1 4155550134. Writable fields: ' +
+          writableFieldSummary() +
           '.',
         inputSchema: {
           type: 'object',
@@ -222,7 +223,13 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
   }
 
   if (tool.name === 'update_record') {
-    return withEnum(tool, 'object', updatableNames(audience));
+    const objects = updatableNames(audience);
+    const description = tool.description.replace(
+      /Writable fields:.*\.$/,
+      `Writable fields: ${writableFieldSummary(audience)}.`,
+    );
+
+    return withEnum({ ...tool, description }, 'object', objects);
   }
 
   if (tool.name === 'archive_record') {
@@ -252,8 +259,48 @@ function readableNames(audience: ToolAudience): TwentyObjectName[] {
 
 function updatableNames(audience: ToolAudience): TwentyObjectName[] {
   return (['person', 'company', 'opportunity'] as const).filter(
-    (name) => audience.canRead.has(name) && audience.canUpdate.has(name),
+    (name) =>
+      audience.canRead.has(name) &&
+      audience.canUpdate.has(name) &&
+      writableFieldNames(audience, name).length > 0,
   );
+}
+
+function writableFieldNames(audience: ToolAudience | undefined, objectName: UpdatableObjectName): string[] {
+  const fields = UPDATABLE_FIELDS[objectName];
+
+  if (!audience) {
+    return [...fields];
+  }
+
+  if (audience.fieldPermissionsUnreadable?.has(objectName)) {
+    return [];
+  }
+
+  const unreadable = audience.unreadableFields?.get(objectName);
+  const known = audience.writableFields?.get(objectName);
+
+  return fields.filter((field) => {
+    if (unreadable?.has(field)) {
+      return false;
+    }
+
+    if (!known) {
+      return true;
+    }
+
+    return known.has(field);
+  });
+}
+
+function writableFieldSummary(audience?: ToolAudience): string {
+  const objects = audience
+    ? updatableNames(audience)
+    : (['person', 'company', 'opportunity'] as const);
+
+  return objects
+    .map((objectName) => `${objectName} (${writableFieldNames(audience, objectName).join(', ')})`)
+    .join('; ');
 }
 
 function archivableNames(audience: ToolAudience): TwentyObjectName[] {

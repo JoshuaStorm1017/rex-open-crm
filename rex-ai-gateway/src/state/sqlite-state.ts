@@ -2,12 +2,18 @@ import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import type { PendingChoice } from '../act/pending-choice';
+import type { PendingSelection } from '../act/pending-choice';
 import type { ActEffect, ToolCall } from '../act/types';
 import { AuditLog, type AuditEntry } from '../audit/audit-log';
 import { IdempotencyStore, type IdempotentResponse } from '../http/idempotency-store';
 import { ProposalStore, type ClaimResult, type StoredProposal } from '../http/proposal-store';
-import { summarizeUndo, UndoStore, type TakeUndoResult, type UndoTicket } from '../http/undo-store';
+import {
+  summarizeUndo,
+  UndoStore,
+  UNDO_STACK_LIMIT,
+  type TakeUndoResult,
+  type UndoTicket,
+} from '../http/undo-store';
 
 export type GatewayState = {
   proposals: ProposalStore;
@@ -51,6 +57,16 @@ export function openGatewayState(filename: string): GatewayState {
       summary TEXT NOT NULL,
       effects_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS undo_stack (
+      id TEXT PRIMARY KEY,
+      member_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      effects_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      act_audit_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS undo_stack_member ON undo_stack (member_id, created_at);
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
       at TEXT NOT NULL,
@@ -64,9 +80,11 @@ export function openGatewayState(filename: string): GatewayState {
       ok INTEGER NOT NULL,
       confirmed INTEGER,
       reason TEXT,
-      replayed INTEGER NOT NULL
+      replayed INTEGER NOT NULL,
+      reverses TEXT
     );
   `);
+  migrateGatewayState(database);
 
   return {
     proposals: new SqliteProposalStore(database, () => restrictStateFiles(filename)),
@@ -92,7 +110,7 @@ class SqliteProposalStore extends ProposalStore {
     memberId: string,
     workspaceId: string,
     tools: ToolCall[],
-    pendingChoice?: PendingChoice,
+    pendingChoice?: PendingSelection,
     now = Date.now(),
   ): StoredProposal | undefined {
     this.database
@@ -130,6 +148,7 @@ class SqliteProposalStore extends ProposalStore {
     workspaceId: string,
     memberId: string,
     choiceId?: string,
+    choices?: Record<string, string>,
     now = Date.now(),
   ): ClaimResult {
     const row = this.database
@@ -169,7 +188,7 @@ class SqliteProposalStore extends ProposalStore {
       return { ok: false, reason: 'missing' };
     }
 
-    const claimed = this.claimStored(proposal, choiceId);
+    const claimed = this.claimStored(proposal, choiceId, choices);
 
     if (!claimed.ok && claimed.reason === 'choice') {
       return claimed;
@@ -196,7 +215,7 @@ class SqliteProposalStore extends ProposalStore {
     }
 
     const pendingChoice = row.pending_choice_json
-      ? (JSON.parse(row.pending_choice_json) as PendingChoice)
+      ? (JSON.parse(row.pending_choice_json) as PendingSelection)
       : undefined;
 
     return {
@@ -223,7 +242,7 @@ class SqliteUndoStore extends UndoStore {
     workspaceId: string,
     effects: ActEffect[],
   ): UndoTicket | undefined {
-    const ticket = this.createTicket(memberId, workspaceId, effects);
+    const ticket = this.buildTicket(memberId, workspaceId, effects);
 
     if (!ticket) {
       return undefined;
@@ -231,18 +250,38 @@ class SqliteUndoStore extends UndoStore {
 
     this.database
       .prepare(
-        `INSERT INTO undo_tickets (member_id, id, workspace_id, summary, effects_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(member_id) DO UPDATE SET
-           id = excluded.id,
-           workspace_id = excluded.workspace_id,
-           summary = excluded.summary,
-           effects_json = excluded.effects_json`,
+        `INSERT INTO undo_stack (id, member_id, workspace_id, summary, effects_json, created_at, act_audit_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       )
-      .run(ticket.memberId, ticket.id, ticket.workspaceId, ticket.summary, JSON.stringify(ticket.effects));
+      .run(
+        ticket.id,
+        ticket.memberId,
+        ticket.workspaceId,
+        ticket.summary,
+        JSON.stringify(ticket.effects),
+        ticket.createdAt,
+      );
+    this.database
+      .prepare(
+        `DELETE FROM undo_stack WHERE member_id = ? AND id NOT IN (
+           SELECT id FROM undo_stack WHERE member_id = ? ORDER BY created_at DESC LIMIT ?
+         )`,
+      )
+      .run(memberId, memberId, UNDO_STACK_LIMIT);
     this.restrict();
 
     return ticket;
+  }
+
+  override list(memberId: string, workspaceId: string): UndoTicket[] {
+    return this.readAll(memberId).filter((ticket) => ticket.workspaceId === workspaceId);
+  }
+
+  override linkAct(id: string, memberId: string, auditId: string): void {
+    this.database
+      .prepare('UPDATE undo_stack SET act_audit_id = ? WHERE member_id = ? AND id = ?')
+      .run(auditId, memberId, id);
+    this.restrict();
   }
 
   override peek(id: string, memberId: string, workspaceId: string): TakeUndoResult {
@@ -253,7 +292,8 @@ class SqliteUndoStore extends UndoStore {
     const result = this.readTicket(id, memberId, workspaceId);
 
     if (result.ok) {
-      this.database.prepare('DELETE FROM undo_tickets WHERE member_id = ?').run(memberId);
+      this.release(memberId);
+      this.database.prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?').run(memberId, id);
       this.restrict();
     }
 
@@ -261,8 +301,14 @@ class SqliteUndoStore extends UndoStore {
   }
 
   override finish(memberId: string): void {
+    const id = this.runningUndoId(memberId);
     super.finish(memberId);
-    this.database.prepare('DELETE FROM undo_tickets WHERE member_id = ?').run(memberId);
+
+    if (!id) {
+      return;
+    }
+
+    this.database.prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?').run(memberId, id);
     this.restrict();
   }
 
@@ -278,64 +324,48 @@ class SqliteUndoStore extends UndoStore {
       return false;
     }
 
-    const summary = current.ticket.summary;
     this.database
-      .prepare(
-        `UPDATE undo_tickets SET summary = ?, effects_json = ? WHERE member_id = ? AND id = ?`,
-      )
-      .run(summarizeUndo(effects) || summary, JSON.stringify(effects), memberId, id);
+      .prepare('UPDATE undo_stack SET summary = ?, effects_json = ? WHERE member_id = ? AND id = ?')
+      .run(summarizeUndo(effects), JSON.stringify(effects), memberId, id);
     this.restrict();
 
     return true;
   }
 
-  private createTicket(
-    memberId: string,
-    workspaceId: string,
-    effects: ActEffect[],
-  ): UndoTicket | undefined {
-    return super.save(memberId, workspaceId, effects);
+  private readAll(memberId: string): UndoTicket[] {
+    const rows = this.database
+      .prepare(
+        `SELECT id, workspace_id, summary, effects_json, created_at, act_audit_id
+         FROM undo_stack WHERE member_id = ? ORDER BY created_at DESC`,
+      )
+      .all(memberId) as Array<Record<string, unknown>>;
+
+    return rows.flatMap((row) => {
+      const ticket = ticketFromRow(memberId, row);
+
+      return ticket ? [ticket] : [];
+    });
   }
 
   private readTicket(id: string, memberId: string, workspaceId: string): TakeUndoResult {
-    const row = this.database
-      .prepare(
-        'SELECT id, workspace_id, summary, effects_json FROM undo_tickets WHERE member_id = ?',
-      )
-      .get(memberId) as
-      | { id: string; workspace_id: string; summary: string; effects_json: string }
-      | undefined;
+    const stack = this.readAll(memberId);
+    const ticket = stack.find((item) => item.id === id);
 
-    if (!row || row.id !== id) {
+    if (!ticket) {
       return { ok: false, reason: 'missing' };
     }
 
-    if (row.workspace_id !== workspaceId) {
+    if (ticket.workspaceId !== workspaceId) {
       return { ok: false, reason: 'workspace' };
     }
 
-    let effects: unknown;
+    const newest = stack.find((item) => item.workspaceId === workspaceId);
 
-    try {
-      effects = JSON.parse(row.effects_json);
-    } catch {
-      return { ok: false, reason: 'missing' };
+    if (newest && newest.id !== id) {
+      return { ok: false, reason: 'order' };
     }
 
-    if (!Array.isArray(effects)) {
-      return { ok: false, reason: 'missing' };
-    }
-
-    return {
-      ok: true,
-      ticket: {
-        id: row.id,
-        memberId,
-        workspaceId: row.workspace_id,
-        summary: row.summary,
-        effects: effects as ActEffect[],
-      },
-    };
+    return { ok: true, ticket };
   }
 }
 
@@ -409,8 +439,8 @@ class SqliteAuditLog extends AuditLog {
       .prepare(
         `INSERT INTO audit_log (
            id, at, member_id, actor, workspace_id, action, summary, tools_json,
-           record_ids_json, ok, confirmed, reason, replayed
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           record_ids_json, ok, confirmed, reason, replayed, reverses
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         stored.id,
@@ -426,6 +456,7 @@ class SqliteAuditLog extends AuditLog {
         stored.confirmed === undefined ? null : stored.confirmed ? 1 : 0,
         stored.reason ?? null,
         stored.replayed ? 1 : 0,
+        stored.reverses ?? null,
       );
     this.database
       .prepare(
@@ -443,7 +474,7 @@ class SqliteAuditLog extends AuditLog {
     const rows = this.database
       .prepare(
         `SELECT id, at, member_id, actor, workspace_id, action, summary, tools_json,
-                record_ids_json, ok, confirmed, reason, replayed
+                record_ids_json, ok, confirmed, reason, replayed, reverses
          FROM audit_log WHERE member_id = ? ORDER BY at ASC`,
       )
       .all(memberId) as Array<Record<string, unknown>>;
@@ -493,5 +524,52 @@ function readAuditRow(row: Record<string, unknown>): AuditEntry {
       : { confirmed: row.confirmed === 1 }),
     ...(typeof row.reason === 'string' ? { reason: row.reason } : {}),
     ...(row.replayed === 1 ? { replayed: true } : {}),
+    ...(typeof row.reverses === 'string' ? { reverses: row.reverses } : {}),
+  };
+}
+
+function migrateGatewayState(database: DatabaseSync): void {
+  const auditColumns = database.prepare('PRAGMA table_info(audit_log)').all() as Array<{ name?: string }>;
+
+  if (!auditColumns.some((column) => column.name === 'reverses')) {
+    database.exec('ALTER TABLE audit_log ADD COLUMN reverses TEXT');
+  }
+
+  const legacy = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'undo_tickets'")
+    .get() as { name?: string } | undefined;
+
+  if (!legacy) {
+    return;
+  }
+
+  database.exec(`
+    INSERT OR IGNORE INTO undo_stack (id, member_id, workspace_id, summary, effects_json, created_at)
+    SELECT id, member_id, workspace_id, summary, effects_json, 0 FROM undo_tickets;
+    DELETE FROM undo_tickets;
+  `);
+}
+
+function ticketFromRow(memberId: string, row: Record<string, unknown>): UndoTicket | undefined {
+  let effects: unknown;
+
+  try {
+    effects = JSON.parse(String(row.effects_json));
+  } catch {
+    return undefined;
+  }
+
+  if (!Array.isArray(effects) || typeof row.id !== 'string' || typeof row.workspace_id !== 'string') {
+    return undefined;
+  }
+
+  return {
+    id: row.id,
+    memberId,
+    workspaceId: row.workspace_id,
+    summary: typeof row.summary === 'string' ? row.summary : '',
+    effects: effects as ActEffect[],
+    createdAt: typeof row.created_at === 'number' ? row.created_at : 0,
+    ...(typeof row.act_audit_id === 'string' ? { actAuditId: row.act_audit_id } : {}),
   };
 }

@@ -164,6 +164,12 @@ export function updateManyName(objectName: TwentyObjectName): string {
   return `update${plural.charAt(0).toUpperCase()}${plural.slice(1)}`;
 }
 
+export function deleteManyName(objectName: TwentyObjectName): string {
+  const plural = TWENTY_OBJECT_PATH[objectName].plural;
+
+  return `delete${plural.charAt(0).toUpperCase()}${plural.slice(1)}`;
+}
+
 export function toClearPayload(
   objectName: TwentyObjectName,
   field: string,

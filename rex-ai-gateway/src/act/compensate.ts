@@ -75,8 +75,14 @@ export async function compensate(
       // A later effect in this same undo already rewrote the row, so its etag moved.
       // Any other etag means the field may no longer hold the value this act wrote.
       if (!reversedInThisPass.has(key) && current.etag !== effect.etag) {
-        remaining.push({ index, id: effect.id, reason: 'conflict' });
-        continue;
+        const currentValue = Object.prototype.hasOwnProperty.call(current.properties, effect.field)
+          ? current.properties[effect.field]
+          : undefined;
+        // A newer undo on this row moves the etag while leaving this act's value in place.
+        if (effect.written === undefined || currentValue !== effect.written) {
+          remaining.push({ index, id: effect.id, reason: 'conflict' });
+          continue;
+        }
       }
 
       reversedInThisPass.add(key);

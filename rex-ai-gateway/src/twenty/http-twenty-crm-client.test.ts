@@ -527,6 +527,13 @@ describe('createHttpTwentyCrmClient', () => {
         return;
       }
 
+      if (captured.method === 'DELETE') {
+        sendJson(response, 200, {
+          data: { deleteCompanies: [{ id: 'company_row' }] },
+        });
+        return;
+      }
+
       sendJson(response, 200, {
         data: { updateCompanies: [{ id: 'company_row', updatedAt: '2026-01-02T00:00:00.000Z' }] },
       });
@@ -582,7 +589,7 @@ describe('createHttpTwentyCrmClient', () => {
       'GET /rest/companies/company_row?depth=1',
       'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
       'GET /rest/companies/company_row?depth=1',
-      'DELETE /rest/companies/company_row?soft_delete=true',
+      'DELETE /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)&soft_delete=true',
       'PATCH /rest/companies/company_row/restore',
     ]);
   });
