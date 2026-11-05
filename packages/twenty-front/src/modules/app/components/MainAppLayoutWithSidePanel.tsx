@@ -2,6 +2,7 @@ import { WorkspaceSetupChatSidePanelEffect } from '@/onboarding/effect-component
 import { CommandMenuForMobile } from '@/command-menu/components/CommandMenuForMobile';
 import { useCommandMenuHotKeys } from '@/command-menu/hooks/useCommandMenuHotKeys';
 import { RouteContextStoreProvider } from '@/context-store/components/RouteContextStoreProvider';
+import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
 import { LogConsole } from '@/log-console/components/LogConsole';
 import { SidePanelForDesktop } from '@/side-panel/components/SidePanelForDesktop';
 import { SidePanelPathUrlSyncEffect } from '@/side-panel/routing/components/SidePanelPathUrlSyncEffect';
@@ -71,6 +72,7 @@ export const MainAppLayoutWithSidePanel = () => {
           <Outlet />
         </StyledContent>
         <LogConsole />
+        <AiCommandBar />
       </StyledMainColumn>
       {isMobile ? <CommandMenuForMobile /> : <SidePanelForDesktop />}
     </StyledRow>
