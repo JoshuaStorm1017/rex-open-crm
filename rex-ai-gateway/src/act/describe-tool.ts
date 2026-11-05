@@ -32,6 +32,11 @@ export function describeTool(
         summary: `Create opportunity “${tool.input.name}”${amount}.${linked}`,
       };
     }
+    case 'create_note':
+      return {
+        tool: tool.name,
+        summary: `Add a note to ${tool.input.targetObject} ${tool.input.targetId ?? tool.input.targetQuery ?? ''}: “${tool.input.body}”.`,
+      };
     case 'search_records':
       return {
         tool: tool.name,
@@ -41,7 +46,7 @@ export function describeTool(
       const previous = current?.properties[tool.input.field];
       const from =
         previous === undefined ? '' : ` from ${formatValue(previous)}`;
-      const label = current?.label ?? tool.input.id;
+      const label = current?.label ?? tool.input.id ?? tool.input.query ?? 'record';
 
       return {
         tool: tool.name,

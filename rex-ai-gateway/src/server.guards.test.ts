@@ -40,11 +40,11 @@ describe('gateway guards', () => {
     };
     const executed = await post(gateway, '/v1/ai/act', body, {
       'idempotency-key': 'command-bar-demo-1',
-      'x-rex-actor': 'ada@analytical.example',
+      'x-rex-actor': 'spoofed@evil.example',
     });
     const replayed = await post(gateway, '/v1/ai/act', body, {
       'idempotency-key': 'command-bar-demo-1',
-      'x-rex-actor': 'ada@analytical.example',
+      'x-rex-actor': 'spoofed@evil.example',
     });
 
     expect(executed.response.status).toBe(200);
@@ -65,7 +65,9 @@ describe('gateway guards', () => {
     expect(conflict.payload).toMatchObject({ reason: 'idempotency_conflict' });
     expect(client.created).toHaveLength(3);
 
-    const audit = await fetch(`${gateway.url}/v1/ai/audit`);
+    const audit = await fetch(`${gateway.url}/v1/ai/audit`, {
+      headers: { 'x-rex-member': 'ada@analytical.example' },
+    });
     const auditBody: unknown = await audit.json();
 
     expect(auditBody).toMatchObject({ ok: true });
@@ -176,7 +178,7 @@ describe('gateway guards', () => {
     expect(client.created[0]?.properties.domain).toBe('engines.example');
   });
 
-  it('refuses an ambiguous name match and requires a bearer token when configured', async () => {
+  it('offers choices when a name matches several records and requires a member credential', async () => {
     const client = createMockTwentyCrmClient();
     await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme North' });
     await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme South' });
@@ -186,18 +188,66 @@ describe('gateway guards', () => {
       intent: 'update company named Acme set domain to acme.example',
     });
 
-    expect(ambiguous.response.status).toBe(400);
-    expect(ambiguous.payload).toMatchObject({ refused: true, reason: 'ambiguous_intent' });
-    expect(client.created.every((record) => record.properties.domain === undefined)).toBe(true);
+    expect(ambiguous.response.status).toBe(200);
+    expect(ambiguous.payload).toMatchObject({
+      ok: true,
+      proposal: {
+        choice: {
+          candidates: [
+            expect.objectContaining({ label: 'Acme North' }),
+            expect.objectContaining({ label: 'Acme South' }),
+          ],
+        },
+      },
+    });
+    const choiceId =
+      isRecord(ambiguous.payload) &&
+      isRecord(ambiguous.payload.proposal) &&
+      isRecord(ambiguous.payload.proposal.choice) &&
+      Array.isArray(ambiguous.payload.proposal.choice.candidates) &&
+      isRecord(ambiguous.payload.proposal.choice.candidates[1]) &&
+      typeof ambiguous.payload.proposal.choice.candidates[1].id === 'string'
+        ? ambiguous.payload.proposal.choice.candidates[1].id
+        : '';
+    const proposal =
+      isRecord(ambiguous.payload) &&
+      isRecord(ambiguous.payload.proposal) &&
+      typeof ambiguous.payload.proposal.id === 'string'
+        ? ambiguous.payload.proposal.id
+        : '';
+    const unchosen = await post(open, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposal,
+    });
+    const chosen = await post(open, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposal,
+      choiceId,
+    });
+
+    expect(unchosen.payload).toMatchObject({ reason: 'confirmation_required' });
+    expect(chosen.response.status).toBe(200);
+    expect(client.created.filter((record) => record.properties.domain === 'acme.example')).toHaveLength(1);
 
     const locked = await openGateway(client, 'test-gateway-token');
     const denied = await post(locked, '/v1/ai/tools', {});
     const deniedAudit = await fetch(`${locked.url}/v1/ai/audit`);
-    const allowed = await fetch(`${locked.url}/v1/ai/tools`, {
+    const bearerOnly = await fetch(`${locked.url}/v1/ai/tools`, {
       headers: { authorization: 'Bearer test-gateway-token' },
     });
+    const allowed = await fetch(`${locked.url}/v1/ai/tools`, {
+      headers: {
+        authorization: 'Bearer test-gateway-token',
+        'x-twenty-authorization': 'Bearer member:ada@analytical.example',
+      },
+    });
     const allowedAudit = await fetch(`${locked.url}/v1/ai/audit`, {
-      headers: { authorization: 'Bearer test-gateway-token' },
+      headers: {
+        authorization: 'Bearer test-gateway-token',
+        'x-twenty-authorization': 'Bearer member:ada@analytical.example',
+      },
     });
     const catalog: unknown = await allowed.json();
     const evilOrigin = await fetch(`${open.url}/v1/ai/audit`, {
@@ -210,6 +260,7 @@ describe('gateway guards', () => {
     expect(denied.response.status).toBe(401);
     expect(denied.payload).toMatchObject({ refused: true, reason: 'unauthorized' });
     expect(deniedAudit.status).toBe(401);
+    expect(bearerOnly.status).toBe(401);
     expect(allowed.status).toBe(200);
     expect(allowedAudit.status).toBe(200);
     expect(evilOrigin.headers.get('access-control-allow-origin')).toBeNull();
@@ -244,7 +295,11 @@ async function post(
 ): Promise<{ response: Response; payload: unknown }> {
   const response = await fetch(`${gateway.url}${path}`, {
     method: path === '/v1/ai/tools' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
+    headers: {
+      'content-type': 'application/json',
+      'x-rex-member': 'ada@analytical.example',
+      ...headers,
+    },
     body: path === '/v1/ai/tools' ? undefined : JSON.stringify(body),
   });
 

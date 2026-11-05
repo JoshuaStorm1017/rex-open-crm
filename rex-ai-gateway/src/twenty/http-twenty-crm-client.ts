@@ -1,3 +1,4 @@
+import { currentTwentyCredential, twentyAuthHeaders } from '../auth/call-context';
 import { isRecord } from '../is-record';
 import { CrmNotFoundError, CrmPreconditionError } from './crm-errors';
 import {
@@ -15,9 +16,11 @@ import {
 import { crmRecordFromTwenty, labelFromProperties, readEtag } from './record-fields';
 import {
   type CreateCompanyInput,
+  type CreateNoteInput,
   type CreateOpportunityInput,
   type CreatePersonInput,
   type CreatedRecord,
+  type DeleteRecordInput,
   type GetRecordInput,
   type SearchRecordsInput,
   type TwentyCrmClient,
@@ -32,7 +35,6 @@ export type TwentyApiStyle = 'rest' | 'graphql';
 
 export type TwentyHttpClientConfig = {
   apiUrl: string;
-  apiKey: string;
   style?: TwentyApiStyle;
   fetchImpl?: typeof fetch;
 };
@@ -46,16 +48,15 @@ export function readHttpClientConfigFromEnv(
   env: NodeJS.ProcessEnv,
 ): TwentyHttpClientConfig | undefined {
   const apiUrl = env.TWENTY_API_URL?.trim() ?? '';
-  const apiKey = env.TWENTY_API_KEY?.trim() ?? '';
 
-  if (apiUrl.length === 0 && apiKey.length === 0) {
+  if (apiUrl.length === 0) {
+    if ((env.TWENTY_API_KEY?.trim() ?? '').length > 0) {
+      throw new Error(
+        'TWENTY_API_KEY is not used. Writes run as the signed-in member. Set TWENTY_API_URL, or neither variable to use the in-memory mock.',
+      );
+    }
+
     return undefined;
-  }
-
-  if (apiUrl.length === 0 || apiKey.length === 0) {
-    throw new Error(
-      'Set both TWENTY_API_URL and TWENTY_API_KEY, or neither to use the in-memory mock.',
-    );
   }
 
   const style = env.TWENTY_API_STYLE?.trim() || 'rest';
@@ -64,7 +65,7 @@ export function readHttpClientConfigFromEnv(
     throw new Error('TWENTY_API_STYLE must be "rest" or "graphql".');
   }
 
-  return { apiUrl, apiKey, style };
+  return { apiUrl, style };
 }
 
 export function createHttpTwentyCrmClient(
@@ -79,7 +80,7 @@ export function createHttpTwentyCrmClient(
     init: { method: string; body?: unknown; ifMatch?: string },
   ): Promise<JsonResult> => {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${config.apiKey}`,
+      ...twentyAuthHeaders(currentTwentyCredential()),
       'content-type': 'application/json',
     };
 
@@ -297,6 +298,105 @@ export function createHttpTwentyCrmClient(
           [input.field]: input.value,
         }),
       };
+    },
+    async createNote(input: CreateNoteInput) {
+      if (!input.targetId) {
+        throw new Error('create_note is missing targetId.');
+      }
+
+      const notePayload = {
+        title: input.title ?? 'Note',
+        bodyV2: { markdown: input.body },
+      };
+      const noteResult =
+        style === 'rest'
+          ? await requestJson('/rest/notes', { method: 'POST', body: notePayload })
+          : await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query:
+                  'mutation Create($data: NoteCreateInput!) { createNote(data: $data) { id updatedAt } }',
+                variables: { data: notePayload },
+              },
+            });
+      const created = readMutationRecord(noteResult.body, 'createNote');
+      const noteId = readId(created, 'createNote');
+      const targetKey =
+        input.targetObject === 'person'
+          ? 'targetPersonId'
+          : input.targetObject === 'company'
+            ? 'targetCompanyId'
+            : 'targetOpportunityId';
+      const targetPayload = { noteId, [targetKey]: input.targetId };
+
+      try {
+        if (style === 'rest') {
+          await requestJson('/rest/noteTargets', { method: 'POST', body: targetPayload });
+        } else {
+          await requestJson('/graphql', {
+            method: 'POST',
+            body: {
+              query:
+                'mutation Create($data: NoteTargetCreateInput!) { createNoteTarget(data: $data) { id } }',
+              variables: { data: targetPayload },
+            },
+          });
+        }
+      } catch (error) {
+        await requestJson(
+          style === 'rest' ? `/rest/notes/${noteId}` : '/graphql',
+          style === 'rest'
+            ? { method: 'DELETE' }
+            : {
+                method: 'POST',
+                body: {
+                  query: 'mutation Delete($id: UUID!) { deleteNote(id: $id) { id } }',
+                  variables: { id: noteId },
+                },
+              },
+        ).catch(() => undefined);
+        throw error;
+      }
+
+      return {
+        id: noteId,
+        objectName: 'note',
+        workspaceId: input.workspaceId,
+        properties: {
+          title: input.title ?? 'Note',
+          body: input.body,
+          targetObject: input.targetObject,
+          targetId: input.targetId,
+        },
+        etag: readEtag(created),
+        label: input.title ?? 'Note',
+      };
+    },
+    async deleteRecord(input: DeleteRecordInput) {
+      const restPath =
+        input.objectName === 'person'
+          ? '/rest/people'
+          : input.objectName === 'company'
+            ? '/rest/companies'
+            : input.objectName === 'opportunity'
+              ? '/rest/opportunities'
+              : input.objectName === 'note'
+                ? '/rest/notes'
+                : '/rest/noteTargets';
+      const mutationName = `delete${input.objectName.charAt(0).toUpperCase()}${input.objectName.slice(1)}`;
+
+      if (style === 'rest') {
+        await requestJson(`${restPath}/${input.id}`, { method: 'DELETE' });
+        return;
+      }
+
+      await requestJson('/graphql', {
+        method: 'POST',
+        body: {
+          query: `mutation Delete($id: UUID!) { ${mutationName}(id: $id) { id } }`,
+          variables: { id: input.id },
+        },
+      });
     },
   };
 }

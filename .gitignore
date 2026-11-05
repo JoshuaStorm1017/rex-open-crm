@@ -39,6 +39,7 @@ dump.rdb
 
 .notes
 /data/
+rex-ai-gateway/data/
 /.devenv/
 /.direnv/
 /.pre-commit-config.yaml

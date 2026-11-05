@@ -28,6 +28,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
             lastName: stringProperty('Family name.'),
             email: stringProperty('Primary email. Fictional addresses only in examples.'),
             jobTitle: stringProperty('Job title.'),
+            phone: stringProperty('Primary phone, for example +1 4155550134.'),
             companyId: stringProperty('Company record id, or $n for an earlier tool result.'),
           },
         },
@@ -57,10 +58,32 @@ export function toolCatalog(): { tools: ToolSchema[] } {
             name: stringProperty('Opportunity name.'),
             amount: { type: 'number', minimum: 0, description: 'Amount in major units.' },
             currencyCode: stringProperty('ISO currency code. Defaults to USD when amount is set.'),
-            stage: stringProperty('Stage. Defaults to NEW.'),
+            stage: stringProperty(
+              'One of NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER. Defaults to NEW.',
+            ),
             companyId: stringProperty('Company record id, or $n.'),
             pointOfContactId: stringProperty('Person record id, or $n.'),
             closeDate: stringProperty('Close date, YYYY-MM-DD.'),
+          },
+        },
+      },
+      {
+        name: 'create_note',
+        description:
+          'Add a note to one person, company, or opportunity. body is markdown. targetId may be a record id or $n. targetQuery names the record when the id is not known; several matches become choices.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: true,
+          required: ['body', 'targetObject'],
+          properties: {
+            title: stringProperty('Note title. Defaults to Note.'),
+            body: stringProperty('Note body, at most 4000 characters.'),
+            targetObject: {
+              type: 'string',
+              enum: ['person', 'company', 'opportunity'],
+            },
+            targetId: stringProperty('Record id, or $n for an earlier tool result.'),
+            targetQuery: stringProperty('Name to search when targetId is omitted.'),
           },
         },
       },
@@ -91,7 +114,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
       {
         name: 'update_record',
         description:
-          'Update one allowlisted field. ifMatch is the record etag from search or get (If-Match). A mismatch does not write. Writable fields: ' +
+          'Update one allowlisted field. id or query is required. ifMatch is the record etag (If-Match). A mismatch does not write. owner and accountOwner accept "me" or a workspace member id. stage must be NEW, SCREENING, MEETING, PROPOSAL, or CUSTOMER. phone looks like +1 4155550134. Writable fields: ' +
           Object.entries(UPDATABLE_FIELDS)
             .map(([objectName, fields]) => `${objectName} (${fields.join(', ')})`)
             .join('; ') +
@@ -99,13 +122,14 @@ export function toolCatalog(): { tools: ToolSchema[] } {
         inputSchema: {
           type: 'object',
           additionalProperties: true,
-          required: ['object', 'id', 'field', 'value', 'ifMatch'],
+          required: ['object', 'field', 'value'],
           properties: {
             object: {
               type: 'string',
               enum: ['person', 'company', 'opportunity'],
             },
-            id: stringProperty('Record id from this workspace.'),
+            id: stringProperty('Record id from this workspace. Omit when query is set.'),
+            query: stringProperty('Name fragment when the id is not known. Several matches become choices.'),
             field: stringProperty('One writable field for that object.'),
             value: {
               description: 'New value. amount is a number. Every other field is a string.',

@@ -2,6 +2,7 @@ import { createServer, type ServerResponse } from 'node:http';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { withMemberCredential } from '../auth/call-context';
 import { isRecord } from '../is-record';
 import { CrmPreconditionError } from './crm-errors';
 import { createHttpTwentyCrmClient } from './http-twenty-crm-client';
@@ -24,6 +25,29 @@ afterEach(async () => {
   }
 });
 
+const memberCredential = { kind: 'bearer' as const, token: 'member-access-token-value' };
+
+function createClient(
+  config: Parameters<typeof createHttpTwentyCrmClient>[0],
+): ReturnType<typeof createHttpTwentyCrmClient> {
+  const client = createHttpTwentyCrmClient(config);
+
+  return new Proxy(client, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+
+      if (typeof value !== 'function') {
+        return value;
+      }
+
+      return (...args: unknown[]) =>
+        withMemberCredential(memberCredential, () =>
+          (value as (...inner: unknown[]) => Promise<unknown>).apply(target, args),
+        );
+    },
+  });
+}
+
 describe('createHttpTwentyCrmClient', () => {
   it('posts allowlisted creates to Twenty REST', async () => {
     const twenty = await startFakeTwenty((captured, response) => {
@@ -39,9 +63,8 @@ describe('createHttpTwentyCrmClient', () => {
       });
     });
 
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'rest',
     });
 
@@ -78,7 +101,7 @@ describe('createHttpTwentyCrmClient', () => {
       '/rest/companies',
       '/rest/opportunities',
     ]);
-    expect(twenty.captured.every((request) => request.authorization === 'Bearer test-workspace-key')).toBe(true);
+    expect(twenty.captured.every((request) => request.authorization === 'Bearer member-access-token-value')).toBe(true);
     expect(twenty.captured[0]?.body).toEqual({
       name: { firstName: 'Ada', lastName: 'Lovelace' },
       emails: {
@@ -112,9 +135,8 @@ describe('createHttpTwentyCrmClient', () => {
       });
     });
 
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'graphql',
     });
 
@@ -146,16 +168,18 @@ describe('createHttpTwentyCrmClient', () => {
     });
     const gateway = await startGateway({
       port: 0,
-      client: createHttpTwentyCrmClient({
+      client: createClient({
         apiUrl: twenty.url,
-        apiKey: 'test-workspace-key',
       }),
     });
     closers.push(() => gateway.close());
 
     const planned = await fetch(`${gateway.url}/v1/ai/plan`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         intent: 'create person Ada Lovelace email ada@analytical.example',
@@ -170,7 +194,10 @@ describe('createHttpTwentyCrmClient', () => {
         : '';
     const direct = await fetch(`${gateway.url}/v1/ai/act`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         confirmed: true,
@@ -183,7 +210,10 @@ describe('createHttpTwentyCrmClient', () => {
 
     const response = await fetch(`${gateway.url}/v1/ai/act`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         confirmed: true,
@@ -260,9 +290,8 @@ describe('createHttpTwentyCrmClient', () => {
         },
       });
     });
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'rest',
     });
 
@@ -343,9 +372,8 @@ describe('createHttpTwentyCrmClient', () => {
 
       sendJson(response, 200, { data: { updatePeople: [] } });
     });
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'rest',
     });
 

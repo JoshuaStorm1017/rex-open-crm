@@ -5,7 +5,10 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 
 import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
-import { type AiCommandBarConfig } from '@/ai-command-bar/utils/readAiCommandBarConfig';
+import {
+  readAiCommandBarConfig,
+  type AiCommandBarConfig,
+} from '@/ai-command-bar/utils/readAiCommandBarConfig';
 import { isAiCommandBarShortcut } from '@/ai-command-bar/utils/isAiCommandBarShortcut';
 
 i18n.load('en', {});
@@ -14,7 +17,6 @@ i18n.activate('en');
 const config: AiCommandBarConfig = {
   gatewayUrl: 'http://127.0.0.1:8787',
   workspaceId: 'ws_demo',
-  actor: 'ada@analytical.example',
 };
 
 const INTENT = 'add Acme Corp as a company and a $50k deal for Jane Doe';
@@ -162,7 +164,9 @@ describe('AiCommandBar', () => {
       proposalId: 'proposal_11111111-1111-4111-8111-111111111111',
     });
     expect(headers['idempotency-key']).toEqual(expect.any(String));
-    expect(headers['x-rex-actor']).toBe('ada@analytical.example');
+    expect(headers.authorization).toBeUndefined();
+    expect(headers['x-rex-actor']).toBeUndefined();
+    expect(actInit?.credentials).toBe('include');
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
@@ -224,5 +228,78 @@ describe('AiCommandBar', () => {
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('asks which record to update when several names match', async () => {
+    const user = userEvent.setup();
+    const choiceProposal = {
+      ok: true,
+      workspaceId: 'ws_demo',
+      proposal: {
+        id: 'proposal_22222222-2222-4222-8222-222222222222',
+        summary: 'Several company records match. Choose one, then confirm.',
+        tools: [],
+        lines: [
+          { tool: 'update_record', summary: 'Acme North' },
+          { tool: 'update_record', summary: 'Acme South' },
+        ],
+        choice: {
+          prompt: 'Several company records match. Choose one, then confirm.',
+          candidates: [
+            { id: 'company_north', label: 'Acme North', objectName: 'company' },
+            { id: 'company_south', label: 'Acme South', objectName: 'company' },
+          ],
+        },
+      },
+    };
+    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/ai/plan')) {
+        return jsonResponse(choiceProposal);
+      }
+
+      return jsonResponse({ ok: true, results: [] });
+    });
+
+    renderBar(fetchImpl, true);
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company named Acme set domain to acme.example',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(
+      await screen.findByRole('radio', { name: 'Acme North' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+
+    await user.click(screen.getByRole('radio', { name: 'Acme South' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+
+    const actCall = fetchImpl.mock.calls.find((call) =>
+      String(call[0]).endsWith('/v1/ai/act'),
+    );
+
+    expect(JSON.parse(String(actCall?.[1]?.body))).toMatchObject({
+      confirmed: true,
+      proposalId: 'proposal_22222222-2222-4222-8222-222222222222',
+      choiceId: 'company_south',
+    });
+  });
+});
+
+describe('readAiCommandBarConfig', () => {
+  it('does not copy a gateway token out of window._env_', () => {
+    window._env_ = {
+      REX_AI_GATEWAY_TOKEN: 'secret-token',
+      REX_AI_GATEWAY_URL: 'http://localhost:8787',
+      REX_AI_WORKSPACE_ID: 'ws_demo',
+    };
+
+    expect(readAiCommandBarConfig()).toEqual({
+      gatewayUrl: 'http://localhost:8787',
+      workspaceId: 'ws_demo',
+    });
+    expect(readAiCommandBarConfig()).not.toHaveProperty('bearerToken');
   });
 });

@@ -4,6 +4,7 @@ export const ALLOWED_TOOL_NAMES = [
   'create_person',
   'create_company',
   'create_opportunity',
+  'create_note',
   'search_records',
   'update_record',
 ] as const;
@@ -47,8 +48,16 @@ export type ActUpstreamFailure = {
   message: string;
 };
 
+export type ActPartialFailure = {
+  ok: false;
+  refused: false;
+  reason: 'partial_failure';
+  message: string;
+  remainingRecordIds: string[];
+};
+
 export type CreatedToolResult = {
-  tool: 'create_person' | 'create_company' | 'create_opportunity';
+  tool: 'create_person' | 'create_company' | 'create_opportunity' | 'create_note';
   status: 'created';
   record: CreatedRecord;
 };
@@ -73,11 +82,20 @@ export type ActSuccess = {
   results: ToolResult[];
 };
 
-export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure;
+export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure | ActPartialFailure;
 
 export type ProposalLine = {
   tool: AllowedToolName;
   summary: string;
+};
+
+export type PlanChoice = {
+  prompt: string;
+  candidates: Array<{
+    id: string;
+    label: string;
+    objectName: 'person' | 'company' | 'opportunity';
+  }>;
 };
 
 export type PlanProposal = {
@@ -85,6 +103,7 @@ export type PlanProposal = {
   summary: string;
   tools: ToolCall[];
   lines: ProposalLine[];
+  choice?: PlanChoice;
 };
 
 export type PlanSuccess = {

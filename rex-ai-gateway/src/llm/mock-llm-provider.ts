@@ -9,6 +9,9 @@ const UNSAFE_PATTERN =
 const COMPOUND_PATTERN =
   /^add (?<company>.+?) as a company and a \$(?<amount>[\d,]+(?:\.\d+)?)(?<multiplier>k)? deal for (?<firstName>\S+) (?<lastName>\S+)$/i;
 
+const NOTE_PATTERN =
+  /^add (?:a )?note(?: titled (?<title>.+?))? to (?<object>person|company|opportunity) named (?<query>.+?): (?<body>.+)$/i;
+
 const SEARCH_PATTERN =
   /^(?:find|search) (?<object>people|persons|person|companies|company|opportunities|opportunity|deals) (?:named|called|for|matching) (?<query>.+)$/i;
 
@@ -80,6 +83,26 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
     };
   }
 
+  const note = NOTE_PATTERN.exec(text);
+
+  if (note?.groups?.object && note.groups.query && note.groups.body) {
+    return {
+      ok: true,
+      summary: `Add a note to ${note.groups.object} ${trimValue(note.groups.query)}.`,
+      tools: [
+        {
+          name: 'create_note',
+          args: {
+            ...(note.groups.title ? { title: trimValue(note.groups.title) } : {}),
+            body: note.groups.body.trim(),
+            targetObject: objectNameFor(note.groups.object),
+            targetQuery: trimValue(note.groups.query),
+          },
+        },
+      ],
+    };
+  }
+
   const search = SEARCH_PATTERN.exec(text);
 
   if (search?.groups?.object && search.groups.query) {
@@ -116,7 +139,17 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
     updateByName.groups.field &&
     updateByName.groups.value
   ) {
-    return resolveNamedUpdate(input, updateByName.groups);
+    return {
+      ok: true,
+      summary: `Update ${updateByName.groups.object} named ${trimValue(updateByName.groups.query)}.`,
+      tools: [
+        updateTool({
+          ...updateByName.groups,
+          id: undefined,
+          query: trimValue(updateByName.groups.query),
+        }),
+      ],
+    };
   }
 
   const mapped = mapIntentToTool(text);
@@ -146,63 +179,21 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
   return mapped;
 }
 
-async function resolveNamedUpdate(
-  input: LlmPlanInput,
-  groups: Record<string, string>,
-): Promise<LlmPlan> {
-  const objectName = objectNameFor(groups.object ?? '');
-  const query = trimValue(groups.query ?? '');
-  const matches = await input.client.searchRecords({
-    workspaceId: input.workspaceId,
-    objectName,
-    query,
-    limit: 10,
-  });
-
-  if (matches.length === 0) {
-    return refusal('not_found', `No ${objectName} matches “${query}”.`, {
-      toolName: 'update_record',
-    });
-  }
-
-  if (matches.length > 1) {
-    const names = matches.map((record) => record.label).join(', ');
-
-    return refusal(
-      'ambiguous_intent',
-      `Several ${objectName} records match “${query}”: ${names}. Name one record id.`,
-      { toolName: 'update_record' },
-    );
-  }
-
-  const match = matches[0];
-
-  if (!match) {
-    return refusal('not_found', `No ${objectName} matches “${query}”.`, {
-      toolName: 'update_record',
-    });
-  }
-
-  return {
-    ok: true,
-    summary: `Update ${objectName} ${match.label}.`,
-    tools: [
-      updateTool({
-        ...groups,
-        id: match.id,
-      }),
-    ],
-  };
-}
-
 function updateTool(groups: Record<string, string | undefined>): ToolCall {
   const field = groups.field ?? '';
   const args: Record<string, unknown> = {
     object: objectNameFor(groups.object ?? ''),
-    id: groups.id,
     field,
     value: field === 'amount' ? Number((groups.value ?? '').replace(/,/g, '')) : trimValue(groups.value ?? ''),
   };
+
+  if (groups.id) {
+    args.id = groups.id;
+  }
+
+  if (groups.query) {
+    args.query = groups.query;
+  }
 
   if (groups.ifMatch) {
     args.ifMatch = groups.ifMatch;

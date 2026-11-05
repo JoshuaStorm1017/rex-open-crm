@@ -437,6 +437,77 @@ describe('POST /v1/ai/act', () => {
       'Analytical Engines',
     ]);
   });
+
+  it('rolls back an earlier create when a later tool fails', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createPerson = async () => {
+      throw new Error('person write failed');
+    };
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        { name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } },
+      ],
+    });
+
+    expect(response.status).toBe(502);
+    expect(payload).toMatchObject({ reason: 'upstream_error' });
+    expect(JSON.stringify(payload)).toContain('rolled back');
+    expect(client.created).toHaveLength(0);
+  });
+
+  it('reports records that could not be rolled back', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createPerson = async () => {
+      throw new Error('person write failed');
+    };
+    client.deleteRecord = async () => {
+      throw new Error('delete failed');
+    };
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        { name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } },
+      ],
+    });
+
+    expect(response.status).toBe(409);
+    expect(payload).toMatchObject({ reason: 'partial_failure' });
+    expect(client.created).toHaveLength(1);
+  });
+
+  it('refuses an unknown opportunity stage and an unsafe search query', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await openGateway(client);
+    const stage = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Difference Engine', stage: 'WON' },
+        },
+      ],
+    });
+    const search = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'search_records',
+          args: { object: 'company', query: 'Acme" or name[eq]:"x' },
+        },
+      ],
+    });
+
+    expect(stage.payload).toMatchObject({ refused: true, reason: 'invalid_request' });
+    expect(search.payload).toMatchObject({ refused: true, reason: 'invalid_request' });
+    expect(client.created).toHaveLength(0);
+  });
 });
 
 async function openGateway(
@@ -489,7 +560,11 @@ async function postJson(
 ): Promise<{ response: Response; payload: unknown }> {
   const response = await fetch(`${gateway.url}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
+    headers: {
+      'content-type': 'application/json',
+      'x-rex-member': 'ada@analytical.example',
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
 

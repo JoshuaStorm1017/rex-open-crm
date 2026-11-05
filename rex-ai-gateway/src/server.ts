@@ -6,12 +6,13 @@ import { proposeAct } from './act/propose-act';
 import { toolCatalog } from './act/tool-schema';
 import { isRecord } from './is-record';
 import { refusal, type ActResult, type PlanResult } from './act/types';
-import { AuditLog, type AuditEntry } from './audit/audit-log';
-import { bearerMatches } from './http/bearer-auth';
+import { createMockAuthenticator, type Authenticator } from './auth/authenticate';
+import { withMemberCredential } from './auth/call-context';
+import type { MemberPrincipal } from './auth/types';
+import { AuditLog, type AuditAction, type AuditEntry } from './audit/audit-log';
 import { corsHeadersFor, DEFAULT_ALLOWED_ORIGINS } from './http/cors';
 import { IdempotencyStore, readIdempotencyKey } from './http/idempotency-store';
 import { ProposalStore } from './http/proposal-store';
-import { readActor } from './http/read-actor';
 import { createMockLlmProvider } from './llm/mock-llm-provider';
 import type { LlmProvider } from './llm/llm-provider';
 import type { TwentyCrmClient } from './twenty/twenty-crm-client';
@@ -33,6 +34,8 @@ export type GatewayOptions = ExecuteActOptions & {
   idempotency?: IdempotencyStore;
   proposals?: ProposalStore;
   allowedOrigins?: string[];
+  authenticator?: Authenticator;
+  onClose?: () => void;
 };
 
 export type RunningGateway = {
@@ -50,6 +53,8 @@ type GatewayRuntime = {
   idempotency: IdempotencyStore;
   proposals: ProposalStore;
   allowedOrigins: ReadonlySet<string>;
+  authenticator: Authenticator;
+  onClose?: () => void;
 };
 
 export function isLoopbackHost(host: string): boolean {
@@ -77,6 +82,8 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
     idempotency: options.idempotency ?? new IdempotencyStore(),
     proposals: options.proposals ?? new ProposalStore(),
     allowedOrigins: new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS),
+    authenticator: options.authenticator ?? createMockAuthenticator(),
+    onClose: options.onClose,
   };
   const server = createServer((request, response) => {
     void handleRequest(request, response, runtime).catch((error: unknown) => {
@@ -110,7 +117,14 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
         url: `http://${host}:${address.port}`,
         close: () =>
           new Promise((closeResolve, closeReject) => {
-            server.close((error) => (error ? closeReject(error) : closeResolve()));
+            server.close((error) => {
+              runtime.onClose?.();
+              if (error) {
+                closeReject(error);
+                return;
+              }
+              closeResolve();
+            });
           }),
       });
     });
@@ -123,7 +137,6 @@ async function handleRequest(
   runtime: GatewayRuntime,
 ): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-  const actor = readActor(headerValue(request.headers['x-rex-actor']));
   const cors = corsFor(request, runtime);
 
   if (!KNOWN_PATHS.has(url.pathname)) {
@@ -137,14 +150,20 @@ async function handleRequest(
     return;
   }
 
-  if (runtime.bearerToken && !bearerMatches(headerValue(request.headers.authorization), runtime.bearerToken)) {
+  const principal = await runtime.authenticator.authenticate(request, {
+    bearerToken: runtime.bearerToken,
+    allowedOrigins: runtime.allowedOrigins,
+  });
+
+  if (!principal) {
     const body = refusal(
       'unauthorized',
-      'Authorization bearer token is missing or incorrect.',
+      'Sign in to Twenty, or present the gateway bearer plus a Twenty access token. The actor header is ignored.',
     );
     remember(runtime, {
+      memberId: 'anonymous',
       actor: 'anonymous',
-      action: url.pathname === PLAN_PATH ? 'plan' : 'act',
+      action: actionForPath(url.pathname),
       summary: body.message,
       tools: [],
       recordIds: [],
@@ -155,13 +174,26 @@ async function handleRequest(
     return;
   }
 
+  await withMemberCredential(principal.credential, () =>
+    handleAuthenticated(request, response, runtime, url, principal, cors),
+  );
+}
+
+async function handleAuthenticated(
+  request: IncomingMessage,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  url: URL,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+): Promise<void> {
   if (request.method === 'GET' && url.pathname === TOOLS_PATH) {
     sendJson(response, 200, { ok: true, ...toolCatalog() }, cors);
     return;
   }
 
   if (request.method === 'GET' && url.pathname === AUDIT_PATH) {
-    sendJson(response, 200, { ok: true, entries: runtime.audit.list() }, cors);
+    sendJson(response, 200, { ok: true, entries: runtime.audit.list(principal.memberId) }, cors);
     return;
   }
 
@@ -193,7 +225,7 @@ async function handleRequest(
     parsed = JSON.parse(rawBody);
   } catch {
     const body = refusal('invalid_request', 'Body must be JSON.');
-    rememberOutcome(runtime, actor, url.pathname, false, body);
+    rememberOutcome(runtime, principal, url.pathname, false, body);
     sendJson(response, 400, body, cors);
     return;
   }
@@ -204,8 +236,10 @@ async function handleRequest(
     const result = await proposeAct(parsed, runtime.client, runtime.llm, {
       boundWorkspaceId: runtime.boundWorkspaceId,
       proposals: runtime.proposals,
+      memberId: principal.memberId,
+      actorMemberId: principal.memberId,
     });
-    rememberOutcome(runtime, actor, PLAN_PATH, confirmed, result);
+    rememberOutcome(runtime, principal, PLAN_PATH, confirmed, result);
     sendJson(response, statusFor(result), result, cors);
     return;
   }
@@ -217,31 +251,31 @@ async function handleRequest(
       'invalid_request',
       'Idempotency-Key must be 8–200 characters of letters, numbers, dot, colon, underscore, or hyphen.',
     );
-    rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
     sendJson(response, 400, body, cors);
     return;
   }
 
   const execute = async () => {
-    const result = await executeConfirmedAct(parsed, runtime);
+    const result = await executeConfirmedAct(parsed, runtime, principal);
     return { status: statusFor(result), body: result };
   };
 
   if (!idempotencyKey) {
     const result = await execute();
-    rememberOutcome(runtime, actor, ACT_PATH, confirmed, result.body);
+    rememberOutcome(runtime, principal, ACT_PATH, confirmed, result.body);
     sendJson(response, result.status, result.body, cors);
     return;
   }
 
-  const stored = await runtime.idempotency.run(idempotencyKey, rawBody, execute);
+  const stored = await runtime.idempotency.run(principal.memberId, idempotencyKey, rawBody, execute);
 
   if ('conflict' in stored && stored.conflict) {
     const body = refusal(
       'idempotency_conflict',
       'This idempotency key was already used with a different request body.',
     );
-    rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
     sendJson(response, 409, body, cors);
     return;
   }
@@ -251,7 +285,7 @@ async function handleRequest(
       'invalid_request',
       'The idempotency store is full. New keys are refused so an evicted key cannot run a write twice.',
     );
-    rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
+    rememberOutcome(runtime, principal, ACT_PATH, confirmed, body);
     sendJson(response, 503, body, cors);
     return;
   }
@@ -260,14 +294,18 @@ async function handleRequest(
     return;
   }
 
-  rememberOutcome(runtime, actor, ACT_PATH, confirmed, stored.response.body, stored.replayed);
+  rememberOutcome(runtime, principal, ACT_PATH, confirmed, stored.response.body, stored.replayed);
   sendJson(response, stored.response.status, stored.response.body, {
     ...cors,
     ...(stored.replayed ? { 'idempotency-replayed': 'true' } : {}),
   });
 }
 
-async function executeConfirmedAct(body: unknown, runtime: GatewayRuntime): Promise<ActResult> {
+async function executeConfirmedAct(
+  body: unknown,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+): Promise<ActResult> {
   const parsed = parseGatewayRequest(body);
 
   if ('refused' in parsed) {
@@ -288,11 +326,23 @@ async function executeConfirmedAct(body: unknown, runtime: GatewayRuntime): Prom
     );
   }
 
-  const claimed = runtime.proposals.claim(parsed.proposalId, parsed.workspaceId);
+  const claimed = runtime.proposals.claim(
+    parsed.proposalId,
+    parsed.workspaceId,
+    principal.memberId,
+    parsed.choiceId,
+  );
 
   if (!claimed.ok) {
     if (claimed.reason === 'workspace') {
       return refusal('cross_workspace', 'This preview belongs to a different workspace.');
+    }
+
+    if (claimed.reason === 'choice') {
+      return refusal(
+        'confirmation_required',
+        'Choose one of the matching records, then confirm. Nothing was written.',
+      );
     }
 
     return refusal(
@@ -314,17 +364,18 @@ async function executeConfirmedAct(body: unknown, runtime: GatewayRuntime): Prom
 
 function rememberOutcome(
   runtime: GatewayRuntime,
-  actor: string,
+  principal: MemberPrincipal,
   path: string,
   confirmed: boolean,
   body: unknown,
   replayed = false,
 ): void {
-  const action = path === PLAN_PATH ? 'plan' : 'act';
+  const action = actionForPath(path);
 
   if (!isRecord(body)) {
     remember(runtime, {
-      actor,
+      memberId: principal.memberId,
+      actor: principal.actor,
       action,
       summary: 'Unexpected result',
       tools: [],
@@ -349,7 +400,8 @@ function rememberOutcome(
     (ok ? `${action} completed` : 'Request failed');
 
   remember(runtime, {
-    actor,
+    memberId: principal.memberId,
+    actor: principal.actor,
     action,
     workspaceId,
     summary,
@@ -417,6 +469,22 @@ function remember(
   runtime.audit.record(entry);
 }
 
+function actionForPath(pathname: string): AuditAction {
+  if (pathname === PLAN_PATH) {
+    return 'plan';
+  }
+
+  if (pathname === TOOLS_PATH) {
+    return 'tools';
+  }
+
+  if (pathname === AUDIT_PATH) {
+    return 'audit';
+  }
+
+  return 'act';
+}
+
 function statusFor(result: ActResult | PlanResult): number {
   if (result.ok) {
     return 200;
@@ -424,6 +492,10 @@ function statusFor(result: ActResult | PlanResult): number {
 
   if (result.reason === 'upstream_error') {
     return 502;
+  }
+
+  if (result.reason === 'partial_failure') {
+    return 409;
   }
 
   if (!('refused' in result) || !result.refused) {

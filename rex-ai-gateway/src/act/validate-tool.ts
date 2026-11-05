@@ -1,9 +1,13 @@
 import type {
   CreateCompanyInput,
+  CreateNoteInput,
   CreateOpportunityInput,
   CreatePersonInput,
   TwentyObjectName,
 } from '../twenty/twenty-crm-client';
+import { canonicalOpportunityStage } from '../twenty/opportunity-stages';
+import { parsePhone } from '../twenty/parse-phone';
+import { isSafeSearchQuery } from '../twenty/safe-search';
 import { isAllowedToolName } from './allowlist';
 import { findForeignWorkspaceId } from './find-foreign-workspace-id';
 import {
@@ -28,7 +32,8 @@ export type SearchRecordsToolInput = {
 
 export type UpdateRecordToolInput = {
   objectName: UpdatableObjectName;
-  id: string;
+  id?: string;
+  query?: string;
   field: string;
   value: string | number;
   ifMatch?: string;
@@ -41,6 +46,7 @@ export type ValidatedTool =
       name: 'create_opportunity';
       input: Omit<CreateOpportunityInput, 'workspaceId'>;
     }
+  | { name: 'create_note'; input: Omit<CreateNoteInput, 'workspaceId'> }
   | { name: 'search_records'; input: SearchRecordsToolInput }
   | { name: 'update_record'; input: UpdateRecordToolInput };
 
@@ -78,6 +84,8 @@ export function validateTool(
       return validateCompany(tool.args);
     case 'create_opportunity':
       return validateOpportunity(tool.args);
+    case 'create_note':
+      return validateNote(tool.args);
     case 'search_records':
       return validateSearch(tool.args);
     case 'update_record':
@@ -113,6 +121,11 @@ function validatePerson(
     return companyId;
   }
 
+  const phone = optionalPhone(args, 'create_person');
+  if (isRefusal(phone)) {
+    return phone;
+  }
+
   return {
     name: 'create_person',
     input: {
@@ -120,6 +133,7 @@ function validatePerson(
       lastName,
       ...(email ? { email } : {}),
       ...(jobTitle ? { jobTitle } : {}),
+      ...(phone ? { phone } : {}),
       ...(companyId ? { companyId } : {}),
     },
   };
@@ -155,7 +169,7 @@ function validateOpportunity(
     return name;
   }
 
-  const stage = optionalString(args, 'create_opportunity', 'stage');
+  const stage = optionalStage(args, 'create_opportunity');
   if (isRefusal(stage)) {
     return stage;
   }
@@ -214,8 +228,10 @@ function validateOpportunity(
 const RELATION_ID_PATTERN = /^(\$[0-9]+|[A-Za-z0-9_-]{1,80})$/;
 const RECORD_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const IF_MATCH_PATTERN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;
-const STAGE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
-const SEARCH_QUERY_PATTERN = /["()[\]\\%,;*{}|&<>$`_\u0000-\u001f]/;
+const MEMBER_ID_PATTERN =
+  /^(me|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+const MAX_SHORT_TEXT = 200;
+const MAX_NOTE_BODY = 4000;
 
 function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefusal {
   const objectName = requireObjectName(args, 'search_records');
@@ -230,10 +246,10 @@ function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefus
     return query;
   }
 
-  if (query.length > 80 || SEARCH_QUERY_PATTERN.test(query)) {
+  if (!isSafeSearchQuery(query)) {
     return refusal(
       'invalid_request',
-      'search_records query must be 1–80 characters and cannot contain filter punctuation.',
+      'search_records query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
       { toolName: 'search_records' },
     );
   }
@@ -261,21 +277,45 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
     return objectName;
   }
 
-  const id = requireString(args, 'update_record', 'id');
+  const id = optionalString(args, 'update_record', 'id');
 
-  if (typeof id !== 'string') {
+  if (isRefusal(id)) {
     return id;
   }
 
-  if (!RECORD_ID_PATTERN.test(id)) {
+  const query = optionalString(args, 'update_record', 'query');
+
+  if (isRefusal(query)) {
+    return query;
+  }
+
+  if (!id && !query) {
+    return refusal(
+      'missing_required_fields',
+      'Refusing update_record: missing required fields: id.',
+      { toolName: 'update_record', missingFields: ['id'] },
+    );
+  }
+
+  if (id && !RECORD_ID_PATTERN.test(id)) {
     return invalidField('update_record', 'id');
   }
 
-  const field = requireString(args, 'update_record', 'field');
-
-  if (typeof field !== 'string') {
-    return field;
+  if (query && !isSafeSearchQuery(query)) {
+    return refusal(
+      'invalid_request',
+      'update_record query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      { toolName: 'update_record' },
+    );
   }
+
+  const rawField = requireString(args, 'update_record', 'field');
+
+  if (typeof rawField !== 'string') {
+    return rawField;
+  }
+
+  const field = objectName === 'company' && rawField === 'owner' ? 'accountOwner' : rawField;
 
   if (!isUpdatableField(objectName, field)) {
     return refusal(
@@ -305,7 +345,8 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
     name: 'update_record',
     input: {
       objectName,
-      id,
+      ...(id ? { id } : {}),
+      ...(query && !id ? { query } : {}),
       field,
       value,
       ...(ifMatch ? { ifMatch } : {}),
@@ -313,11 +354,141 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
   };
 }
 
+function optionalStage(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName,
+): string | undefined | ActRefusal {
+  const stage = optionalString(args, toolName, 'stage');
+
+  if (isRefusal(stage) || stage === undefined) {
+    return stage;
+  }
+
+  const canonical = canonicalOpportunityStage(stage);
+
+  if (!canonical) {
+    return refusal(
+      'invalid_request',
+      'create_opportunity stage must be one of NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER.',
+      { toolName },
+    );
+  }
+
+  return canonical;
+}
+
+function optionalPhone(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName,
+): string | undefined | ActRefusal {
+  const phone = optionalString(args, toolName, 'phone');
+
+  if (isRefusal(phone) || phone === undefined) {
+    return phone;
+  }
+
+  if (!parsePhone(phone)) {
+    return refusal(
+      'invalid_request',
+      `${toolName} phone must look like +1 4155550134. Calling codes +1, +33, +44, +49, and +61 are accepted.`,
+      { toolName },
+    );
+  }
+
+  return phone;
+}
+
+function validateNote(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+  const body = requireNoteBody(args);
+
+  if (typeof body !== 'string') {
+    return body;
+  }
+
+  const title = optionalString(args, 'create_note', 'title');
+
+  if (isRefusal(title)) {
+    return title;
+  }
+
+  const targetObject = requireObjectName(args, 'create_note', 'targetObject');
+
+  if (typeof targetObject !== 'string') {
+    return targetObject;
+  }
+
+  const targetId = optionalRelationId(args, 'create_note', 'targetId');
+
+  if (isRefusal(targetId)) {
+    return targetId;
+  }
+
+  const targetQuery = optionalString(args, 'create_note', 'targetQuery');
+
+  if (isRefusal(targetQuery)) {
+    return targetQuery;
+  }
+
+  if (!targetId && !targetQuery) {
+    return refusal(
+      'missing_required_fields',
+      'Refusing create_note: missing required fields: targetId.',
+      { toolName: 'create_note', missingFields: ['targetId'] },
+    );
+  }
+
+  if (targetQuery && !isSafeSearchQuery(targetQuery)) {
+    return refusal(
+      'invalid_request',
+      'create_note targetQuery must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      { toolName: 'create_note' },
+    );
+  }
+
+  return {
+    name: 'create_note',
+    input: {
+      body,
+      ...(title ? { title } : {}),
+      targetObject,
+      ...(targetId ? { targetId } : {}),
+      ...(targetQuery && !targetId ? { targetQuery } : {}),
+    },
+  };
+}
+
+function requireNoteBody(args: Record<string, unknown>): string | ActRefusal {
+  const body = readString(args, 'body');
+
+  if (body === 'invalid') {
+    return invalidField('create_note', 'body');
+  }
+
+  if (!body) {
+    return refusal(
+      'missing_required_fields',
+      'Refusing create_note: missing required fields: body.',
+      { toolName: 'create_note', missingFields: ['body'] },
+    );
+  }
+
+  if (body.length > MAX_NOTE_BODY) {
+    return refusal(
+      'invalid_request',
+      'create_note body must be at most 4000 characters.',
+      { toolName: 'create_note' },
+    );
+  }
+
+  return body;
+}
+
 function requireObjectName(
   args: Record<string, unknown>,
   toolName: AllowedToolName,
+  key = 'object',
 ): UpdatableObjectName | ActRefusal {
-  const objectName = requireString(args, toolName, 'object');
+  const objectName = requireString(args, toolName, key);
 
   if (typeof objectName !== 'string') {
     return objectName;
@@ -403,7 +574,7 @@ function readUpdateValue(
 
   const value = args.value.trim();
 
-  if (value.length > 200) {
+  if (value.length > MAX_SHORT_TEXT) {
     return refusal(
       'invalid_request',
       'update_record value must be at most 200 characters.',
@@ -411,10 +582,36 @@ function readUpdateValue(
     );
   }
 
-  if (objectName === 'opportunity' && field === 'stage' && !STAGE_PATTERN.test(value)) {
+  if (objectName === 'opportunity' && field === 'stage') {
+    const stage = canonicalOpportunityStage(value);
+
+    if (!stage) {
+      return refusal(
+        'invalid_request',
+        'update_record stage must be one of NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER.',
+        { toolName: 'update_record' },
+      );
+    }
+
+    return stage;
+  }
+
+  if (field === 'phone') {
+    if (!parsePhone(value)) {
+      return refusal(
+        'invalid_request',
+        'update_record phone must look like +1 4155550134. Calling codes +1, +33, +44, +49, and +61 are accepted.',
+        { toolName: 'update_record' },
+      );
+    }
+
+    return value;
+  }
+
+  if ((field === 'owner' || field === 'accountOwner') && !MEMBER_ID_PATTERN.test(value)) {
     return refusal(
       'invalid_request',
-      'update_record stage must be letters, numbers, or underscores.',
+      'update_record owner must be "me" or a workspace member id.',
       { toolName: 'update_record' },
     );
   }
@@ -515,6 +712,10 @@ function readString(
   }
 
   const trimmed = value.trim();
+
+  if (trimmed.length > MAX_SHORT_TEXT) {
+    return 'invalid';
+  }
 
   return trimmed.length === 0 ? undefined : trimmed;
 }

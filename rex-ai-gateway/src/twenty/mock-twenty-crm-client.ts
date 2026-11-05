@@ -26,7 +26,7 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
   const created: CreatedRecord[] = [];
 
   const remember = (
-    objectName: TwentyObjectName,
+    objectName: CreatedRecord['objectName'],
     workspaceId: string,
     properties: Record<string, string | number>,
     idPrefix: string,
@@ -78,6 +78,25 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
         'opportunity',
       );
     },
+    async createNote(input) {
+      if (!input.targetId) {
+        throw new Error('create_note is missing targetId.');
+      }
+
+      const note = remember(
+        'note',
+        input.workspaceId,
+        {
+          title: input.title ?? 'Note',
+          body: input.body,
+          targetObject: input.targetObject,
+          targetId: input.targetId,
+        },
+        'note',
+      );
+      remember('note', input.workspaceId, { noteId: note.id }, 'noteTarget');
+      return note;
+    },
     async searchRecords(input) {
       const needle = input.query.toLowerCase();
 
@@ -112,6 +131,25 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       applyField(record, input.field, input.value);
       record.etag = nextVersionEtag(record.etag);
       return cloneRecord(record);
+    },
+    async deleteRecord(input) {
+      const index = created.findIndex(
+        (record) => record.workspaceId === input.workspaceId && record.id === input.id,
+      );
+
+      if (index < 0) {
+        throw new CrmNotFoundError(`No ${input.objectName} found with id ${input.id}.`);
+      }
+
+      const [removed] = created.splice(index, 1);
+
+      if (removed) {
+        for (let cursor = created.length - 1; cursor >= 0; cursor -= 1) {
+          if (created[cursor]?.properties.noteId === removed.id) {
+            created.splice(cursor, 1);
+          }
+        }
+      }
     },
   };
 }

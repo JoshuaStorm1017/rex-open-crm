@@ -1,3 +1,5 @@
+import { parsePhone } from './parse-phone';
+import { quoteFilterValue } from './safe-search';
 import type {
   CreateCompanyInput,
   CreateOpportunityInput,
@@ -77,13 +79,13 @@ export const TWENTY_CREATE_TARGET: Record<TwentyObjectName, TwentyCreateTarget> 
   };
 
 export function restSearchFilter(objectName: TwentyObjectName, query: string): string {
-  const quoted = `%${query}%`;
+  const quoted = quoteFilterValue(`%${query}%`);
 
   if (objectName === 'person') {
-    return `or(name.firstName[ilike]:"${quoted}",name.lastName[ilike]:"${quoted}",emails.primaryEmail[ilike]:"${quoted}")`;
+    return `or(name.firstName[ilike]:${quoted},name.lastName[ilike]:${quoted},emails.primaryEmail[ilike]:${quoted})`;
   }
 
-  return `name[ilike]:"${quoted}"`;
+  return `name[ilike]:${quoted}`;
 }
 
 export function graphqlSearchFilter(
@@ -156,6 +158,31 @@ export function toUpdatePayload(
     };
   }
 
+  if (objectName === 'person' && field === 'phone' && typeof value === 'string') {
+    const phone = parsePhone(value);
+
+    if (!phone) {
+      throw new Error('Refusing to write a phone number the gateway did not parse.');
+    }
+
+    return {
+      phones: {
+        primaryPhoneNumber: phone.number,
+        primaryPhoneCountryCode: phone.countryCode,
+        primaryPhoneCallingCode: phone.callingCode,
+        additionalPhones: [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && field === 'accountOwner' && typeof value === 'string') {
+    return { accountOwnerId: value };
+  }
+
+  if (objectName === 'opportunity' && field === 'owner' && typeof value === 'string') {
+    return { ownerId: value };
+  }
+
   if (objectName === 'opportunity' && field === 'amount' && typeof value === 'number') {
     return {
       amount: {
@@ -188,6 +215,19 @@ export function toPersonPayload(
 
   if (input.jobTitle) {
     payload.jobTitle = input.jobTitle;
+  }
+
+  if (input.phone) {
+    const phone = parsePhone(input.phone);
+
+    if (phone) {
+      payload.phones = {
+        primaryPhoneNumber: phone.number,
+        primaryPhoneCountryCode: phone.countryCode,
+        primaryPhoneCallingCode: phone.callingCode,
+        additionalPhones: [],
+      };
+    }
   }
 
   if (input.companyId) {

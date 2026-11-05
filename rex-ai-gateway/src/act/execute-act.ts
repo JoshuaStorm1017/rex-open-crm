@@ -1,11 +1,13 @@
 import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
-import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import { UnsafeSearchQueryError } from '../twenty/safe-search';
+import type { CreatedRecord, DeletableObjectName, TwentyCrmClient } from '../twenty/twenty-crm-client';
 import { mapIntentToTool } from './map-intent';
 import { parseGatewayRequest } from './parse-request';
 import { preflightRefs, resolveRelationId } from './resolve-refs';
 import {
   refusal,
   upstreamFailure,
+  type ActPartialFailure,
   type ActRefusal,
   type ActResult,
   type ToolCall,
@@ -69,31 +71,57 @@ export async function executeAct(
 
   const results: ToolResult[] = [];
   const priorIds: Array<string | undefined> = [];
+  const effects: CompletedEffect[] = [];
 
   try {
     for (const tool of validated) {
       const resolved = resolveTool(tool, priorIds);
 
       if ('refused' in resolved) {
-        return resolved;
+        const remaining = await compensate(client, parsed.workspaceId, effects);
+        if (remaining.length > 0) {
+          return partialFailure(resolved.message, remaining);
+        }
+        return refusal(resolved.reason, withRollback(resolved.message, effects.length), {
+          toolName: resolved.toolName,
+          missingFields: resolved.missingFields,
+        });
       }
 
+      const snapshot = await snapshotUpdate(client, parsed.workspaceId, resolved);
       const result = await dispatch(client, parsed.workspaceId, resolved);
       results.push(result);
       priorIds.push(recordId(result));
+      effects.push(...effectsFor(resolved, result, snapshot));
     }
   } catch (error) {
+    const remaining = await compensate(client, parsed.workspaceId, effects);
+    const message = errorMessage(error);
+
+    if (remaining.length > 0) {
+      return partialFailure(message, remaining);
+    }
+
     if (error instanceof CrmNotFoundError) {
-      return refusal('not_found', error.message, { toolName: 'update_record' });
+      return refusal('not_found', withRollback(message, effects.length), { toolName: 'update_record' });
     }
 
     if (error instanceof CrmPreconditionError) {
-      return refusal('precondition_failed', withCompleted(error.message, results.length), {
+      return refusal('precondition_failed', withRollback(message, effects.length), {
         toolName: 'update_record',
       });
     }
 
-    return upstreamFailure(error, results.length);
+    if (error instanceof UnsafeSearchQueryError) {
+      return refusal('invalid_request', withRollback(message, effects.length), {
+        toolName: 'search_records',
+      });
+    }
+
+    return {
+      ...upstreamFailure(error, 0),
+      message: withRollback(upstreamFailure(error, 0).message, effects.length),
+    };
   }
 
   return {
@@ -167,6 +195,19 @@ function resolveTool(
     };
   }
 
+  if (tool.name === 'create_note' && tool.input.targetId) {
+    const targetId = resolveRelationId(tool.input.targetId, priorIds, tool.name);
+
+    if (isRefusal(targetId)) {
+      return targetId;
+    }
+
+    return {
+      ...tool,
+      input: { ...tool.input, ...(targetId ? { targetId } : {}) },
+    };
+  }
+
   return tool;
 }
 
@@ -188,6 +229,18 @@ async function dispatch(
       const record = await client.createOpportunity({ ...tool.input, workspaceId });
       return { tool: tool.name, status: 'created', record };
     }
+    case 'create_note': {
+      if (!tool.input.targetId) {
+        throw new Error('create_note is missing targetId.');
+      }
+
+      const record = await client.createNote({
+        ...tool.input,
+        workspaceId,
+        targetId: tool.input.targetId,
+      });
+      return { tool: tool.name, status: 'created', record };
+    }
     case 'search_records': {
       const records = await client.searchRecords({ ...tool.input, workspaceId });
       return { tool: tool.name, status: 'found', records };
@@ -202,7 +255,7 @@ async function dispatch(
       const record = await client.updateRecord({
         workspaceId,
         objectName: tool.input.objectName,
-        id: tool.input.id,
+        id: tool.input.id ?? '',
         field: tool.input.field,
         value: tool.input.value,
         ifMatch,
@@ -220,12 +273,122 @@ function recordId(result: ToolResult): string | undefined {
   return result.record.id;
 }
 
-function withCompleted(message: string, completedCount: number): string {
+type CompletedEffect =
+  | { kind: 'created'; objectName: DeletableObjectName; id: string }
+  | {
+      kind: 'updated';
+      objectName: 'person' | 'company' | 'opportunity';
+      id: string;
+      field: string;
+      previous: string | number | undefined;
+      etag: string;
+    };
+
+async function snapshotUpdate(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  tool: ValidatedTool,
+): Promise<CreatedRecord | undefined> {
+  if (tool.name !== 'update_record' || !tool.input.id) {
+    return undefined;
+  }
+
+  return client.getRecord({
+    workspaceId,
+    objectName: tool.input.objectName,
+    id: tool.input.id,
+  });
+}
+
+function effectsFor(
+  tool: ValidatedTool,
+  result: ToolResult,
+  snapshot: CreatedRecord | undefined,
+): CompletedEffect[] {
+  if (result.status === 'created') {
+    return [{ kind: 'created', objectName: result.record.objectName, id: result.record.id }];
+  }
+
+  if (result.status === 'updated' && tool.name === 'update_record' && tool.input.id) {
+    return [
+      {
+        kind: 'updated',
+        objectName: tool.input.objectName,
+        id: tool.input.id,
+        field: tool.input.field,
+        previous: snapshot?.properties[tool.input.field],
+        etag: result.record.etag,
+      },
+    ];
+  }
+
+  return [];
+}
+
+async function compensate(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  effects: CompletedEffect[],
+): Promise<string[]> {
+  const remaining: string[] = [];
+
+  for (const effect of [...effects].reverse()) {
+    try {
+      if (effect.kind === 'created') {
+        await client.deleteRecord({
+          workspaceId,
+          objectName: effect.objectName,
+          id: effect.id,
+        });
+        continue;
+      }
+
+      if (effect.previous === undefined) {
+        remaining.push(effect.id);
+        continue;
+      }
+
+      const current = await client.getRecord({
+        workspaceId,
+        objectName: effect.objectName,
+        id: effect.id,
+      });
+      await client.updateRecord({
+        workspaceId,
+        objectName: effect.objectName,
+        id: effect.id,
+        field: effect.field,
+        value: effect.previous,
+        ifMatch: current.etag,
+      });
+    } catch {
+      remaining.push(effect.id);
+    }
+  }
+
+  return remaining;
+}
+
+function partialFailure(message: string, remainingRecordIds: string[]): ActPartialFailure {
+  return {
+    ok: false,
+    refused: false,
+    reason: 'partial_failure',
+    message: `${message} Some earlier changes could not be rolled back.`,
+    remainingRecordIds,
+  };
+}
+
+function withRollback(message: string, completedCount: number): string {
   if (completedCount === 0) {
     return message;
   }
 
-  return `${message} ${completedCount} earlier tool(s) already succeeded.`;
+  return `${message} ${completedCount} earlier change(s) were rolled back.`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Twenty request failed';
 }
 
 function isRefusal(value: unknown): value is ActRefusal {

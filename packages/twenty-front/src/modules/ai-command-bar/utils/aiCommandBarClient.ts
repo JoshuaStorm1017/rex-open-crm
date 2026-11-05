@@ -7,11 +7,21 @@ export type AiProposalLine = {
   summary: string;
 };
 
+export type AiProposalChoice = {
+  prompt: string;
+  candidates: Array<{
+    id: string;
+    label: string;
+    objectName: string;
+  }>;
+};
+
 export type AiProposal = {
   id: string;
   summary: string;
   tools: unknown[];
   lines: AiProposalLine[];
+  choice?: AiProposalChoice;
 };
 
 export type AiRecordLink = {
@@ -59,11 +69,17 @@ export const executeAiCommand = async (
   proposalId: string,
   idempotencyKey: string,
   fetchImpl: FetchImpl,
+  choiceId?: string,
 ): Promise<AiCommandOutcome<AiRecordLink[]>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/act',
-    { workspaceId: config.workspaceId, confirmed: true, proposalId },
+    {
+      workspaceId: config.workspaceId,
+      confirmed: true,
+      proposalId,
+      ...(choiceId ? { choiceId } : {}),
+    },
     fetchImpl,
     idempotencyKey,
   );
@@ -84,12 +100,7 @@ const postAiCommand = async (
 ): Promise<AiCommandOutcome<unknown>> => {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
-    'x-rex-actor': config.actor,
   };
-
-  if (config.bearerToken) {
-    headers.authorization = `Bearer ${config.bearerToken}`;
-  }
 
   if (idempotencyKey) {
     headers['idempotency-key'] = idempotencyKey;
@@ -101,6 +112,7 @@ const postAiCommand = async (
     response = await fetchImpl(`${config.gatewayUrl}${path}`, {
       method: 'POST',
       headers,
+      credentials: 'include',
       body: JSON.stringify(body),
     });
   } catch {
@@ -148,7 +160,13 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     return undefined;
   }
 
-  if (tools.length === 0 || lines.length === 0) {
+  const choice = readChoice(payload.proposal.choice);
+
+  if (tools.length === 0 && !choice) {
+    return undefined;
+  }
+
+  if (lines.length === 0) {
     return undefined;
   }
 
@@ -166,7 +184,48 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     parsedLines.push({ tool: line.tool, summary: line.summary });
   }
 
-  return { id, summary, tools, lines: parsedLines };
+  return {
+    id,
+    summary,
+    tools,
+    lines: parsedLines,
+    ...(choice ? { choice } : {}),
+  };
+};
+
+const readChoice = (value: unknown): AiProposalChoice | undefined => {
+  if (
+    !isPlainObject(value) ||
+    typeof value.prompt !== 'string' ||
+    !Array.isArray(value.candidates)
+  ) {
+    return undefined;
+  }
+
+  const candidates: AiProposalChoice['candidates'] = [];
+
+  for (const candidate of value.candidates) {
+    if (
+      !isPlainObject(candidate) ||
+      typeof candidate.id !== 'string' ||
+      typeof candidate.label !== 'string' ||
+      typeof candidate.objectName !== 'string'
+    ) {
+      return undefined;
+    }
+
+    candidates.push({
+      id: candidate.id,
+      label: candidate.label,
+      objectName: candidate.objectName,
+    });
+  }
+
+  if (candidates.length < 2) {
+    return undefined;
+  }
+
+  return { prompt: value.prompt, candidates };
 };
 
 const readRecordLinks = (payload: unknown): AiRecordLink[] => {

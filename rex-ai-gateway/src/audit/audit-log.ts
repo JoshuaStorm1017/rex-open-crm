@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto';
 
+export type AuditAction = 'plan' | 'act' | 'tools' | 'audit';
+
 export type AuditEntry = {
   id: string;
   at: string;
+  memberId: string;
   actor: string;
   workspaceId?: string;
-  action: 'plan' | 'act';
+  action: AuditAction;
   summary: string;
   tools: string[];
   recordIds: string[];
@@ -36,7 +39,7 @@ export class AuditLog {
     return stored;
   }
 
-  list(): AuditEntry[] {
-    return [...this.entries];
+  list(memberId: string): AuditEntry[] {
+    return this.entries.filter((entry) => entry.memberId === memberId);
   }
 }

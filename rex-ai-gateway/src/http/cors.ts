@@ -8,7 +8,7 @@ export const DEFAULT_ALLOWED_ORIGINS = [
 const CORS_BASE_HEADERS = {
   'access-control-allow-methods': 'GET, POST, OPTIONS',
   'access-control-allow-headers':
-    'content-type, authorization, idempotency-key, x-rex-actor',
+    'content-type, authorization, idempotency-key, x-twenty-authorization',
   'access-control-expose-headers': 'idempotency-replayed',
   vary: 'origin',
 };
@@ -31,19 +31,33 @@ export function readAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
   return [...origins];
 }
 
+export function allowedRequestOrigin(
+  originHeader: string | undefined,
+  allowedOrigins: ReadonlySet<string>,
+): string | undefined {
+  const origin = originValue(originHeader);
+
+  if (!origin || !allowedOrigins.has(origin)) {
+    return undefined;
+  }
+
+  return origin;
+}
+
 export function corsHeadersFor(
   originHeader: string | undefined,
   allowedOrigins: ReadonlySet<string>,
 ): Record<string, string> {
-  const origin = originValue(originHeader);
+  const origin = allowedRequestOrigin(originHeader, allowedOrigins);
 
-  if (!origin || !allowedOrigins.has(origin)) {
+  if (!origin) {
     return { ...CORS_BASE_HEADERS };
   }
 
   return {
     ...CORS_BASE_HEADERS,
     'access-control-allow-origin': origin,
+    'access-control-allow-credentials': 'true',
   };
 }
 

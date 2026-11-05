@@ -6,7 +6,7 @@ import type {
 } from './twenty-crm-client';
 
 export function labelFromProperties(
-  objectName: TwentyObjectName,
+  objectName: TwentyObjectName | 'note',
   properties: Record<string, string | number>,
 ): string {
   if (objectName === 'person') {
@@ -21,6 +21,10 @@ export function labelFromProperties(
     if (typeof properties.email === 'string') {
       return properties.email;
     }
+  }
+
+  if (typeof properties.title === 'string' && properties.title.length > 0) {
+    return properties.title;
   }
 
   if (typeof properties.name === 'string' && properties.name.length > 0) {
@@ -147,6 +151,10 @@ function readPersonProperties(raw: Record<string, unknown>): Record<string, stri
   const email = readString(emails?.primaryEmail) ?? readString(raw.email);
   const jobTitle = readString(raw.jobTitle);
   const companyId = readString(raw.companyId);
+  const phones = isRecord(raw.phones) ? raw.phones : undefined;
+  const phoneNumber = readString(phones?.primaryPhoneNumber);
+  const callingCode = readString(phones?.primaryPhoneCallingCode);
+  const phone = phoneNumber ? (callingCode ? `${callingCode} ${phoneNumber}` : phoneNumber) : readString(raw.phone);
 
   if (firstName) {
     properties.firstName = firstName;
@@ -164,6 +172,10 @@ function readPersonProperties(raw: Record<string, unknown>): Record<string, stri
     properties.jobTitle = jobTitle;
   }
 
+  if (phone) {
+    properties.phone = phone;
+  }
+
   if (companyId) {
     properties.companyId = companyId;
   }
@@ -179,6 +191,7 @@ function readCompanyProperties(raw: Record<string, unknown>): Record<string, str
     readString(domainName?.primaryLinkUrl) ??
     readString(raw.domain) ??
     readString(raw.domainName);
+  const accountOwnerId = readString(raw.accountOwnerId) ?? readString(raw.accountOwner);
 
   if (name) {
     properties.name = name;
@@ -186,6 +199,10 @@ function readCompanyProperties(raw: Record<string, unknown>): Record<string, str
 
   if (domain) {
     properties.domain = domain;
+  }
+
+  if (accountOwnerId) {
+    properties.accountOwner = accountOwnerId;
   }
 
   return properties;
@@ -203,6 +220,7 @@ function readOpportunityProperties(
   const companyId = readString(raw.companyId);
   const pointOfContactId = readString(raw.pointOfContactId);
   const closeDate = readString(raw.closeDate);
+  const ownerId = readString(raw.ownerId) ?? readString(raw.owner);
 
   if (name) {
     properties.name = name;
@@ -232,6 +250,10 @@ function readOpportunityProperties(
 
   if (closeDate) {
     properties.closeDate = closeDate;
+  }
+
+  if (ownerId) {
+    properties.owner = ownerId;
   }
 
   return properties;

@@ -9,7 +9,9 @@ export function preflightRefs(tools: ValidatedTool[]): ActRefusal | undefined {
 
     if (
       !tool ||
-      (tool.name !== 'create_opportunity' && tool.name !== 'create_person')
+      (tool.name !== 'create_opportunity' &&
+        tool.name !== 'create_person' &&
+        tool.name !== 'create_note')
     ) {
       continue;
     }
@@ -76,6 +78,10 @@ function relationRefs(tool: ValidatedTool): string[] {
     return [tool.input.companyId, tool.input.pointOfContactId].filter(
       (value): value is string => typeof value === 'string',
     );
+  }
+
+  if (tool.name === 'create_note') {
+    return tool.input.targetId ? [tool.input.targetId] : [];
   }
 
   return [];

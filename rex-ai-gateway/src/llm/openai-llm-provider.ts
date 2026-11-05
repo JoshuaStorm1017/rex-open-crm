@@ -55,7 +55,7 @@ function systemPrompt(): string {
     'Either {"summary":"short","tools":[{"name":"tool","args":{}}]} or {"refused":true,"reason":"unsafe_intent|ambiguous_intent|unmapped_intent","message":"why"}.',
     'Use only the tools in this catalog. Do not invent record ids. If the user did not give an id, search instead of updating.',
     'amount is major currency units. $50k means 50000. Refuse deletes, exports, and anything about passwords or credentials.',
-    'A request that could match more than one record is ambiguous_intent.',
+    'A named record without an id uses update_record query or create_note targetQuery. Do not invent ids. The gateway offers choices when several records match.',
     JSON.stringify(toolCatalog()),
   ].join('\n');
 }

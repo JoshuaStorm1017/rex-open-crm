@@ -8,6 +8,7 @@ import {
 } from './types';
 
 const PROPOSAL_ID_PATTERN = /^proposal_[0-9a-f-]{36}$/;
+const CHOICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 
 export type ParsedRequest = {
   workspaceId: string;
@@ -15,6 +16,7 @@ export type ParsedRequest = {
   intent?: string;
   confirmed: boolean;
   proposalId?: string;
+  choiceId?: string;
 };
 
 const MAX_INTENT_CHARS = 500;
@@ -84,12 +86,21 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     );
   }
 
+  if (body.choiceId !== undefined && typeof body.choiceId !== 'string') {
+    return refusal('invalid_request', 'choiceId must be a string.');
+  }
+
+  if (typeof body.choiceId === 'string' && !CHOICE_ID_PATTERN.test(body.choiceId)) {
+    return refusal('invalid_request', 'choiceId is not one of the preview choices.');
+  }
+
   return {
     workspaceId: body.workspaceId,
     ...(tools ? { tools } : {}),
     ...(typeof body.intent === 'string' ? { intent: body.intent } : {}),
     confirmed: body.confirmed === true,
     ...(typeof body.proposalId === 'string' ? { proposalId: body.proposalId } : {}),
+    ...(typeof body.choiceId === 'string' ? { choiceId: body.choiceId } : {}),
   };
 }
 

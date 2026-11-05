@@ -26,6 +26,7 @@ type Phase =
       draft: string;
       proposal: AiProposal;
       idempotencyKey: string;
+      choiceId?: string;
     }
   | { name: 'executing'; draft: string; proposal: AiProposal }
   | { name: 'done'; links: AiRecordLink[] }
@@ -208,6 +209,7 @@ export const AiCommandBar = ({
     proposal: AiProposal,
     idempotencyKey: string,
     draft: string,
+    choiceId?: string,
   ) => {
     const generation = readGeneration();
 
@@ -218,6 +220,7 @@ export const AiCommandBar = ({
       proposal.id,
       idempotencyKey,
       fetchImpl,
+      choiceId,
     );
 
     if (generation !== readGeneration()) {
@@ -326,11 +329,35 @@ export const AiCommandBar = ({
             {(phase.name === 'preview' || phase.name === 'executing') && (
               <>
                 <StyledSummary>{phase.proposal.summary}</StyledSummary>
-                <StyledList>
-                  {phase.proposal.lines.map((line, index) => (
-                    <li key={`${index}-${line.tool}`}>{line.summary}</li>
-                  ))}
-                </StyledList>
+                {phase.name === 'preview' && phase.proposal.choice && (
+                  <StyledChoices>
+                    <legend>{phase.proposal.choice.prompt}</legend>
+                    {phase.proposal.choice.candidates.map((candidate) => (
+                      <label key={candidate.id}>
+                        <input
+                          type="radio"
+                          name="ai-record-choice"
+                          value={candidate.id}
+                          checked={phase.choiceId === candidate.id}
+                          onChange={() =>
+                            setPhase({
+                              ...phase,
+                              choiceId: candidate.id,
+                            })
+                          }
+                        />
+                        {candidate.label}
+                      </label>
+                    ))}
+                  </StyledChoices>
+                )}
+                {!phase.proposal.choice && (
+                  <StyledList>
+                    {phase.proposal.lines.map((line, index) => (
+                      <li key={`${index}-${line.tool}`}>{line.summary}</li>
+                    ))}
+                  </StyledList>
+                )}
               </>
             )}
             {phase.name === 'preview' && (
@@ -338,11 +365,13 @@ export const AiCommandBar = ({
                 <StyledPrimary
                   ref={confirmRef}
                   type="button"
+                  disabled={Boolean(phase.proposal.choice) && !phase.choiceId}
                   onClick={() =>
                     void confirm(
                       phase.proposal,
                       phase.idempotencyKey,
                       phase.draft,
+                      phase.choiceId,
                     )
                   }
                 >
@@ -518,6 +547,27 @@ const StyledSecondary = styled.button`
 const StyledSummary = styled.p`
   font-size: ${themeCssVariables.font.size.sm};
   margin: 0;
+`;
+
+const StyledChoices = styled.fieldset`
+  border: 1px solid ${themeCssVariables.border.color.medium};
+  border-radius: ${themeCssVariables.border.radius.sm};
+  display: flex;
+  flex-direction: column;
+  font-size: ${themeCssVariables.font.size.sm};
+  gap: ${themeCssVariables.spacing[2]};
+  margin: 0;
+  padding: ${themeCssVariables.spacing[3]};
+
+  legend {
+    padding: 0 ${themeCssVariables.spacing[1]};
+  }
+
+  label {
+    align-items: center;
+    display: flex;
+    gap: ${themeCssVariables.spacing[2]};
+  }
 `;
 
 const StyledList = styled.ul`

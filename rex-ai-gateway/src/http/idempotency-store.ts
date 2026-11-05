@@ -22,12 +22,14 @@ export class IdempotencyStore {
   constructor(private readonly capacity = 500) {}
 
   async run(
+    memberId: string,
     key: string,
     rawBody: string,
     execute: () => Promise<IdempotentResponse>,
   ): Promise<RunResult> {
     const hash = createHash('sha256').update(rawBody).digest('hex');
-    const existing = this.completed.get(key);
+    const storageKey = `${memberId}\n${key}`;
+    const existing = this.readCompleted(memberId, key);
 
     if (existing) {
       if (existing.hash !== hash) {
@@ -37,7 +39,7 @@ export class IdempotencyStore {
       return { response: existing.response, replayed: true };
     }
 
-    const current = this.inflight.get(key);
+    const current = this.inflight.get(storageKey);
 
     if (current) {
       if (current.hash !== hash) {
@@ -47,24 +49,40 @@ export class IdempotencyStore {
       return { response: await current.promise, replayed: true };
     }
 
-    if (this.completed.size >= this.capacity) {
+    if (this.countCompleted() >= this.capacity) {
       return { full: true };
     }
 
     const promise = execute();
-    this.inflight.set(key, { hash, promise });
+    this.inflight.set(storageKey, { hash, promise });
 
     try {
       const response = await promise;
-      this.remember(key, hash, response);
+      this.writeCompleted(memberId, key, hash, response);
       return { response, replayed: false };
     } finally {
-      this.inflight.delete(key);
+      this.inflight.delete(storageKey);
     }
   }
 
-  private remember(key: string, hash: string, response: IdempotentResponse): void {
-    this.completed.set(key, { hash, response });
+  protected readCompleted(
+    memberId: string,
+    key: string,
+  ): { hash: string; response: IdempotentResponse } | undefined {
+    return this.completed.get(`${memberId}\n${key}`);
+  }
+
+  protected countCompleted(): number {
+    return this.completed.size;
+  }
+
+  protected writeCompleted(
+    memberId: string,
+    key: string,
+    hash: string,
+    response: IdempotentResponse,
+  ): void {
+    this.completed.set(`${memberId}\n${key}`, { hash, response });
   }
 }
 
