@@ -215,7 +215,7 @@ const RELATION_ID_PATTERN = /^(\$[0-9]+|[A-Za-z0-9_-]{1,80})$/;
 const RECORD_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const IF_MATCH_PATTERN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;
 const STAGE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
-const SEARCH_QUERY_PATTERN = /["()[\]\\]/;
+const SEARCH_QUERY_PATTERN = /["()[\]\\%,;*{}|&<>$`_\u0000-\u001f]/;
 
 function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefusal {
   const objectName = requireObjectName(args, 'search_records');
@@ -233,7 +233,7 @@ function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefus
   if (query.length > 80 || SEARCH_QUERY_PATTERN.test(query)) {
     return refusal(
       'invalid_request',
-      'search_records query must be 1–80 characters and cannot contain quotes or brackets.',
+      'search_records query must be 1–80 characters and cannot contain filter punctuation.',
       { toolName: 'search_records' },
     );
   }
@@ -478,18 +478,26 @@ function optionalAmount(
   return amount;
 }
 
+const MAX_MAJOR_AMOUNT = 1_000_000_000;
+
 // A present amount that is not a finite number >= 0 is refused. Never substitute 0.
+// Micros must stay inside Number.MAX_SAFE_INTEGER or the currency write is not the amount the user confirmed.
 function readNonNegativeAmount(value: unknown): number | undefined {
+  let numeric: number | undefined;
+
   if (typeof value === 'number') {
-    return Number.isFinite(value) && value >= 0 ? value : undefined;
+    numeric = value;
+  } else if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())) {
+    numeric = Number(value.trim());
   }
 
-  if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())) {
-    const numeric = Number(value.trim());
-    return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
+  if (numeric === undefined || !Number.isFinite(numeric) || numeric < 0 || numeric > MAX_MAJOR_AMOUNT) {
+    return undefined;
   }
 
-  return undefined;
+  const micros = Math.round(numeric * 1_000_000);
+
+  return Number.isSafeInteger(micros) ? numeric : undefined;
 }
 
 function readString(

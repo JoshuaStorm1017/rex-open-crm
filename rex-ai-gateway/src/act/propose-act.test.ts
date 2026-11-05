@@ -24,6 +24,7 @@ describe('proposeAct', () => {
     expect(planned).toMatchObject({
       ok: true,
       proposal: {
+        summary: expect.stringContaining('Create company'),
         tools: [
           { name: 'create_company', args: { name: 'Acme Corp' } },
           { name: 'create_person', args: { firstName: 'Jane', lastName: 'Doe' } },
@@ -148,12 +149,13 @@ describe('proposeAct', () => {
     const openai = createOpenAiLlmProvider(
       {
         provider: 'openai',
-        baseUrl: 'http://127.0.0.1:9',
+        baseUrl: 'https://llm.example/v1',
         apiKey: 'test-llm-key',
         model: 'mock-model',
       },
       async (url, init) => {
-        expect(String(url)).toBe('http://127.0.0.1:9/chat/completions');
+        expect(String(url)).toBe('https://llm.example/v1/chat/completions');
+        expect(init?.redirect).toBe('error');
         expect(new Headers(init?.headers).get('authorization')).toBe('Bearer test-llm-key');
         return new Response(
           JSON.stringify({
@@ -161,7 +163,7 @@ describe('proposeAct', () => {
               {
                 message: {
                   content: JSON.stringify({
-                    summary: 'no',
+                    summary: 'This only searches. Nothing will be written.',
                     tools: [{ name: 'delete_workspace', args: {} }],
                   }),
                 },
@@ -206,5 +208,29 @@ describe('readLlmConfigFromEnv', () => {
         REX_AI_MODEL: 'mock-model',
       }),
     ).toThrow(/credentials/);
+    expect(() =>
+      readLlmConfigFromEnv({
+        REX_AI_PROVIDER: 'openai',
+        REX_AI_BASE_URL: 'http://169.254.169.254/latest',
+        REX_AI_API_KEY: 'test-llm-key',
+        REX_AI_MODEL: 'mock-model',
+      }),
+    ).toThrow(/non-public|metadata|local/);
+    expect(() =>
+      readLlmConfigFromEnv({
+        REX_AI_PROVIDER: 'openai',
+        REX_AI_BASE_URL: 'http://127.0.0.1:9/v1',
+        REX_AI_API_KEY: 'test-llm-key',
+        REX_AI_MODEL: 'mock-model',
+      }),
+    ).toThrow(/non-public|local/);
+    expect(
+      readLlmConfigFromEnv({
+        REX_AI_PROVIDER: 'openai',
+        REX_AI_BASE_URL: 'https://api.openai.com/v1',
+        REX_AI_API_KEY: 'test-llm-key',
+        REX_AI_MODEL: 'mock-model',
+      }).provider,
+    ).toBe('openai');
   });
 });

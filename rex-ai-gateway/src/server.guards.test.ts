@@ -26,10 +26,18 @@ describe('gateway guards', () => {
     expect(planned.response.status).toBe(200);
     expect(client.created).toHaveLength(0);
 
-    const tools = isRecord(planned.payload) && isRecord(planned.payload.proposal)
-      ? planned.payload.proposal.tools
-      : undefined;
-    const body = { workspaceId: 'ws_demo', confirmed: true, tools };
+    const proposalId =
+      isRecord(planned.payload) &&
+      isRecord(planned.payload.proposal) &&
+      typeof planned.payload.proposal.id === 'string'
+        ? planned.payload.proposal.id
+        : undefined;
+    const body = {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId,
+      tools: [{ name: 'create_company', args: { name: 'Not Acme' } }],
+    };
     const executed = await post(gateway, '/v1/ai/act', body, {
       'idempotency-key': 'command-bar-demo-1',
       'x-rex-actor': 'ada@analytical.example',
@@ -42,6 +50,7 @@ describe('gateway guards', () => {
     expect(executed.response.status).toBe(200);
     expect(replayed.response.headers.get('idempotency-replayed')).toBe('true');
     expect(client.created).toHaveLength(3);
+    expect(client.created.some((record) => record.properties.name === 'Not Acme')).toBe(false);
     expect(client.created[2]?.properties.amount).toBe(50000);
     expect(client.created[2]?.properties.companyId).toBe(client.created[0]?.id);
 
@@ -85,9 +94,20 @@ describe('gateway guards', () => {
       name: 'Analytical Engines',
       domain: 'analytical.example',
     });
-    const found = await post(gateway, '/v1/ai/act', {
+    const foundPlan = await post(gateway, '/v1/ai/plan', {
       workspaceId: 'ws_demo',
       tools: [{ name: 'search_records', args: { object: 'company', query: 'Analytical' } }],
+    });
+    const foundProposalId =
+      isRecord(foundPlan.payload) &&
+      isRecord(foundPlan.payload.proposal) &&
+      typeof foundPlan.payload.proposal.id === 'string'
+        ? foundPlan.payload.proposal.id
+        : undefined;
+    const found = await post(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: foundProposalId,
     });
 
     expect(found.response.status).toBe(200);
@@ -99,32 +119,43 @@ describe('gateway guards', () => {
       workspaceId: 'ws_demo',
       intent: `update company ${company.id} set domain to engines.example`,
     });
-    const tools = isRecord(planned.payload) && isRecord(planned.payload.proposal)
-      ? planned.payload.proposal.tools
-      : undefined;
+    const proposalId =
+      isRecord(planned.payload) &&
+      isRecord(planned.payload.proposal) &&
+      typeof planned.payload.proposal.id === 'string'
+        ? planned.payload.proposal.id
+        : undefined;
     const updated = await post(gateway, '/v1/ai/act', {
       workspaceId: 'ws_demo',
       confirmed: true,
-      tools,
+      proposalId,
+    });
+    const stalePlan = await post(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      intent: `update company ${company.id} set domain to old.example`,
+    });
+    const staleProposalId =
+      isRecord(stalePlan.payload) &&
+      isRecord(stalePlan.payload.proposal) &&
+      typeof stalePlan.payload.proposal.id === 'string'
+        ? stalePlan.payload.proposal.id
+        : undefined;
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: company.id,
+      field: 'domain',
+      value: 'engines.example',
+      ifMatch: client.created[0]?.etag ?? 'v2',
     });
     const stale = await post(gateway, '/v1/ai/act', {
       workspaceId: 'ws_demo',
       confirmed: true,
-      tools: [
-        {
-          name: 'update_record',
-          args: {
-            object: 'company',
-            id: company.id,
-            field: 'domain',
-            value: 'old.example',
-            ifMatch: 'v1',
-          },
-        },
-      ],
+      proposalId: staleProposalId,
     });
     const missing = await post(gateway, '/v1/ai/act', {
       workspaceId: 'ws_demo',
+      confirmed: true,
       tools: [
         {
           name: 'update_record',
@@ -135,13 +166,12 @@ describe('gateway guards', () => {
 
     expect(updated.response.status).toBe(200);
     expect(client.created[0]?.properties.domain).toBe('engines.example');
-    expect(client.created[0]?.etag).toBe('v2');
+    expect(client.created[0]?.etag).toBe('v3');
     expect(stale.response.status).toBe(412);
     expect(stale.payload).toMatchObject({ refused: true, reason: 'precondition_failed' });
     expect(missing.payload).toMatchObject({
       refused: true,
-      reason: 'missing_required_fields',
-      missingFields: ['ifMatch'],
+      reason: 'confirmation_required',
     });
     expect(client.created[0]?.properties.domain).toBe('engines.example');
   });
@@ -162,14 +192,31 @@ describe('gateway guards', () => {
 
     const locked = await openGateway(client, 'test-gateway-token');
     const denied = await post(locked, '/v1/ai/tools', {});
+    const deniedAudit = await fetch(`${locked.url}/v1/ai/audit`);
     const allowed = await fetch(`${locked.url}/v1/ai/tools`, {
       headers: { authorization: 'Bearer test-gateway-token' },
     });
+    const allowedAudit = await fetch(`${locked.url}/v1/ai/audit`, {
+      headers: { authorization: 'Bearer test-gateway-token' },
+    });
     const catalog: unknown = await allowed.json();
+    const evilOrigin = await fetch(`${open.url}/v1/ai/audit`, {
+      headers: { origin: 'https://evil.example' },
+    });
+    const appOrigin = await fetch(`${open.url}/v1/ai/tools`, {
+      headers: { origin: 'http://localhost:3001' },
+    });
 
     expect(denied.response.status).toBe(401);
     expect(denied.payload).toMatchObject({ refused: true, reason: 'unauthorized' });
+    expect(deniedAudit.status).toBe(401);
     expect(allowed.status).toBe(200);
+    expect(allowedAudit.status).toBe(200);
+    expect(evilOrigin.headers.get('access-control-allow-origin')).toBeNull();
+    expect(appOrigin.headers.get('access-control-allow-origin')).toBe('http://localhost:3001');
+    await expect(startGateway({ client, host: '0.0.0.0', port: 0 })).rejects.toThrow(
+      /REX_AI_GATEWAY_TOKEN/,
+    );
     expect(catalog).toMatchObject({
       ok: true,
       tools: expect.arrayContaining([

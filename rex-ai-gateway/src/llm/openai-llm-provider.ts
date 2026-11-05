@@ -1,6 +1,7 @@
 import { isRecord } from '../is-record';
 import { toolCatalog } from '../act/tool-schema';
 import { refusal, type ToolCall } from '../act/types';
+import { assertProviderHostIsPublic, assertPublicProviderBaseUrl } from '../http/public-url';
 import type { LlmPlan, LlmProvider } from './llm-provider';
 import type { LlmConfig } from './read-llm-config';
 
@@ -10,12 +11,18 @@ export function createOpenAiLlmProvider(
   config: Extract<LlmConfig, { provider: 'openai' }>,
   fetchImpl: typeof fetch = fetch,
 ): LlmProvider {
+  const parsed = assertPublicProviderBaseUrl(config.baseUrl);
   const endpoint = `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
   return {
     async plan(input) {
+      if (fetchImpl === fetch) {
+        await assertProviderHostIsPublic(parsed.hostname);
+      }
+
       const response = await fetchImpl(endpoint, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
           'content-type': 'application/json',
@@ -30,13 +37,12 @@ export function createOpenAiLlmProvider(
         }),
         signal: AbortSignal.timeout(20_000),
       });
-      const text = await response.text();
 
       if (!response.ok) {
-        throw new Error(
-          `LLM request failed with ${response.status}: ${text.replace(/\s+/g, ' ').trim().slice(0, 200)}`,
-        );
+        throw new Error(`LLM request failed with ${response.status}.`);
       }
+
+      const text = await response.text();
 
       return parseModelPlan(text);
     },

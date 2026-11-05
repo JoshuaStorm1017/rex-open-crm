@@ -12,11 +12,11 @@ type Completed = {
 
 type RunResult =
   | { conflict: true }
-  | { conflict?: false; response: IdempotentResponse; replayed: boolean };
+  | { full: true }
+  | { response: IdempotentResponse; replayed: boolean };
 
 export class IdempotencyStore {
   private readonly completed = new Map<string, Completed>();
-  private readonly order: string[] = [];
   private readonly inflight = new Map<string, { hash: string; promise: Promise<IdempotentResponse> }>();
 
   constructor(private readonly capacity = 500) {}
@@ -47,6 +47,10 @@ export class IdempotencyStore {
       return { response: await current.promise, replayed: true };
     }
 
+    if (this.completed.size >= this.capacity) {
+      return { full: true };
+    }
+
     const promise = execute();
     this.inflight.set(key, { hash, promise });
 
@@ -60,19 +64,7 @@ export class IdempotencyStore {
   }
 
   private remember(key: string, hash: string, response: IdempotentResponse): void {
-    if (!this.completed.has(key)) {
-      this.order.push(key);
-    }
-
     this.completed.set(key, { hash, response });
-
-    while (this.order.length > this.capacity) {
-      const oldest = this.order.shift();
-
-      if (oldest) {
-        this.completed.delete(oldest);
-      }
-    }
   }
 }
 

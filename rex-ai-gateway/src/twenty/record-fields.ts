@@ -1,5 +1,9 @@
 import { isRecord } from '../is-record';
-import type { CreatedRecord, TwentyObjectName } from './twenty-crm-client';
+import type {
+  CreatedRecord,
+  RecordComposites,
+  TwentyObjectName,
+} from './twenty-crm-client';
 
 export function labelFromProperties(
   objectName: TwentyObjectName,
@@ -48,6 +52,23 @@ export function cloneRecord(record: CreatedRecord): CreatedRecord {
   return {
     ...record,
     properties: { ...record.properties },
+    ...(record.composites
+      ? {
+          composites: {
+            ...record.composites,
+            ...(record.composites.additionalEmails
+              ? { additionalEmails: [...record.composites.additionalEmails] }
+              : {}),
+            ...(record.composites.secondaryLinks
+              ? {
+                  secondaryLinks: record.composites.secondaryLinks.map((link) => ({
+                    ...link,
+                  })),
+                }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -62,6 +83,59 @@ export function applyField(
 
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function readStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const list = value.filter((item): item is string => typeof item === 'string');
+
+  return list.length === value.length ? list : undefined;
+}
+
+function readLinkList(value: unknown): Array<Record<string, string>> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const links: Array<Record<string, string>> = [];
+
+  for (const item of value) {
+    if (!isRecord(item)) {
+      return undefined;
+    }
+
+    const link: Record<string, string> = {};
+
+    for (const [key, entry] of Object.entries(item)) {
+      if (typeof entry !== 'string') {
+        return undefined;
+      }
+
+      link[key] = entry;
+    }
+
+    links.push(link);
+  }
+
+  return links;
+}
+
+function readComposites(raw: Record<string, unknown>): RecordComposites | undefined {
+  const emails = isRecord(raw.emails) ? raw.emails : undefined;
+  const domainName = isRecord(raw.domainName) ? raw.domainName : undefined;
+  const additionalEmails = readStringList(emails?.additionalEmails);
+  const secondaryLinks = readLinkList(domainName?.secondaryLinks);
+  const primaryLinkLabel = readString(domainName?.primaryLinkLabel);
+  const composites: RecordComposites = {
+    ...(additionalEmails ? { additionalEmails } : {}),
+    ...(secondaryLinks ? { secondaryLinks } : {}),
+    ...(primaryLinkLabel ? { primaryLinkLabel } : {}),
+  };
+
+  return Object.keys(composites).length > 0 ? composites : undefined;
 }
 
 function readPersonProperties(raw: Record<string, unknown>): Record<string, string | number> {
@@ -179,6 +253,8 @@ export function crmRecordFromTwenty(
         ? readCompanyProperties(raw)
         : readOpportunityProperties(raw);
 
+  const composites = readComposites(raw);
+
   return {
     id: raw.id,
     objectName,
@@ -186,5 +262,6 @@ export function crmRecordFromTwenty(
     properties,
     etag: readEtag(raw),
     label: labelFromProperties(objectName, properties) || raw.id,
+    ...(composites ? { composites } : {}),
   };
 }

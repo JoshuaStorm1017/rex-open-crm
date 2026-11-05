@@ -1,9 +1,13 @@
+import { randomUUID } from 'node:crypto';
+
 import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
 import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import type { ProposalStore } from '../http/proposal-store';
 import type { LlmProvider } from '../llm/llm-provider';
 import { describeTool, summarizeLines } from './describe-tool';
 import { parseGatewayRequest } from './parse-request';
 import {
+  MAX_TOOLS_PER_REQUEST,
   refusal,
   upstreamFailure,
   type ActRefusal,
@@ -15,11 +19,15 @@ import {
 import { validateTool, type ValidatedTool } from './validate-tool';
 import type { ExecuteActOptions } from './execute-act';
 
+export type ProposeActOptions = ExecuteActOptions & {
+  proposals?: ProposalStore;
+};
+
 export async function proposeAct(
   body: unknown,
   client: TwentyCrmClient,
   llm: LlmProvider,
-  options: ExecuteActOptions = {},
+  options: ProposeActOptions = {},
 ): Promise<PlanResult> {
   const parsed = parseGatewayRequest(body);
 
@@ -34,7 +42,7 @@ export async function proposeAct(
   }
 
   if (parsed.tools && parsed.tools.length > 0) {
-    return previewTools(client, parsed.workspaceId, parsed.tools, parsed.intent);
+    return previewTools(client, parsed.workspaceId, parsed.tools, options.proposals);
   }
 
   if (parsed.intent === undefined || parsed.intent.trim().length === 0) {
@@ -57,14 +65,25 @@ export async function proposeAct(
     return planned;
   }
 
-  return previewTools(client, parsed.workspaceId, planned.tools, planned.summary);
+  if (planned.tools.length === 0) {
+    return refusal('unmapped_intent', 'The model response did not include tools.');
+  }
+
+  if (planned.tools.length > MAX_TOOLS_PER_REQUEST) {
+    return refusal(
+      'invalid_request',
+      `A plan can include at most ${MAX_TOOLS_PER_REQUEST} tools.`,
+    );
+  }
+
+  return previewTools(client, parsed.workspaceId, planned.tools, options.proposals);
 }
 
 async function previewTools(
   client: TwentyCrmClient,
   workspaceId: string,
   tools: ToolCall[],
-  summary: string | undefined,
+  proposals: ProposalStore | undefined,
 ): Promise<PlanResult> {
   const validated: ValidatedTool[] = [];
 
@@ -104,8 +123,18 @@ async function previewTools(
     return upstreamFailure(error, 0);
   }
 
+  const stored = proposals?.save(workspaceId, normalized);
+
+  if (proposals && !stored) {
+    return refusal(
+      'invalid_request',
+      'Too many pending previews. Confirm or discard one before proposing another.',
+    );
+  }
+
   const proposal: PlanProposal = {
-    summary: summary && summary.trim().length > 0 ? summary.trim() : summarizeLines(lines),
+    id: stored?.id ?? `proposal_${randomUUID()}`,
+    summary: summarizeLines(lines),
     tools: normalized,
     lines,
   };

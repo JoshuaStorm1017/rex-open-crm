@@ -2,6 +2,7 @@ import type {
   CreateCompanyInput,
   CreateOpportunityInput,
   CreatePersonInput,
+  RecordComposites,
   TwentyObjectName,
 } from './twenty-crm-client';
 
@@ -104,11 +105,28 @@ export function graphqlSearchFilter(
   return { name: { ilike } };
 }
 
+const SAFE_FILTER_TOKEN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;
+
+export function conditionalUpdateFilter(id: string, etag: string): string {
+  if (!SAFE_FILTER_TOKEN.test(id) || !SAFE_FILTER_TOKEN.test(etag)) {
+    throw new Error('Refusing to interpolate an unsafe id or etag into a Twenty filter.');
+  }
+
+  return `and(id[eq]:"${id}",updatedAt[eq]:"${etag}")`;
+}
+
+export function updateManyName(objectName: TwentyObjectName): string {
+  const plural = TWENTY_OBJECT_PATH[objectName].plural;
+
+  return `update${plural.charAt(0).toUpperCase()}${plural.slice(1)}`;
+}
+
 export function toUpdatePayload(
   objectName: TwentyObjectName,
   field: string,
   value: string | number,
   current: Record<string, string | number>,
+  composites?: RecordComposites,
 ): Record<string, unknown> {
   if (objectName === 'person' && (field === 'firstName' || field === 'lastName')) {
     return {
@@ -123,7 +141,7 @@ export function toUpdatePayload(
     return {
       emails: {
         primaryEmail: value,
-        additionalEmails: [],
+        additionalEmails: composites?.additionalEmails ?? [],
       },
     };
   }
@@ -132,8 +150,8 @@ export function toUpdatePayload(
     return {
       domainName: {
         primaryLinkUrl: toCompanyLinkUrl(value),
-        primaryLinkLabel: '',
-        secondaryLinks: [],
+        primaryLinkLabel: composites?.primaryLinkLabel ?? '',
+        secondaryLinks: composites?.secondaryLinks ?? [],
       },
     };
   }
@@ -208,7 +226,13 @@ export function toCompanyPayload(
 
 // Twenty stores currency as micros (1 major unit = 1_000_000).
 export function toAmountMicros(amount: number): number {
-  return Math.round(amount * 1_000_000);
+  const micros = Math.round(amount * 1_000_000);
+
+  if (!Number.isSafeInteger(micros)) {
+    throw new Error('amount is too large to store as micros.');
+  }
+
+  return micros;
 }
 
 export function toOpportunityPayload(

@@ -1,13 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 import { executeAct, type ExecuteActOptions } from './act/execute-act';
+import { parseGatewayRequest } from './act/parse-request';
 import { proposeAct } from './act/propose-act';
 import { toolCatalog } from './act/tool-schema';
 import { isRecord } from './is-record';
 import { refusal, type ActResult, type PlanResult } from './act/types';
 import { AuditLog, type AuditEntry } from './audit/audit-log';
 import { bearerMatches } from './http/bearer-auth';
+import { corsHeadersFor, DEFAULT_ALLOWED_ORIGINS } from './http/cors';
 import { IdempotencyStore, readIdempotencyKey } from './http/idempotency-store';
+import { ProposalStore } from './http/proposal-store';
 import { readActor } from './http/read-actor';
 import { createMockLlmProvider } from './llm/mock-llm-provider';
 import type { LlmProvider } from './llm/llm-provider';
@@ -20,14 +23,6 @@ const AUDIT_PATH = '/v1/ai/audit';
 const KNOWN_PATHS = new Set([ACT_PATH, PLAN_PATH, TOOLS_PATH, AUDIT_PATH]);
 const MAX_BODY_BYTES = 64 * 1024;
 
-const CORS_HEADERS = {
-  'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, POST, OPTIONS',
-  'access-control-allow-headers':
-    'content-type, authorization, idempotency-key, x-rex-actor, if-match',
-  'access-control-expose-headers': 'idempotency-replayed',
-};
-
 export type GatewayOptions = ExecuteActOptions & {
   client: TwentyCrmClient;
   port?: number;
@@ -36,6 +31,8 @@ export type GatewayOptions = ExecuteActOptions & {
   llm?: LlmProvider;
   audit?: AuditLog;
   idempotency?: IdempotencyStore;
+  proposals?: ProposalStore;
+  allowedOrigins?: string[];
 };
 
 export type RunningGateway = {
@@ -51,11 +48,26 @@ type GatewayRuntime = {
   llm: LlmProvider;
   audit: AuditLog;
   idempotency: IdempotencyStore;
+  proposals: ProposalStore;
+  allowedOrigins: ReadonlySet<string>;
 };
+
+export function isLoopbackHost(host: string): boolean {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
 
 export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
   const host = options.host ?? '127.0.0.1';
   const port = options.port ?? 8787;
+
+  if (!isLoopbackHost(host) && !options.bearerToken) {
+    return Promise.reject(
+      new Error(
+        'REX_AI_GATEWAY_TOKEN is required when the gateway host is not loopback.',
+      ),
+    );
+  }
+
   const runtime: GatewayRuntime = {
     client: options.client,
     boundWorkspaceId: options.boundWorkspaceId,
@@ -63,6 +75,8 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
     llm: options.llm ?? createMockLlmProvider(),
     audit: options.audit ?? new AuditLog(),
     idempotency: options.idempotency ?? new IdempotencyStore(),
+    proposals: options.proposals ?? new ProposalStore(),
+    allowedOrigins: new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS),
   };
   const server = createServer((request, response) => {
     void handleRequest(request, response, runtime).catch((error: unknown) => {
@@ -71,8 +85,13 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
         return;
       }
 
-      const message = error instanceof Error ? error.message : 'Unexpected error';
-      sendJson(response, 500, { ok: false, message });
+      console.error(error instanceof Error ? error.message : 'Unexpected error');
+      sendJson(
+        response,
+        500,
+        { ok: false, message: 'Unexpected error' },
+        corsFor(request, runtime),
+      );
     });
   });
 
@@ -105,14 +124,15 @@ async function handleRequest(
 ): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1');
   const actor = readActor(headerValue(request.headers['x-rex-actor']));
+  const cors = corsFor(request, runtime);
 
   if (!KNOWN_PATHS.has(url.pathname)) {
-    sendJson(response, 404, { ok: false, message: 'Not found' });
+    sendJson(response, 404, { ok: false, message: 'Not found' }, cors);
     return;
   }
 
   if (request.method === 'OPTIONS') {
-    response.writeHead(204, CORS_HEADERS);
+    response.writeHead(204, cors);
     response.end();
     return;
   }
@@ -131,34 +151,39 @@ async function handleRequest(
       ok: false,
       reason: body.reason,
     });
-    sendJson(response, 401, body);
+    sendJson(response, 401, body, cors);
     return;
   }
 
   if (request.method === 'GET' && url.pathname === TOOLS_PATH) {
-    sendJson(response, 200, { ok: true, ...toolCatalog() });
+    sendJson(response, 200, { ok: true, ...toolCatalog() }, cors);
     return;
   }
 
   if (request.method === 'GET' && url.pathname === AUDIT_PATH) {
-    sendJson(response, 200, { ok: true, entries: runtime.audit.list() });
+    sendJson(response, 200, { ok: true, entries: runtime.audit.list() }, cors);
     return;
   }
 
   if (request.method !== 'POST' || (url.pathname !== ACT_PATH && url.pathname !== PLAN_PATH)) {
-    sendJson(response, 405, { ok: false, message: 'Method not allowed' });
+    sendJson(response, 405, { ok: false, message: 'Method not allowed' }, cors);
     return;
   }
 
   const rawBody = await readBody(request);
 
   if (rawBody === undefined) {
-    sendJson(response, 400, {
-      ok: false,
-      refused: true,
-      reason: 'invalid_request',
-      message: `Body exceeds ${MAX_BODY_BYTES} bytes.`,
-    });
+    sendJson(
+      response,
+      400,
+      {
+        ok: false,
+        refused: true,
+        reason: 'invalid_request',
+        message: `Body exceeds ${MAX_BODY_BYTES} bytes.`,
+      },
+      cors,
+    );
     return;
   }
 
@@ -169,7 +194,7 @@ async function handleRequest(
   } catch {
     const body = refusal('invalid_request', 'Body must be JSON.');
     rememberOutcome(runtime, actor, url.pathname, false, body);
-    sendJson(response, 400, body);
+    sendJson(response, 400, body, cors);
     return;
   }
 
@@ -178,9 +203,10 @@ async function handleRequest(
   if (url.pathname === PLAN_PATH) {
     const result = await proposeAct(parsed, runtime.client, runtime.llm, {
       boundWorkspaceId: runtime.boundWorkspaceId,
+      proposals: runtime.proposals,
     });
     rememberOutcome(runtime, actor, PLAN_PATH, confirmed, result);
-    sendJson(response, statusFor(result), result);
+    sendJson(response, statusFor(result), result, cors);
     return;
   }
 
@@ -192,21 +218,19 @@ async function handleRequest(
       'Idempotency-Key must be 8–200 characters of letters, numbers, dot, colon, underscore, or hyphen.',
     );
     rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
-    sendJson(response, 400, body);
+    sendJson(response, 400, body, cors);
     return;
   }
 
   const execute = async () => {
-    const result = await executeAct(parsed, runtime.client, {
-      boundWorkspaceId: runtime.boundWorkspaceId,
-    });
+    const result = await executeConfirmedAct(parsed, runtime);
     return { status: statusFor(result), body: result };
   };
 
   if (!idempotencyKey) {
     const result = await execute();
     rememberOutcome(runtime, actor, ACT_PATH, confirmed, result.body);
-    sendJson(response, result.status, result.body);
+    sendJson(response, result.status, result.body, cors);
     return;
   }
 
@@ -218,7 +242,17 @@ async function handleRequest(
       'This idempotency key was already used with a different request body.',
     );
     rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
-    sendJson(response, 409, body);
+    sendJson(response, 409, body, cors);
+    return;
+  }
+
+  if ('full' in stored && stored.full) {
+    const body = refusal(
+      'invalid_request',
+      'The idempotency store is full. New keys are refused so an evicted key cannot run a write twice.',
+    );
+    rememberOutcome(runtime, actor, ACT_PATH, confirmed, body);
+    sendJson(response, 503, body, cors);
     return;
   }
 
@@ -228,8 +262,54 @@ async function handleRequest(
 
   rememberOutcome(runtime, actor, ACT_PATH, confirmed, stored.response.body, stored.replayed);
   sendJson(response, stored.response.status, stored.response.body, {
+    ...cors,
     ...(stored.replayed ? { 'idempotency-replayed': 'true' } : {}),
   });
+}
+
+async function executeConfirmedAct(body: unknown, runtime: GatewayRuntime): Promise<ActResult> {
+  const parsed = parseGatewayRequest(body);
+
+  if ('refused' in parsed) {
+    return parsed;
+  }
+
+  if (runtime.boundWorkspaceId && parsed.workspaceId !== runtime.boundWorkspaceId) {
+    return refusal(
+      'cross_workspace',
+      `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
+    );
+  }
+
+  if (!parsed.confirmed || !parsed.proposalId) {
+    return refusal(
+      'confirmation_required',
+      'Nothing is written until Confirm. POST /v1/ai/plan returns a preview id; POST /v1/ai/act must send that id with confirmed true. Cancel sends nothing.',
+    );
+  }
+
+  const claimed = runtime.proposals.claim(parsed.proposalId, parsed.workspaceId);
+
+  if (!claimed.ok) {
+    if (claimed.reason === 'workspace') {
+      return refusal('cross_workspace', 'This preview belongs to a different workspace.');
+    }
+
+    return refusal(
+      'confirmation_required',
+      'This preview expired, was already confirmed, or does not exist. Propose it again.',
+    );
+  }
+
+  return executeAct(
+    {
+      workspaceId: parsed.workspaceId,
+      confirmed: true,
+      tools: claimed.proposal.tools,
+    },
+    runtime.client,
+    { boundWorkspaceId: runtime.boundWorkspaceId },
+  );
 }
 
 function rememberOutcome(
@@ -369,6 +449,10 @@ function statusFor(result: ActResult | PlanResult): number {
   return 400;
 }
 
+function corsFor(request: IncomingMessage, runtime: GatewayRuntime): Record<string, string> {
+  return corsHeadersFor(headerValue(request.headers.origin), runtime.allowedOrigins);
+}
+
 function sendJson(
   response: ServerResponse,
   status: number,
@@ -377,7 +461,6 @@ function sendJson(
 ): void {
   const payload = JSON.stringify(body);
   response.writeHead(status, {
-    ...CORS_HEADERS,
     ...extraHeaders,
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),

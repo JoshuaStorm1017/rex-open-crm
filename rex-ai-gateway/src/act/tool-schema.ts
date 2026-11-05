@@ -78,7 +78,7 @@ export function toolCatalog(): { tools: ToolSchema[] } {
               enum: ['person', 'company', 'opportunity'],
               description: 'Object to search.',
             },
-            query: stringProperty('Text to match. 1–80 characters, no quotes or brackets.'),
+            query: stringProperty('Text to match. 1–80 characters, without filter punctuation or wildcards.'),
             limit: {
               type: 'integer',
               minimum: 1,

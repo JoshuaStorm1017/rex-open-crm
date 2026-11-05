@@ -7,11 +7,14 @@ import {
   type ToolCall,
 } from './types';
 
+const PROPOSAL_ID_PATTERN = /^proposal_[0-9a-f-]{36}$/;
+
 export type ParsedRequest = {
   workspaceId: string;
   tools?: ToolCall[];
   intent?: string;
   confirmed: boolean;
+  proposalId?: string;
 };
 
 const MAX_INTENT_CHARS = 500;
@@ -70,11 +73,23 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     return refusal('invalid_request', 'confirmed must be a boolean.');
   }
 
+  if (body.proposalId !== undefined && typeof body.proposalId !== 'string') {
+    return refusal('invalid_request', 'proposalId must be a string.');
+  }
+
+  if (typeof body.proposalId === 'string' && !PROPOSAL_ID_PATTERN.test(body.proposalId)) {
+    return refusal(
+      'invalid_request',
+      'proposalId is not a preview id from POST /v1/ai/plan.',
+    );
+  }
+
   return {
     workspaceId: body.workspaceId,
     ...(tools ? { tools } : {}),
     ...(typeof body.intent === 'string' ? { intent: body.intent } : {}),
     confirmed: body.confirmed === true,
+    ...(typeof body.proposalId === 'string' ? { proposalId: body.proposalId } : {}),
   };
 }
 

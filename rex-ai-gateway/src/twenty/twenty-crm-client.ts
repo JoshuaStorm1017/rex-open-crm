@@ -26,6 +26,12 @@ export type CreateOpportunityInput = {
 
 export type TwentyObjectName = 'person' | 'company' | 'opportunity';
 
+export type RecordComposites = {
+  additionalEmails?: string[];
+  primaryLinkLabel?: string;
+  secondaryLinks?: Array<Record<string, string>>;
+};
+
 export type CreatedRecord = {
   id: string;
   objectName: TwentyObjectName;
@@ -33,6 +39,7 @@ export type CreatedRecord = {
   properties: Record<string, string | number>;
   etag: string;
   label: string;
+  composites?: RecordComposites;
 };
 
 export type SearchRecordsInput = {

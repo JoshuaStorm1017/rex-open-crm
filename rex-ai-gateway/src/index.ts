@@ -1,9 +1,11 @@
 import { createHttpTwentyCrmClient, readHttpClientConfigFromEnv } from './twenty/http-twenty-crm-client';
 import { createMockTwentyCrmClient } from './twenty/mock-twenty-crm-client';
 import { WORKSPACE_ID_PATTERN } from './act/find-foreign-workspace-id';
+import { readAllowedOrigins } from './http/cors';
+import { assertProviderHostIsPublic, assertPublicProviderBaseUrl } from './http/public-url';
 import { createLlmProvider } from './llm/create-llm-provider';
 import { readLlmConfigFromEnv } from './llm/read-llm-config';
-import { startGateway } from './server';
+import { isLoopbackHost, startGateway } from './server';
 
 let httpConfig: ReturnType<typeof readHttpClientConfigFromEnv>;
 let llmConfig: ReturnType<typeof readLlmConfigFromEnv>;
@@ -14,6 +16,16 @@ try {
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'Invalid gateway config.');
   process.exit(1);
+}
+
+if (llmConfig.provider === 'openai') {
+  try {
+    const providerUrl = assertPublicProviderBaseUrl(llmConfig.baseUrl);
+    await assertProviderHostIsPublic(providerUrl.hostname);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : 'Invalid provider URL.');
+    process.exit(1);
+  }
 }
 
 const client = httpConfig
@@ -37,6 +49,13 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
   process.exit(1);
 }
 
+if (!isLoopbackHost(host) && !bearerToken) {
+  console.error('REX_AI_GATEWAY_TOKEN is required when REX_AI_GATEWAY_HOST is not loopback.');
+  process.exit(1);
+}
+
+const allowedOrigins = readAllowedOrigins(process.env);
+
 const gateway = await startGateway({
   client,
   llm,
@@ -44,6 +63,7 @@ const gateway = await startGateway({
   host,
   boundWorkspaceId,
   bearerToken,
+  allowedOrigins,
 });
 
 console.log(`rex-ai-gateway listening on ${gateway.url}`);

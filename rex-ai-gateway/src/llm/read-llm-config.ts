@@ -1,3 +1,5 @@
+import { assertPublicProviderBaseUrl } from '../http/public-url';
+
 export type LlmConfig =
   | { provider: 'mock' }
   | { provider: 'openai'; baseUrl: string; apiKey: string; model: string };
@@ -23,21 +25,7 @@ export function readLlmConfigFromEnv(env: NodeJS.ProcessEnv): LlmConfig {
     );
   }
 
-  let parsed: URL;
-
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    throw new Error('REX_AI_BASE_URL must be an http(s) URL.');
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('REX_AI_BASE_URL must be an http(s) URL.');
-  }
-
-  if (parsed.username || parsed.password) {
-    throw new Error('REX_AI_BASE_URL must not include credentials.');
-  }
+  assertPublicProviderBaseUrl(baseUrl);
 
   return { provider: 'openai', baseUrl, apiKey, model };
 }

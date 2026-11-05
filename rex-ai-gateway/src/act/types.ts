@@ -28,7 +28,8 @@ export type RefusalReason =
   | 'not_found'
   | 'precondition_failed'
   | 'unauthorized'
-  | 'idempotency_conflict';
+  | 'idempotency_conflict'
+  | 'confirmation_required';
 
 export type ActRefusal = {
   ok: false;
@@ -80,6 +81,7 @@ export type ProposalLine = {
 };
 
 export type PlanProposal = {
+  id: string;
   summary: string;
   tools: ToolCall[];
   lines: ProposalLine[];

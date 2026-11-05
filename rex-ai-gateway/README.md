@@ -20,10 +20,10 @@ npm start
 
 ## Demo: intent to a Person
 
-With the mock server running:
+With the mock server running, preview first. The plan does not write. Copy `proposal.id` into the confirm call. `POST /v1/ai/act` runs that stored preview and ignores any tools in the confirm body.
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/v1/ai/act \
+curl -s -X POST http://127.0.0.1:8787/v1/ai/plan \
   -H 'content-type: application/json' \
   -d '{
     "workspaceId": "ws_demo",
@@ -31,24 +31,14 @@ curl -s -X POST http://127.0.0.1:8787/v1/ai/act \
   }'
 ```
 
-The same create as an explicit tool call:
-
 ```bash
 curl -s -X POST http://127.0.0.1:8787/v1/ai/act \
   -H 'content-type: application/json' \
+  -H 'Idempotency-Key: demo-ada-1' \
   -d '{
     "workspaceId": "ws_demo",
-    "tools": [
-      {
-        "name": "create_person",
-        "args": {
-          "firstName": "Ada",
-          "lastName": "Lovelace",
-          "email": "ada@analytical.example",
-          "jobTitle": "Mathematician"
-        }
-      }
-    ]
+    "confirmed": true,
+    "proposalId": "proposal_…"
   }'
 ```
 
@@ -89,8 +79,9 @@ Refusals are HTTP 400 with `refused: true` and a `reason`:
 | `ambiguous_intent` | an update does not name exactly one record |
 | `not_found` | the named record does not exist |
 | `precondition_failed` | `ifMatch` is not the current etag (HTTP 412) |
-| `unauthorized` | bearer token is missing or wrong (HTTP 401) |
+| `unauthorized` | bearer token is missing or wrong (HTTP 401). Applies to plan, act, tools, and audit |
 | `idempotency_conflict` | the idempotency key was reused with a different body (HTTP 409) |
+| `confirmation_required` | act did not confirm a live preview id, so nothing was written |
 | `invalid_request` | the JSON body is the wrong shape |
 
 `workspaceId` is a gateway token such as `ws_demo`, not Twenty's internal workspace uuid.
@@ -107,7 +98,7 @@ Only these tools run. Anything else is refused before the client is called.
 | `search_records` | `object` (`person`, `company`, or `opportunity`), `query` | `limit` (1–20, default 10) |
 | `update_record` | `object`, `id`, `field`, `value`, `ifMatch` | |
 
-`GET /v1/ai/tools` returns the same allowlist as JSON Schema for an external agent. `ifMatch` is the record etag (`v1` on the mock, `updatedAt` from Twenty). A mismatch is HTTP 412 and does not write.
+`GET /v1/ai/tools` returns the same allowlist as JSON Schema for an external agent. It uses the same bearer check as act and audit. `ifMatch` is the record etag (`v1` on the mock, `updatedAt` from Twenty). A mismatch is HTTP 412 and does not write. Twenty's REST API ignores an `If-Match` header, so the HTTP client sends the etag as `updatedAt[eq]` on an update-many filter. Zero matched rows means nothing was written.
 
 Writable fields: person `firstName`, `lastName`, `email`, `jobTitle`; company `name`, `domain`; opportunity `name`, `stage`, `amount`.
 
@@ -141,9 +132,10 @@ npm run start:twenty
 | `TWENTY_API_STYLE` | `rest` (default) or `graphql` |
 | `REX_AI_GATEWAY_HOST` | Default `127.0.0.1` |
 | `REX_AI_GATEWAY_PORT` | Default `8787` |
-| `REX_AI_GATEWAY_TOKEN` | When set, every route requires `Authorization: Bearer`. Unset keeps local dev open |
+| `REX_AI_GATEWAY_TOKEN` | When set, plan, act, tools, and audit require `Authorization: Bearer`. Required if the host is not loopback. Unset keeps a loopback dev process open. A missing token does not fall back to a session cookie |
+| `REX_AI_CORS_ORIGINS` | Comma-separated browser origins. Unset allows `http://localhost:3001`, `http://127.0.0.1:3001`, `http://localhost:3000`, and `http://127.0.0.1:3000`. Other origins are not reflected |
 | `REX_AI_PROVIDER` | `mock` (default) or `openai` |
-| `REX_AI_BASE_URL` | OpenAI-compatible origin, required when the provider is `openai` |
+| `REX_AI_BASE_URL` | Public OpenAI-compatible origin, required when the provider is `openai`. Private, loopback, and metadata hosts are refused, and redirects are not followed |
 | `REX_AI_API_KEY` | Provider key. Never commit it |
 | `REX_AI_MODEL` | Model name, required when the provider is `openai` |
 
@@ -151,7 +143,7 @@ The mock provider is deterministic and makes no network call. It is what `npm st
 
 ## Plan, then confirm
 
-`POST /v1/ai/plan` interprets plain English and returns a proposal. It does not write. The command bar shows that proposal and, only after Confirm, posts the same tools to `POST /v1/ai/act` with `confirmed: true`.
+`POST /v1/ai/plan` interprets plain English and returns a proposal. It does not write. The headline is built from the validated tools, not from the model's own summary. The command bar shows that proposal and, only after Confirm, posts `proposal.id` to `POST /v1/ai/act` with `confirmed: true`. Act runs the stored tools. A tools array on act, or `confirmed` without a live preview id, is `confirmation_required` and does not write. Cancel sends nothing.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/v1/ai/plan \
@@ -172,7 +164,7 @@ update company <id> set domain to acme.example
 update company named Acme set domain to acme.example
 ```
 
-A named update that matches zero records is `not_found`. More than one match is `ambiguous_intent`. Deletes, exports, and credential requests are `unsafe_intent`. The strict `create person|company|opportunity` sentences from the table above still run immediately on `POST /v1/ai/act` so existing tool calls keep working. Natural language goes through `/v1/ai/plan` first.
+A named update that matches zero records is `not_found`. More than one match is `ambiguous_intent`. Deletes, exports, and credential requests are `unsafe_intent`. Create sentences go through `/v1/ai/plan` as well. Nothing is written until the preview id is confirmed.
 
 `Idempotency-Key` on `POST /v1/ai/act` replays the stored response when the body matches, and returns 409 `idempotency_conflict` when the same key is reused with a different body. The store is in memory. `GET /v1/ai/audit` lists who (`X-Rex-Actor`), what, when, and the result. These three ideas are adapted from rex-crm-public's bearer API auth, `Idempotency-Key`, and `If-Match` on writes. This gateway keeps them in process instead of in that app's SQL tables, and a missing bearer token does not fall back to a session cookie.
 

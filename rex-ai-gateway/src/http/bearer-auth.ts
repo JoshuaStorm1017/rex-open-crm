@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 
 export function bearerMatches(header: string | undefined, token: string): boolean {
-  const presented = /^Bearer (.+)$/.exec(header ?? '')?.[1] ?? '';
+  const presented = /^Bearer (.+)$/i.exec(header ?? '')?.[1] ?? '';
   const actual = Buffer.from(presented);
   const expected = Buffer.from(token);
 

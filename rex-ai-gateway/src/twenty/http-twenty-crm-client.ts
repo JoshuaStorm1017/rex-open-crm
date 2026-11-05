@@ -3,12 +3,14 @@ import { CrmNotFoundError, CrmPreconditionError } from './crm-errors';
 import {
   TWENTY_CREATE_TARGET,
   TWENTY_OBJECT_PATH,
+  conditionalUpdateFilter,
   graphqlSearchFilter,
   restSearchFilter,
   toCompanyPayload,
   toOpportunityPayload,
   toPersonPayload,
   toUpdatePayload,
+  updateManyName,
 } from './map-to-twenty-payload';
 import { crmRecordFromTwenty, labelFromProperties, readEtag } from './record-fields';
 import {
@@ -34,8 +36,6 @@ export type TwentyHttpClientConfig = {
   style?: TwentyApiStyle;
   fetchImpl?: typeof fetch;
 };
-
-const MAX_ERROR_BODY_CHARS = 300;
 
 type JsonResult = {
   status: number;
@@ -90,23 +90,35 @@ export function createHttpTwentyCrmClient(
     const response = await fetchImpl(`${apiUrl}${path}`, {
       method: init.method,
       headers,
+      redirect: 'error',
       body: init.body === undefined ? undefined : JSON.stringify(init.body),
     });
     const text = await response.text();
-    const body: unknown = text.length === 0 ? undefined : JSON.parse(text);
+    let body: unknown;
+
+    try {
+      body = text.length === 0 ? undefined : JSON.parse(text);
+    } catch {
+      throw new Error(`Twenty ${style} request failed with ${response.status}.`);
+    }
 
     if (!response.ok) {
       if (response.status === 404) {
-        throw new CrmNotFoundError(`Twenty ${style} ${path} returned 404.`);
+        throw new CrmNotFoundError(`Twenty ${style} request returned 404.`);
       }
 
-      throw new Error(
-        `Twenty ${style} ${path} failed with ${response.status}: ${truncate(text)}`,
-      );
+      if (response.status === 412) {
+        throw new CrmPreconditionError(
+          `Twenty refused the update precondition (${response.status}).`,
+          init.ifMatch ?? 'unknown',
+        );
+      }
+
+      throw new Error(`Twenty ${style} request failed with ${response.status}.`);
     }
 
     if (isRecord(body) && Array.isArray(body.errors) && body.errors.length > 0) {
-      throw new Error(`Twenty GraphQL error: ${truncate(JSON.stringify(body.errors))}`);
+      throw new Error('Twenty GraphQL error.');
     }
 
     return { status: response.status, body };
@@ -220,26 +232,49 @@ export function createHttpTwentyCrmClient(
         input.field,
         input.value,
         current.properties,
+        current.composites,
       );
+      const manyName = updateManyName(input.objectName);
+      let filter: string;
+
+      try {
+        filter = conditionalUpdateFilter(input.id, input.ifMatch);
+      } catch {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} cannot be compared for ${input.objectName} ${input.id}.`,
+          current.etag,
+        );
+      }
+
+      // Twenty ignores If-Match. The etag is updatedAt, applied as a filter on update-many so a stale row matches nothing.
       const result =
         style === 'rest'
-          ? await requestJson(`${target.restPath}/${input.id}`, {
-              method: 'PATCH',
-              body: data,
-              ifMatch: input.ifMatch,
-            })
+          ? await requestJson(
+              `${target.restPath}?filter=${encodeURIComponent(filter)}`,
+              { method: 'PATCH', body: data },
+            )
           : await requestJson('/graphql', {
               method: 'POST',
-              ifMatch: input.ifMatch,
               body: {
-                query: `mutation Update($id: UUID!, $data: ${target.updateInputType}!) { ${target.updateMutationName}(id: $id, data: $data) { id updatedAt } }`,
-                variables: { id: input.id, data },
+                query: `mutation Update($filter: ${target.filterInputType}!, $data: ${target.updateInputType}!) { ${manyName}(filter: $filter, data: $data) { id updatedAt } }`,
+                variables: {
+                  filter: {
+                    and: [{ id: { eq: input.id } }, { updatedAt: { eq: input.ifMatch } }],
+                  },
+                  data,
+                },
               },
             });
-      const raw = readMutationRecord(
-        result.body,
-        style === 'rest' ? target.updateMutationName : target.updateMutationName,
-      );
+      const updatedRows = readUpdatedList(result.body, manyName);
+
+      if (updatedRows.length !== 1) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} did not match the current ${input.objectName} row. Nothing was written.`,
+          current.etag,
+        );
+      }
+
+      const raw = updatedRows[0] ?? {};
       const updated = crmRecordFromTwenty(input.objectName, input.workspaceId, {
         ...current.properties,
         id: input.id,
@@ -296,6 +331,16 @@ function readDataRecord(body: unknown, key: string): unknown {
   return body.data[key];
 }
 
+function readUpdatedList(body: unknown, key: string): Record<string, unknown>[] {
+  if (!isRecord(body) || !isRecord(body.data)) {
+    return [];
+  }
+
+  const value = body.data[key];
+
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
 function readList(body: unknown, plural: string): unknown[] {
   if (!isRecord(body) || !isRecord(body.data)) {
     return [];
@@ -314,12 +359,3 @@ function readList(body: unknown, plural: string): unknown[] {
   return [];
 }
 
-function truncate(text: string): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim();
-
-  if (oneLine.length <= MAX_ERROR_BODY_CHARS) {
-    return oneLine;
-  }
-
-  return `${oneLine.slice(0, MAX_ERROR_BODY_CHARS)}…`;
-}

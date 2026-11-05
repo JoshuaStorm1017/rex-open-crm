@@ -138,7 +138,7 @@ describe('createHttpTwentyCrmClient', () => {
     expect(query).toContain('PersonCreateInput');
   });
 
-  it('forwards a gateway act call through the HTTP client', async () => {
+  it('forwards a confirmed gateway act call through the HTTP client', async () => {
     const twenty = await startFakeTwenty((_captured, response) => {
       sendJson(response, 201, {
         data: { createPerson: { id: 'person_from_twenty' } },
@@ -153,12 +153,41 @@ describe('createHttpTwentyCrmClient', () => {
     });
     closers.push(() => gateway.close());
 
-    const response = await fetch(`${gateway.url}/v1/ai/act`, {
+    const planned = await fetch(`${gateway.url}/v1/ai/plan`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         intent: 'create person Ada Lovelace email ada@analytical.example',
+      }),
+    });
+    const planPayload: unknown = await planned.json();
+    const proposalId =
+      isRecord(planPayload) &&
+      isRecord(planPayload.proposal) &&
+      typeof planPayload.proposal.id === 'string'
+        ? planPayload.proposal.id
+        : '';
+    const direct = await fetch(`${gateway.url}/v1/ai/act`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        tools: [{ name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } }],
+      }),
+    });
+
+    expect(direct.status).toBe(400);
+    expect(twenty.captured).toHaveLength(0);
+
+    const response = await fetch(`${gateway.url}/v1/ai/act`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        proposalId,
       }),
     });
     const payload: unknown = await response.json();
@@ -222,10 +251,12 @@ describe('createHttpTwentyCrmClient', () => {
 
       sendJson(response, 200, {
         data: {
-          updateCompany: {
-            id: 'company_row',
-            updatedAt: '2026-01-02T00:00:00.000Z',
-          },
+          updateCompanies: [
+            {
+              id: 'company_row',
+              updatedAt: '2026-01-02T00:00:00.000Z',
+            },
+          ],
         },
       });
     });
@@ -277,7 +308,10 @@ describe('createHttpTwentyCrmClient', () => {
 
     expect(updated.etag).toBe('2026-01-02T00:00:00.000Z');
     expect(updated.properties.domain).toBe('engines.example');
-    expect(patch?.ifMatch).toBe('2026-01-01T00:00:00.000Z');
+    expect(decodeURIComponent(patch?.url ?? '')).toContain(
+      'and(id[eq]:"company_row",updatedAt[eq]:"2026-01-01T00:00:00.000Z")',
+    );
+    expect(patch?.ifMatch).toBeUndefined();
     expect(patch?.body).toEqual({
       domainName: {
         primaryLinkUrl: 'https://engines.example',
@@ -286,6 +320,54 @@ describe('createHttpTwentyCrmClient', () => {
       },
     });
     expect(JSON.stringify(patch?.body)).not.toContain('ws_demo');
+  });
+
+  it('keeps additional emails when the primary email changes and writes nothing on a lost race', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET') {
+        sendJson(response, 200, {
+          data: {
+            person: {
+              id: 'person_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              name: { firstName: 'Ada', lastName: 'Lovelace' },
+              emails: {
+                primaryEmail: 'ada@analytical.example',
+                additionalEmails: ['ada.archive@analytical.example'],
+              },
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, { data: { updatePeople: [] } });
+    });
+    const client = createHttpTwentyCrmClient({
+      apiUrl: twenty.url,
+      apiKey: 'test-workspace-key',
+      style: 'rest',
+    });
+
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'person',
+        id: 'person_row',
+        field: 'email',
+        value: 'ada.office@analytical.example',
+        ifMatch: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+
+    const patch = twenty.captured.find((request) => request.method === 'PATCH');
+
+    expect(patch?.body).toEqual({
+      emails: {
+        primaryEmail: 'ada.office@analytical.example',
+        additionalEmails: ['ada.archive@analytical.example'],
+      },
+    });
   });
 });
 
