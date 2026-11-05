@@ -308,6 +308,8 @@ export const AiCommandBar = ({
       resolvedConfig,
       current.proposal.id,
       fetchImpl,
+      current.proposal.choice?.groups ? undefined : current.choiceId,
+      current.proposal.choice?.groups ? current.choiceIds : undefined,
     );
 
     if (generation !== readGeneration()) {

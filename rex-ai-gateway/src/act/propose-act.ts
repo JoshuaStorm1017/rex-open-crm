@@ -271,9 +271,18 @@ export async function reproposeAct(
     parsed.proposalId,
     parsed.workspaceId,
     options.memberId,
+    parsed.choiceId,
+    parsed.choices,
   );
 
   if (!peeked.ok) {
+    if (peeked.reason === 'choice') {
+      return refusal(
+        'confirmation_required',
+        'Choose a record for each name, then confirm. Nothing was written.',
+      );
+    }
+
     return refusal(
       'not_found',
       'That preview expired or does not exist. Nothing was written.',

@@ -199,6 +199,8 @@ export const reproposeAiCommand = async (
   config: AiCommandBarConfig,
   proposalId: string,
   fetchImpl: FetchImpl,
+  choiceId?: string,
+  choices?: Record<string, string>,
 ): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
@@ -206,6 +208,8 @@ export const reproposeAiCommand = async (
     {
       workspaceId: config.workspaceId,
       proposalId,
+      ...(choiceId ? { choiceId } : {}),
+      ...(choices && Object.keys(choices).length > 0 ? { choices } : {}),
     },
     fetchImpl,
   );

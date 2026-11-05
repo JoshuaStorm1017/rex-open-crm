@@ -53,6 +53,7 @@ export function openGatewayState(filename: string): GatewayState {
   const database = new DatabaseSync(filename);
   restrictStateFiles(filename);
   database.exec('PRAGMA journal_mode = WAL;');
+  database.exec('PRAGMA busy_timeout = 5000;');
   database.exec(`
     CREATE TABLE IF NOT EXISTS proposals (
       id TEXT PRIMARY KEY,
@@ -95,7 +96,8 @@ export function openGatewayState(filename: string): GatewayState {
       member_id TEXT PRIMARY KEY,
       undo_id TEXT NOT NULL,
       generation INTEGER NOT NULL,
-      locked_at INTEGER NOT NULL
+      locked_at INTEGER NOT NULL,
+      lock_token TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS confirmed_plans (
       id TEXT PRIMARY KEY,
@@ -339,6 +341,8 @@ class SqliteProposalStore extends ProposalStore {
 }
 
 class SqliteUndoStore extends UndoStore {
+  private readonly lockTokens = new Map<string, string>();
+
   constructor(
     private readonly database: DatabaseSync,
     private readonly restrict: () => void,
@@ -410,20 +414,48 @@ class SqliteUndoStore extends UndoStore {
     }
 
     const generation = this.readGeneration(memberId);
+    const token = this.claimSharedLock(memberId, id, generation);
 
-    if (!this.claimSharedLock(memberId, id, generation)) {
+    if (!token) {
       super.release(memberId);
       return { ok: false, reason: 'busy' };
     }
 
+    this.lockTokens.set(memberId, token);
     this.setGenerationAtBegin(memberId, generation);
 
     return result;
   }
 
+  override holdsLock(memberId: string): boolean {
+    const token = this.lockTokens.get(memberId);
+
+    if (!token) {
+      return false;
+    }
+
+    const row = this.database
+      .prepare('SELECT lock_token FROM undo_lock WHERE member_id = ?')
+      .get(memberId) as { lock_token?: string } | undefined;
+
+    return row?.lock_token === token;
+  }
+
   override release(memberId: string): void {
+    const token = this.lockTokens.get(memberId);
     super.release(memberId);
-    this.clearLock(memberId);
+    this.lockTokens.delete(memberId);
+
+    if (!token) {
+      return;
+    }
+
+    this.database
+      .prepare(
+        'DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?',
+      )
+      .run(memberId, token);
+    this.restrict();
   }
 
   override superseded(memberId: string): boolean {
@@ -475,17 +507,15 @@ class SqliteUndoStore extends UndoStore {
 
   override finish(memberId: string): void {
     const id = this.runningUndoId(memberId);
+    const token = this.lockTokens.get(memberId);
     super.finish(memberId);
-    this.clearLock(memberId);
+    this.lockTokens.delete(memberId);
 
-    if (!id) {
+    if (!token) {
       return;
     }
 
-    this.database
-      .prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?')
-      .run(memberId, id);
-    this.restrict();
+    this.finishOwned(memberId, id, token);
   }
 
   override retain(
@@ -494,6 +524,10 @@ class SqliteUndoStore extends UndoStore {
     workspaceId: string,
     effects: ActEffect[],
   ): boolean {
+    if (!this.holdsLock(memberId)) {
+      return false;
+    }
+
     const current = this.readTicket(id, memberId, workspaceId);
 
     if (!current.ok || effects.length === 0) {
@@ -510,37 +544,76 @@ class SqliteUndoStore extends UndoStore {
     return true;
   }
 
-  // A lock older than a minute is stolen so a crashed process cannot block undo forever.
+  // A lock older than a minute can be taken so a crashed holder does not block
+  // undo forever. The new token replaces the old one; finish and release only
+  // delete the row when it still carries this process's token.
   private claimSharedLock(
     memberId: string,
     undoId: string,
     generation: number,
-  ): boolean {
+  ): string | undefined {
     const now = Date.now();
+    const token = randomUUID();
     const row = this.database
       .prepare(
-        `INSERT INTO undo_lock (member_id, undo_id, generation, locked_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO undo_lock (member_id, undo_id, generation, locked_at, lock_token)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(member_id) DO UPDATE SET
            undo_id = excluded.undo_id,
            generation = excluded.generation,
-           locked_at = excluded.locked_at
+           locked_at = excluded.locked_at,
+           lock_token = excluded.lock_token
          WHERE undo_lock.locked_at <= ?
-         RETURNING member_id`,
+         RETURNING lock_token`,
       )
-      .get(memberId, undoId, generation, now, now - 60_000) as
-      | { member_id: string }
+      .get(memberId, undoId, generation, now, token, now - 60_000) as
+      | { lock_token: string }
       | undefined;
     this.restrict();
 
-    return Boolean(row);
+    return row?.lock_token === token ? token : undefined;
   }
 
-  private clearLock(memberId: string): void {
-    this.database
-      .prepare('DELETE FROM undo_lock WHERE member_id = ?')
-      .run(memberId);
-    this.restrict();
+  private finishOwned(
+    memberId: string,
+    undoId: string | undefined,
+    token: string,
+  ): void {
+    this.database.exec('BEGIN IMMEDIATE');
+
+    try {
+      const row = this.database
+        .prepare('SELECT lock_token FROM undo_lock WHERE member_id = ?')
+        .get(memberId) as { lock_token?: string } | undefined;
+
+      if (row?.lock_token !== token) {
+        this.database.exec('ROLLBACK');
+        return;
+      }
+
+      this.database
+        .prepare(
+          'DELETE FROM undo_lock WHERE member_id = ? AND lock_token = ?',
+        )
+        .run(memberId, token);
+
+      if (undoId) {
+        this.database
+          .prepare('DELETE FROM undo_stack WHERE member_id = ? AND id = ?')
+          .run(memberId, undoId);
+      }
+
+      this.database.exec('COMMIT');
+      this.restrict();
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // BEGIN never opened, or SQLite already rolled the transaction back.
+      }
+
+      throw error;
+    }
   }
 
   private readGeneration(memberId: string): number {
@@ -991,6 +1064,16 @@ function migrateGatewayState(database: DatabaseSync): void {
 
   if (!auditColumns.some((column) => column.name === 'reverses')) {
     database.exec('ALTER TABLE audit_log ADD COLUMN reverses TEXT');
+  }
+
+  const lockColumns = database
+    .prepare('PRAGMA table_info(undo_lock)')
+    .all() as Array<{ name?: string }>;
+
+  if (!lockColumns.some((column) => column.name === 'lock_token')) {
+    database.exec(
+      "ALTER TABLE undo_lock ADD COLUMN lock_token TEXT NOT NULL DEFAULT ''",
+    );
   }
 
   const legacy = database

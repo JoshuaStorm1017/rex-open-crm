@@ -25,6 +25,7 @@ import { isRecord } from './is-record';
 import {
   refusal,
   upstreamFailure,
+  type ActRefusal,
   type ActResult,
   type PlanResult,
 } from './act/types';
@@ -871,6 +872,13 @@ async function readJsonBody(
   }
 }
 
+function undoLockLost(): ActRefusal {
+  return refusal(
+    'precondition_failed',
+    'Another process took this undo. This process stopped and left the ticket in place.',
+  );
+}
+
 async function executeConfirmedUndo(
   body: unknown,
   runtime: GatewayRuntime,
@@ -951,6 +959,11 @@ async function executeConfirmedUndo(
     );
   }
 
+  if (!runtime.undos.holdsLock(principal.memberId)) {
+    runtime.undos.release(principal.memberId);
+    return undoLockLost();
+  }
+
   let failures;
 
   try {
@@ -958,11 +971,18 @@ async function executeConfirmedUndo(
       runtime.client,
       parsed.workspaceId,
       begun.ticket.effects,
-      () => !runtime.undos.superseded(principal.memberId),
+      () =>
+        runtime.undos.holdsLock(principal.memberId) &&
+        !runtime.undos.superseded(principal.memberId),
     );
   } catch (error) {
     runtime.undos.release(principal.memberId);
     return upstreamFailure(error, 0);
+  }
+
+  if (!runtime.undos.holdsLock(principal.memberId)) {
+    runtime.undos.release(principal.memberId);
+    return undoLockLost();
   }
 
   if (failures.some((failure) => failure.reason === 'superseded')) {

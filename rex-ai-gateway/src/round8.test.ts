@@ -105,6 +105,199 @@ describe('reload a blocked preview', () => {
         .city,
     ).toBe('Faro');
   });
+
+  it('reloads a second write on the same record without confirming the stale preview', async () => {
+    const client = createMockTwentyCrmClient();
+    const company = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme',
+      city: 'Lisbon',
+      address: '1 Dock',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'city',
+            value: 'Faro',
+          },
+        },
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'address',
+            value: '12 Analytical Way',
+          },
+        },
+      ],
+    });
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: company.id,
+      field: 'city',
+      value: 'Porto',
+      ifMatch: company.etag,
+    });
+    const blocked = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+    });
+    const liveEtag = client.created.find(
+      (record) => record.id === company.id,
+    )?.etag;
+    const reloaded = await postJson(gateway, '/v1/ai/repropose', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+      tools: [{ name: 'create_note', args: { body: 'ignore me' } }],
+    });
+    const duringCity = client.created.find(
+      (record) => record.id === company.id,
+    )?.properties.city;
+    const duringAddress = client.created.find(
+      (record) => record.id === company.id,
+    )?.properties.address;
+    const stillBlocked = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(reloaded.payload),
+    });
+    const saved = client.created.find((record) => record.id === company.id);
+
+    expect(blocked.response.status).toBe(412);
+    expect(reloaded.payload).toMatchObject({
+      ok: true,
+      proposal: {
+        tools: [
+          {
+            name: 'update_record',
+            args: { field: 'city', value: 'Faro', ifMatch: liveEtag },
+          },
+          {
+            name: 'update_record',
+            args: {
+              field: 'address',
+              value: '12 Analytical Way',
+              ifMatch: 'chained',
+            },
+          },
+        ],
+        changes: [
+          { field: 'city', current: 'Porto', proposed: 'Faro' },
+          {
+            field: 'address',
+            current: '1 Dock',
+            proposed: '12 Analytical Way',
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(reloaded.payload)).not.toContain('create_note');
+    expect(duringCity).toBe('Porto');
+    expect(duringAddress).toBe('1 Dock');
+    expect(stillBlocked.response.status).toBe(412);
+    expect(acted.payload).toMatchObject({ ok: true });
+    expect(saved?.properties.city).toBe('Faro');
+    expect(saved?.properties.address).toBe('12 Analytical Way');
+  });
+
+  it('reloads the chosen record after a stale disambiguation', async () => {
+    const client = createMockTwentyCrmClient();
+    const north = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme North',
+      city: 'Lisbon',
+    });
+    const south = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme South',
+      city: 'Lisbon',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      intent: 'update company named Acme set city to Faro',
+    });
+    const choiceId = candidateId(planned.payload, south.id);
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: south.id,
+      field: 'city',
+      value: 'Porto',
+      ifMatch: south.etag,
+    });
+    const blocked = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+      choiceId,
+    });
+    const withoutChoice = await postJson(gateway, '/v1/ai/repropose', {
+      workspaceId: 'ws_demo',
+      proposalId: proposalId(planned.payload),
+    });
+    const cityBeforeReload = client.created.find(
+      (record) => record.id === south.id,
+    )?.properties.city;
+    const liveEtag = client.created.find((record) => record.id === south.id)
+      ?.etag;
+    const reloaded = await postJson(gateway, '/v1/ai/repropose', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+      choiceId,
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(reloaded.payload),
+    });
+
+    expect(blocked.response.status).toBe(412);
+    expect(withoutChoice.payload).toMatchObject({
+      reason: 'confirmation_required',
+    });
+    expect(cityBeforeReload).toBe('Porto');
+    expect(reloaded.payload).toMatchObject({
+      ok: true,
+      proposal: {
+        tools: [
+          {
+            name: 'update_record',
+            args: {
+              id: south.id,
+              field: 'city',
+              value: 'Faro',
+              ifMatch: liveEtag,
+            },
+          },
+        ],
+        changes: [{ recordId: south.id, current: 'Porto', proposed: 'Faro' }],
+      },
+    });
+    expect(acted.payload).toMatchObject({ ok: true });
+    expect(
+      client.created.find((record) => record.id === south.id)?.properties.city,
+    ).toBe('Faro');
+    expect(
+      client.created.find((record) => record.id === north.id)?.properties.city,
+    ).toBe('Lisbon');
+  });
 });
 
 describe('saved skills', () => {
@@ -208,6 +401,172 @@ describe('saved skills', () => {
     expect(
       client.created.find((record) => record.id === company.id)?.etag,
     ).not.toBe(etagAfterAct);
+  });
+
+  it('reruns a two-field skill against the live etag and ignores injected tools', async () => {
+    const client = createMockTwentyCrmClient();
+    const company = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme',
+      city: 'Lisbon',
+      address: '1 Dock',
+    });
+    const llm: LlmProvider = {
+      async plan() {
+        throw new Error('model should not run');
+      },
+    };
+    const gateway = await openGateway(client, llm);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'city',
+            value: 'Faro',
+          },
+        },
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'address',
+            value: '12 Analytical Way',
+          },
+        },
+      ],
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+    });
+    const saved = await postJson(gateway, '/v1/ai/skills', {
+      workspaceId: 'ws_demo',
+      skillName: 'Move Acme',
+      confirmedPlanId: confirmedId(acted.payload),
+      tools: [{ name: 'shell', args: { command: 'id' } }],
+    });
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: company.id,
+      field: 'city',
+      value: 'Porto',
+      ifMatch:
+        client.created.find((record) => record.id === company.id)?.etag ?? '',
+    });
+    const liveEtag = client.created.find(
+      (record) => record.id === company.id,
+    )?.etag;
+    const preview = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      skillId: skillId(saved.payload),
+    });
+    const cityBeforeConfirm = client.created.find(
+      (record) => record.id === company.id,
+    )?.properties.city;
+    const rerun = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(preview.payload),
+    });
+
+    expect(saved.payload).toMatchObject({
+      skill: { tools: ['update_record', 'update_record'] },
+    });
+    expect(JSON.stringify(saved.payload)).not.toContain('shell');
+    expect(preview.payload).toMatchObject({
+      proposal: {
+        tools: [
+          {
+            name: 'update_record',
+            args: { field: 'city', value: 'Faro', ifMatch: liveEtag },
+          },
+          {
+            name: 'update_record',
+            args: {
+              field: 'address',
+              value: '12 Analytical Way',
+              ifMatch: 'chained',
+            },
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(preview.payload)).not.toContain('shell');
+    expect(cityBeforeConfirm).toBe('Porto');
+    expect(rerun.payload).toMatchObject({ ok: true });
+    expect(
+      client.created.find((record) => record.id === company.id)?.properties,
+    ).toMatchObject({ city: 'Faro', address: '12 Analytical Way' });
+  });
+
+  it('refuses a saved skill when that field is no longer writable', async () => {
+    const client = createMockTwentyCrmClient();
+    const company = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme',
+      city: 'Lisbon',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'city',
+            value: 'Faro',
+          },
+        },
+      ],
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+    });
+    const saved = await postJson(gateway, '/v1/ai/skills', {
+      workspaceId: 'ws_demo',
+      skillName: 'Move Acme',
+      confirmedPlanId: confirmedId(acted.payload),
+    });
+    client.loadCapabilities = async () => ({
+      objects: [
+        {
+          objectName: 'company',
+          canRead: true,
+          canUpdate: true,
+          canCreate: true,
+          canSoftDelete: false,
+          fieldPermissions: [
+            { name: 'name', canUpdate: true },
+            { name: 'city', canUpdate: false },
+          ],
+        },
+      ],
+    });
+    const preview = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      skillId: skillId(saved.payload),
+    });
+
+    expect(preview.payload).toMatchObject({
+      ok: false,
+      reason: 'forbidden',
+    });
+    expect(JSON.stringify(preview.payload)).not.toContain('proposal_');
+    expect(
+      client.created.find((record) => record.id === company.id)?.properties
+        .city,
+    ).toBe('Faro');
   });
 
   it('keeps a skill in the shared state file', async () => {
@@ -522,6 +881,58 @@ describe('review polish', () => {
     expect(after.ok).toBe(true);
     expect(held.ok).toBe(true);
     expect(stolen.ok).toBe(true);
+    expect(first.undos.holdsLock('member_ada')).toBe(false);
+    expect(second.undos.holdsLock('member_ada')).toBe(true);
+
+    first.undos.finish('member_ada');
+    first.undos.release('member_ada');
+    const third = openGatewayState(file);
+    closers.push(async () => third.close());
+    const blocked = third.undos.begin(
+      ticket?.id ?? '',
+      'member_ada',
+      'ws_demo',
+    );
+    const stillThere = second.undos.list('member_ada', 'ws_demo');
+    second.undos.finish('member_ada');
+    const afterFinish = third.undos.begin(
+      ticket?.id ?? '',
+      'member_ada',
+      'ws_demo',
+    );
+
+    expect(stillThere.map((item) => item.id)).toEqual([ticket?.id]);
+    expect(blocked).toEqual({ ok: false, reason: 'busy' });
+    expect(afterFinish).toEqual({ ok: false, reason: 'missing' });
+  });
+
+  it('keeps a round 8 undo lock usable after the token column is added', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'rex-lock-old-'));
+    const file = path.join(dir, 'state.sqlite');
+    const database = new DatabaseSync(file);
+    database.exec(`
+      CREATE TABLE undo_lock (
+        member_id TEXT PRIMARY KEY,
+        undo_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        locked_at INTEGER NOT NULL
+      );
+    `);
+    database.close();
+    const state = openGatewayState(file);
+    closers.push(async () => state.close());
+    const ticket = state.undos.save('member_ada', 'ws_demo', [
+      {
+        kind: 'created',
+        objectName: 'person',
+        id: 'person_1',
+        etag: 'v1',
+      },
+    ]);
+    const begun = state.undos.begin(ticket?.id ?? '', 'member_ada', 'ws_demo');
+
+    expect(begun.ok).toBe(true);
+    expect(state.undos.holdsLock('member_ada')).toBe(true);
   });
 });
 
@@ -555,6 +966,27 @@ async function postJson(
   const payload: unknown = await response.json();
 
   return { response, payload };
+}
+
+function candidateId(payload: unknown, recordId: string): string {
+  if (
+    !isRecord(payload) ||
+    !isRecord(payload.proposal) ||
+    !isRecord(payload.proposal.choice) ||
+    !Array.isArray(payload.proposal.choice.candidates)
+  ) {
+    throw new Error('Missing choices');
+  }
+
+  const match = payload.proposal.choice.candidates.find(
+    (candidate) => isRecord(candidate) && candidate.id === recordId,
+  );
+
+  if (!isRecord(match) || typeof match.id !== 'string') {
+    throw new Error('Missing choice');
+  }
+
+  return match.id;
 }
 
 function proposalId(payload: unknown): string {

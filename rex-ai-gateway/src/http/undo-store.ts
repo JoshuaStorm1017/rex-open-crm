@@ -112,6 +112,12 @@ export class UndoStore {
     return begun !== (this.generation.get(memberId) ?? 0);
   }
 
+  // In-memory undos have one process. The sqlite store overrides this so a
+  // stolen lock is visible to the process that lost it.
+  holdsLock(memberId: string): boolean {
+    return this.running.has(memberId);
+  }
+
   finish(memberId: string): void {
     const id = this.running.get(memberId);
     this.running.delete(memberId);

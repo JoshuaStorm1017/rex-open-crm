@@ -1,6 +1,9 @@
 import type { ToolCall } from './types';
 
-const PLACEHOLDER_ETAGS = new Set(['chained', 'created']);
+// "created" is the etag of a row this same preview creates. "chained" is
+// recomputed when the preview is built; keeping it makes enrichUpdate treat
+// the sentinel as a stale etag and refuse the reload.
+const KEPT_ETAGS = new Set(['created']);
 
 export function withoutLiveEtag(tools: ToolCall[]): ToolCall[] {
   return tools.map((tool) => {
@@ -8,7 +11,7 @@ export function withoutLiveEtag(tools: ToolCall[]): ToolCall[] {
 
     if (
       typeof ifMatch !== 'string' ||
-      PLACEHOLDER_ETAGS.has(ifMatch) ||
+      KEPT_ETAGS.has(ifMatch) ||
       ifMatch.startsWith('$')
     ) {
       return { name: tool.name, args: { ...tool.args } };
