@@ -4,6 +4,7 @@ import { parsePhone } from '../twenty/parse-phone';
 import { canCreateObject, canSetField, type AudienceLoad } from './permissions';
 import type { CaptureRequest } from './parse-request';
 import {
+  MAX_TOOLS_PER_REQUEST,
   refusal,
   upstreamFailure,
   type ActRefusal,
@@ -95,6 +96,60 @@ export function captureToTools(
   fillDomainFromEmail(fields);
 
   return toolsFromFields(fields, audience);
+}
+
+export function splitCardBlocks(text: string): string[] {
+  const blocks = text
+    .split(/^\s*---\s*$/m)
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0);
+
+  return blocks.length > 0 ? blocks : [text.trim()];
+}
+
+export function toolsFromCardText(
+  source: 'card' | 'voice',
+  text: string,
+  audience: AudienceLoad,
+): ToolCall[] | ActRefusal {
+  const tools: ToolCall[] = [];
+
+  for (const block of splitCardBlocks(text)) {
+    const captured = captureToTools({ source, text: block }, audience);
+
+    if ('refused' in captured) {
+      return captured;
+    }
+
+    tools.push(...shiftRefs(captured, tools.length));
+  }
+
+  if (tools.length > MAX_TOOLS_PER_REQUEST) {
+    return refusal(
+      'invalid_request',
+      `A photo can preview at most ${MAX_TOOLS_PER_REQUEST} records. Split the cards.`,
+    );
+  }
+
+  return tools;
+}
+
+function shiftRefs(tools: ToolCall[], offset: number): ToolCall[] {
+  if (offset === 0) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    const args = { ...tool.args };
+
+    for (const [key, value] of Object.entries(args)) {
+      if (typeof value === 'string' && /^\$\d+$/.test(value)) {
+        args[key] = `$${Number(value.slice(1)) + offset}`;
+      }
+    }
+
+    return { name: tool.name, args };
+  });
 }
 
 function toolsFromFields(

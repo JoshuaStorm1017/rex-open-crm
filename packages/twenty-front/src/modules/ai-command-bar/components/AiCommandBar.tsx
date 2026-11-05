@@ -9,18 +9,22 @@ import { aiCommandBarCreatePreviewState } from '@/ai-command-bar/states/aiComman
 import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   executeAiCommand,
+  linkAiCompany,
   listAiSkills,
   proposeAiCapture,
   proposeAiCommand,
   proposeAiSkill,
   reproposeAiCommand,
+  retryAiRead,
   saveAiSkill,
+  searchAiCompanies,
   undoAiCommand,
   type AiAnswer,
   type AiAnswerRecord,
   type AiCaptureImage,
   type AiCaptureSource,
   type AiCommandOutcome,
+  type AiFailedRead,
   type AiPlanView,
   type AiProposal,
   type AiProposalLine,
@@ -41,6 +45,14 @@ import {
 import { recordShowPath } from '@/ai-command-bar/utils/recordShowPath';
 import { RootStackingContextZIndices } from '@/ui/layout/constants/RootStackingContextZIndices';
 
+const STAGE_OPTIONS = [
+  'NEW',
+  'SCREENING',
+  'MEETING',
+  'PROPOSAL',
+  'CUSTOMER',
+] as const;
+
 type Phase =
   | { name: 'compose'; draft: string; notice?: string }
   | {
@@ -48,6 +60,7 @@ type Phase =
       draft: string;
       lines: AiProposalLine[];
       records: AiAnswerRecord[];
+      failures: AiFailedRead[];
     }
   | {
       name: 'fill';
@@ -55,6 +68,10 @@ type Phase =
       skillId: string;
       parameters: AiSkillParameter[];
       values: Record<string, string>;
+      companyQuery: string;
+      companyMatches: AiAnswerRecord[];
+      companyLabel?: string;
+      notice?: string;
     }
   | {
       name: 'preview';
@@ -73,7 +90,12 @@ type Phase =
       proposal: AiProposal;
       progress?: string;
     }
-  | { name: 'answer'; draft: string; answer: AiAnswer }
+  | {
+      name: 'answer';
+      draft: string;
+      answer: AiAnswer;
+      failures: AiFailedRead[];
+    }
   | {
       name: 'done';
       links: AiRecordLink[];
@@ -137,8 +159,64 @@ export const AiCommandBar = ({
       return t`Stage`;
     }
 
+    if (name === 'company') {
+      return t`Company`;
+    }
+
+    if (name === 'owner') {
+      return t`Owner`;
+    }
+
+    if (name === 'closeDate') {
+      return t`Close date`;
+    }
+
     return name;
   };
+  const parameterControl = (name: string): AiSkillParameter['control'] => {
+    if (name === 'amount') {
+      return 'amount';
+    }
+
+    if (name === 'stage') {
+      return 'stage';
+    }
+
+    if (name === 'company') {
+      return 'company';
+    }
+
+    if (name === 'owner') {
+      return 'owner';
+    }
+
+    if (name === 'closeDate') {
+      return 'date';
+    }
+
+    return 'text';
+  };
+  const retryName = (tool: string): string => {
+    if (tool === 'search_notes') {
+      return t`Retry notes`;
+    }
+
+    if (tool === 'search_tasks') {
+      return t`Retry tasks`;
+    }
+
+    if (tool === 'search_activities') {
+      return t`Retry activities`;
+    }
+
+    return t`Retry search`;
+  };
+  const skillParameter = (name: string): AiSkillParameter => ({
+    name,
+    label: parameterLabel(name),
+    control: parameterControl(name),
+    ...(name === 'stage' ? { options: [...STAGE_OPTIONS] } : {}),
+  });
   const setFieldPreview = useSetAtomState(aiCommandBarFieldPreviewState);
   const setCreatePreview = useSetAtomState(aiCommandBarCreatePreviewState);
   const clearPreviews = () => {
@@ -278,7 +356,9 @@ export const AiCommandBar = ({
     }
 
     clearPreviews();
-    setPhase({ name: 'planning', draft, lines: [], records: [] });
+    let streamedRecords: AiAnswerRecord[] = [];
+    let streamedFailures: AiFailedRead[] = [];
+    setPhase({ name: 'planning', draft, lines: [], records: [], failures: [] });
 
     const outcome = await proposeAiCommand(
       resolvedConfig,
@@ -294,14 +374,28 @@ export const AiCommandBar = ({
           current.name === 'planning' ? { ...current, lines } : current,
         );
       },
-      (records) => {
+      (update) => {
         if (generation !== readGeneration()) {
           return;
         }
 
+        if (update.records.length > 0) {
+          streamedRecords = [...streamedRecords, ...update.records];
+        }
+
+        if (update.failure) {
+          streamedFailures = [...streamedFailures, update.failure];
+        }
+
         setPhase((current) =>
           current.name === 'planning'
-            ? { ...current, records: [...current.records, ...records] }
+            ? {
+                ...current,
+                records: [...current.records, ...update.records],
+                failures: update.failure
+                  ? [...current.failures, update.failure]
+                  : current.failures,
+              }
             : current,
         );
       },
@@ -311,11 +405,30 @@ export const AiCommandBar = ({
       return;
     }
 
-    showPlan(draft, outcome);
+    showPlan(draft, outcome, streamedRecords, streamedFailures);
   };
 
-  const showPlan = (draft: string, outcome: AiCommandOutcome<AiPlanView>) => {
+  const showPlan = (
+    draft: string,
+    outcome: AiCommandOutcome<AiPlanView>,
+    streamedRecords: AiAnswerRecord[] = [],
+    streamedFailures: AiFailedRead[] = [],
+  ) => {
     if (outcome.kind === 'message' || outcome.kind === 'stale') {
+      if (outcome.kind === 'message' && streamedRecords.length > 0) {
+        clearPreviews();
+        setPhase({
+          name: 'answer',
+          draft,
+          answer: {
+            summary: outcome.message,
+            records: streamedRecords,
+          },
+          failures: streamedFailures,
+        });
+        return;
+      }
+
       clearPreviews();
       setPhase({
         name: 'refused',
@@ -328,15 +441,34 @@ export const AiCommandBar = ({
       return;
     }
 
+    if (outcome.data.captureReview && !outcome.data.proposal) {
+      clearPreviews();
+      setCaptureSource('card');
+      setCaptureImage(undefined);
+      setCaptureText(outcome.data.captureReview.text);
+      setCaptureOpen(true);
+      setPhase({
+        name: 'compose',
+        draft,
+        notice:
+          outcome.data.captureReview.cardCount > 1
+            ? t`${outcome.data.captureReview.cardCount} cards were read. Edit the lines, then preview. Nothing is created yet.`
+            : t`Edit the card lines, then preview. Nothing is created yet.`,
+      });
+      return;
+    }
+
     if (!outcome.data.proposal) {
       clearPreviews();
+      const answer = outcome.data.answer ?? {
+        summary: 'No matching records.',
+        records: streamedRecords,
+      };
       setPhase({
         name: 'answer',
         draft,
-        answer: outcome.data.answer ?? {
-          summary: 'No matching records.',
-          records: [],
-        },
+        answer,
+        failures: answer.failedReads ?? streamedFailures,
       });
       return;
     }
@@ -363,6 +495,7 @@ export const AiCommandBar = ({
       draft: current.draft,
       lines: [],
       records: [],
+      failures: [],
     });
     const outcome = await reproposeAiCommand(
       resolvedConfig,
@@ -394,7 +527,13 @@ export const AiCommandBar = ({
     }
 
     clearPreviews();
-    setPhase({ name: 'planning', draft: '', lines: [], records: [] });
+    setPhase({
+      name: 'planning',
+      draft: '',
+      lines: [],
+      records: [],
+      failures: [],
+    });
     const outcome = await proposeAiCapture(
       resolvedConfig,
       captureSource,
@@ -440,16 +579,21 @@ export const AiCommandBar = ({
         name: 'fill',
         draft: skill.name,
         skillId: skill.id,
-        parameters: skill.parameters.map((name) => ({
-          name,
-          label: parameterLabel(name),
-        })),
+        parameters: skill.parameters.map((name) => skillParameter(name)),
         values: {},
+        companyQuery: '',
+        companyMatches: [],
       });
       return;
     }
 
-    setPhase({ name: 'planning', draft: skill.name, lines: [], records: [] });
+    setPhase({
+      name: 'planning',
+      draft: skill.name,
+      lines: [],
+      records: [],
+      failures: [],
+    });
     const outcome = await proposeAiSkill(resolvedConfig, skill.id, fetchImpl);
 
     if (generation !== readGeneration()) {
@@ -467,6 +611,8 @@ export const AiCommandBar = ({
         skillId: skill.id,
         parameters: outcome.data.parameters,
         values: {},
+        companyQuery: '',
+        companyMatches: [],
       });
       return;
     }
@@ -512,6 +658,7 @@ export const AiCommandBar = ({
       draft: current.draft,
       lines: [],
       records: [],
+      failures: [],
     });
     const outcome = await proposeAiSkill(
       resolvedConfig,
@@ -525,6 +672,100 @@ export const AiCommandBar = ({
     }
 
     showPlan(current.draft, outcome);
+  };
+
+  const findCompanies = async (query: string) => {
+    const trimmed = query.trim();
+
+    if (trimmed.length === 0) {
+      return;
+    }
+
+    const outcome = await searchAiCompanies(resolvedConfig, trimmed, fetchImpl);
+
+    setPhase((current) => {
+      if (current.name !== 'fill') {
+        return current;
+      }
+
+      if (outcome.kind !== 'data') {
+        return {
+          ...current,
+          notice:
+            outcome.kind === 'message'
+              ? outcome.message
+              : t`The company search failed.`,
+        };
+      }
+
+      return { ...current, companyMatches: outcome.data, notice: undefined };
+    });
+  };
+
+  const acceptCompanyLink = async (
+    current: Extract<Phase, { name: 'preview' }>,
+    companyId: string,
+  ) => {
+    const generation = readGeneration();
+
+    setPhase({
+      name: 'planning',
+      draft: current.draft,
+      lines: [],
+      records: [],
+      failures: [],
+    });
+    const outcome = await linkAiCompany(
+      resolvedConfig,
+      current.proposal.id,
+      companyId,
+      fetchImpl,
+    );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    showPlan(current.draft, outcome);
+  };
+
+  const retryFailure = async (
+    current: Extract<Phase, { name: 'answer' }>,
+    failure: AiFailedRead,
+  ) => {
+    const outcome = await retryAiRead(
+      resolvedConfig,
+      failure.retry,
+      fetchImpl,
+      openRecord,
+    );
+
+    if (outcome.kind !== 'data') {
+      const message =
+        outcome.kind === 'message' ? outcome.message : t`That search failed.`;
+
+      setPhase({
+        ...current,
+        failures: current.failures.map((item) =>
+          item.tool === failure.tool ? { ...item, message } : item,
+        ),
+      });
+      return;
+    }
+
+    const seen = new Set(current.answer.records.map((record) => record.id));
+
+    setPhase({
+      ...current,
+      answer: {
+        summary: outcome.data.summary,
+        records: [
+          ...current.answer.records,
+          ...outcome.data.records.filter((record) => !seen.has(record.id)),
+        ],
+      },
+      failures: current.failures.filter((item) => item.tool !== failure.tool),
+    });
   };
 
   const saveSkill = async (current: Extract<Phase, { name: 'done' }>) => {
@@ -649,7 +890,7 @@ export const AiCommandBar = ({
       if (typeof reader.result === 'string') {
         setCaptureSource('card');
         setCaptureImage(undefined);
-        setCaptureText(reader.result.slice(0, 2000));
+        setCaptureText(reader.result.slice(0, 8000));
       }
     };
     reader.readAsText(file);
@@ -938,6 +1179,11 @@ export const AiCommandBar = ({
                     ))}
                   </StyledList>
                 )}
+                {phase.failures.map((failure) => (
+                  <StyledNotice key={failure.tool} role="status">
+                    {failure.message}
+                  </StyledNotice>
+                ))}
               </>
             )}
             {phase.name === 'fill' && (
@@ -945,18 +1191,36 @@ export const AiCommandBar = ({
                 <StyledNotice role="status">
                   {t`Fill the open values before Confirm.`}
                 </StyledNotice>
+                {phase.notice && (
+                  <StyledNotice role="status">{phase.notice}</StyledNotice>
+                )}
                 {phase.parameters.map((parameter) => (
-                  <StyledInput
+                  <SkillParameterField
                     key={parameter.name}
-                    aria-label={parameter.label}
+                    parameter={parameter}
                     value={phase.values[parameter.name] ?? ''}
-                    onChange={(event) =>
+                    companyQuery={phase.companyQuery}
+                    companyMatches={phase.companyMatches}
+                    companyLabel={phase.companyLabel}
+                    onValue={(next) =>
                       setPhase({
                         ...phase,
                         values: {
                           ...phase.values,
-                          [parameter.name]: event.target.value,
+                          [parameter.name]: next,
                         },
+                      })
+                    }
+                    onCompanyQuery={(companyQuery) =>
+                      setPhase({ ...phase, companyQuery })
+                    }
+                    onFind={() => void findCompanies(phase.companyQuery)}
+                    onUseCompany={(company) =>
+                      setPhase({
+                        ...phase,
+                        values: { ...phase.values, company: company.id },
+                        companyMatches: [],
+                        companyLabel: company.label,
                       })
                     }
                   />
@@ -995,7 +1259,20 @@ export const AiCommandBar = ({
                       key={`${warning.code}-${warning.message}`}
                       role="status"
                     >
-                      {warning.message}
+                      <span>{warning.message}</span>
+                      {warning.link && (
+                        <StyledSecondary
+                          type="button"
+                          onClick={() =>
+                            void acceptCompanyLink(
+                              phase,
+                              warning.link?.companyId ?? '',
+                            )
+                          }
+                        >
+                          {t`Link the new person to`} {warning.link.label}
+                        </StyledSecondary>
+                      )}
                     </StyledWarning>
                   ))}
                 {phase.name === 'preview' && phase.blockMessage && (
@@ -1139,6 +1416,17 @@ export const AiCommandBar = ({
             {phase.name === 'answer' && (
               <>
                 <AnswerList answer={phase.answer} />
+                {phase.failures.map((failure) => (
+                  <StyledWarning key={failure.tool} role="status">
+                    <span>{failure.message}</span>
+                    <StyledSecondary
+                      type="button"
+                      onClick={() => void retryFailure(phase, failure)}
+                    >
+                      {retryName(failure.tool)}
+                    </StyledSecondary>
+                  </StyledWarning>
+                ))}
                 <StyledNotice role="status">
                   {t`Nothing was changed.`}
                 </StyledNotice>
@@ -1209,7 +1497,14 @@ export const AiCommandBar = ({
                     />
                     <StyledChoices>
                       <legend>{t`Leave blank for next time`}</legend>
-                      {['city', 'amount', 'stage'].map((name) => (
+                      {[
+                        'city',
+                        'amount',
+                        'stage',
+                        'company',
+                        'owner',
+                        'closeDate',
+                      ].map((name) => (
                         <label key={name}>
                           <input
                             type="checkbox"
@@ -1347,6 +1642,17 @@ const StyledFileLabel = styled.label`
   input {
     margin-left: ${themeCssVariables.spacing[2]};
   }
+`;
+
+const StyledSelect = styled.select`
+  background: ${themeCssVariables.background.transparent.lighter};
+  border: 1px solid ${themeCssVariables.border.color.medium};
+  border-radius: ${themeCssVariables.border.radius.sm};
+  color: ${themeCssVariables.font.color.primary};
+  font-family: ${themeCssVariables.font.family};
+  font-size: ${themeCssVariables.font.size.md};
+  padding: ${themeCssVariables.spacing[2]};
+  width: 100%;
 `;
 
 const StyledInput = styled.input`
@@ -1506,6 +1812,110 @@ const speechRecognition = (): SpeechRecognitionLike | undefined => {
   return Recognition ? new Recognition() : undefined;
 };
 
+const SkillParameterField = ({
+  parameter,
+  value,
+  companyQuery,
+  companyMatches,
+  companyLabel,
+  onValue,
+  onCompanyQuery,
+  onFind,
+  onUseCompany,
+}: {
+  parameter: AiSkillParameter;
+  value: string;
+  companyQuery: string;
+  companyMatches: AiAnswerRecord[];
+  companyLabel?: string;
+  onValue: (value: string) => void;
+  onCompanyQuery: (value: string) => void;
+  onFind: () => void;
+  onUseCompany: (company: AiAnswerRecord) => void;
+}) => {
+  const { t } = useLingui();
+  const control = parameter.control ?? 'text';
+
+  if (control === 'stage') {
+    const options =
+      parameter.options && parameter.options.length > 0
+        ? parameter.options
+        : [...STAGE_OPTIONS];
+
+    return (
+      <StyledSelect
+        aria-label={parameter.label}
+        value={value}
+        onChange={(event) => onValue(event.target.value)}
+      >
+        <option value="">{t`Select a stage`}</option>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </StyledSelect>
+    );
+  }
+
+  if (control === 'company') {
+    return (
+      <>
+        <StyledInput
+          aria-label={t`Company search`}
+          value={companyQuery}
+          placeholder={t`Company name`}
+          onChange={(event) => onCompanyQuery(event.target.value)}
+        />
+        <StyledActions>
+          <StyledSecondary type="button" onClick={onFind}>
+            {t`Find company`}
+          </StyledSecondary>
+        </StyledActions>
+        {companyMatches.length > 0 && (
+          <StyledList>
+            {companyMatches.map((company) => (
+              <li key={company.id}>
+                <StyledSecondary
+                  type="button"
+                  onClick={() => onUseCompany(company)}
+                >
+                  {t`Use`} {company.label}
+                </StyledSecondary>
+              </li>
+            ))}
+          </StyledList>
+        )}
+        {companyLabel && (
+          <StyledNotice role="status">
+            {t`Selected company`} {companyLabel}
+          </StyledNotice>
+        )}
+      </>
+    );
+  }
+
+  if (control === 'date') {
+    return (
+      <StyledInput
+        aria-label={parameter.label}
+        type="date"
+        value={value}
+        onChange={(event) => onValue(event.target.value)}
+      />
+    );
+  }
+
+  return (
+    <StyledInput
+      aria-label={parameter.label}
+      placeholder={control === 'owner' ? 'me' : undefined}
+      value={value}
+      onChange={(event) => onValue(event.target.value)}
+    />
+  );
+};
+
 const CaptureFields = ({
   source,
   text,
@@ -1646,9 +2056,12 @@ const StyledNotice = styled.p`
   margin: 0;
 `;
 
-const StyledWarning = styled.p`
+const StyledWarning = styled.div`
   color: ${themeCssVariables.font.color.secondary};
+  display: flex;
+  flex-direction: column;
   font-size: ${themeCssVariables.font.size.sm};
+  gap: ${themeCssVariables.spacing[2]};
   margin: 0;
 `;
 

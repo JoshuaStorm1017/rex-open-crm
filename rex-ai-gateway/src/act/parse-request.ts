@@ -2,6 +2,8 @@ import { isRecord } from '../is-record';
 import { WORKSPACE_ID_PATTERN } from './find-foreign-workspace-id';
 import {
   isSkillParameterName,
+  parseSkillParameterValue,
+  SKILL_PARAMETER_NAMES,
   type SkillParameterName,
 } from './skill-parameters';
 import {
@@ -18,7 +20,7 @@ const RECORD_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const SKILL_ID_PATTERN = /^skill_[0-9a-f-]{36}$/;
 const CONFIRMED_PLAN_ID_PATTERN = /^confirmed_[0-9a-f-]{36}$/;
 const SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .'-]{0,39}$/;
-const MAX_CAPTURE_CHARS = 2000;
+const MAX_CAPTURE_CHARS = 8000;
 const MAX_IMAGE_CHARS = 1_000_000;
 const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 
@@ -54,6 +56,7 @@ export type ParsedRequest = {
   confirmedPlanId?: string;
   blanks?: SkillParameterName[];
   parameterValues?: Partial<Record<SkillParameterName, string | number>>;
+  linkCompanyId?: string;
 };
 
 const MAX_INTENT_CHARS = 500;
@@ -229,6 +232,14 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     return parameterValues;
   }
 
+  if (
+    body.linkCompanyId !== undefined &&
+    (typeof body.linkCompanyId !== 'string' ||
+      !RECORD_ID_PATTERN.test(body.linkCompanyId))
+  ) {
+    return refusal('invalid_request', 'linkCompanyId is not a company id.');
+  }
+
   return {
     workspaceId: body.workspaceId,
     ...(tools ? { tools } : {}),
@@ -251,6 +262,9 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
       : {}),
     ...(blanks && blanks.length > 0 ? { blanks } : {}),
     ...(parameterValues ? { parameterValues } : {}),
+    ...(typeof body.linkCompanyId === 'string'
+      ? { linkCompanyId: body.linkCompanyId }
+      : {}),
   };
 }
 
@@ -358,10 +372,10 @@ function parseBlanks(
     return undefined;
   }
 
-  if (!Array.isArray(value) || value.length > SKILL_PARAMETER_LIMIT) {
+  if (!Array.isArray(value) || value.length > SKILL_PARAMETER_NAMES.length) {
     return refusal(
       'invalid_request',
-      'blanks must list city, amount, or stage.',
+      'blanks must list city, amount, stage, company, owner, or closeDate.',
     );
   }
 
@@ -371,7 +385,7 @@ function parseBlanks(
     if (typeof item !== 'string' || !isSkillParameterName(item)) {
       return refusal(
         'invalid_request',
-        'blanks must list city, amount, or stage.',
+        'blanks must list city, amount, stage, company, owner, or closeDate.',
       );
     }
 
@@ -403,36 +417,21 @@ function parseParameterValues(
     if (!isSkillParameterName(key)) {
       return refusal(
         'invalid_request',
-        'parameterValues only accepts city, amount, or stage.',
+        'parameterValues only accepts city, amount, stage, company, owner, or closeDate.',
       );
     }
 
-    if (key === 'amount') {
-      if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) {
-        return refusal(
-          'invalid_request',
-          'parameterValues.amount must be a non-negative number.',
-        );
-      }
+    const parsed = parseSkillParameterValue(key, raw);
 
-      values.amount = raw;
-      continue;
+    if (!parsed.ok) {
+      return refusal('invalid_request', parsed.message);
     }
 
-    if (typeof raw !== 'string' || raw.trim().length === 0 || raw.length > 80) {
-      return refusal(
-        'invalid_request',
-        `parameterValues.${key} must be 1–80 characters.`,
-      );
-    }
-
-    values[key] = raw.trim();
+    values[key] = parsed.value;
   }
 
   return values;
 }
-
-const SKILL_PARAMETER_LIMIT = 3;
 
 function parseChoices(
   value: unknown,

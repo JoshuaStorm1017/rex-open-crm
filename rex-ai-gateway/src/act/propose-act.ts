@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
+import { domainHostKey } from '../twenty/map-to-twenty-payload';
 import type {
   CreatedRecord,
   TwentyCrmClient,
@@ -32,7 +33,12 @@ import {
   type AudienceLoad,
 } from './permissions';
 import { answerReads, isReadTool } from './answer-reads';
-import { captureToTools, resolveCaptureText } from './capture-text';
+import {
+  resolveCaptureText,
+  splitCardBlocks,
+  toolsFromCardText,
+} from './capture-text';
+import { linkPeopleToExistingCompany } from './link-existing-company';
 import { createsFromSlots } from './preview-creates';
 import { fillSkillParameters } from './skill-parameters';
 import { describeTool, partialsForRole, summarizeLines } from './describe-tool';
@@ -109,6 +115,17 @@ export async function proposeAct(
     return openRecord;
   }
 
+  if (parsed.proposalId && parsed.linkCompanyId) {
+    return applyCompanyLink(
+      client,
+      parsed.workspaceId,
+      parsed.proposalId,
+      parsed.linkCompanyId,
+      options,
+      audience,
+    );
+  }
+
   if (parsed.tools && parsed.tools.length > 0) {
     return previewTools(
       client,
@@ -121,14 +138,36 @@ export async function proposeAct(
   }
 
   if (parsed.capture) {
-    const capturedText = await resolveCaptureText(parsed.capture, llm);
+    if (parsed.capture.image && !parsed.capture.text) {
+      const capturedText = await resolveCaptureText(parsed.capture, llm);
 
-    if ('reason' in capturedText) {
-      return capturedText;
+      if ('reason' in capturedText) {
+        return capturedText;
+      }
+
+      const cardCount = splitCardBlocks(capturedText.text).length;
+
+      return {
+        ok: true,
+        workspaceId: parsed.workspaceId,
+        summary:
+          cardCount > 1
+            ? `Read ${cardCount} cards. Edit the lines, then preview. Nothing is created yet.`
+            : 'Read the card. Edit the lines, then preview. Nothing is created yet.',
+        captureReview: { text: capturedText.text, cardCount },
+      };
     }
 
-    const captured = captureToTools(
-      { source: parsed.capture.source, text: capturedText.text },
+    if (!parsed.capture.text) {
+      return refusal(
+        'invalid_request',
+        'capture needs card text, a vCard, or a photo.',
+      );
+    }
+
+    const captured = toolsFromCardText(
+      parsed.capture.source,
+      parsed.capture.text,
       audience,
     );
 
@@ -388,6 +427,88 @@ async function loadOpenRecord(
   }
 }
 
+async function applyCompanyLink(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  proposalId: string,
+  companyId: string,
+  options: ProposeActOptions,
+  audience: AudienceLoad,
+): Promise<PlanResult> {
+  if (!options.proposals || !options.memberId) {
+    return refusal('invalid_request', 'This preview cannot be changed.');
+  }
+
+  const peeked = options.proposals.peek(
+    proposalId,
+    workspaceId,
+    options.memberId,
+  );
+
+  if (!peeked.ok) {
+    return refusal(
+      'not_found',
+      'That preview expired or does not exist. Nothing was written.',
+    );
+  }
+
+  let company: CreatedRecord;
+
+  try {
+    company = await client.getRecord({
+      workspaceId,
+      objectName: 'company',
+      id: companyId,
+    });
+  } catch (error) {
+    if (error instanceof CrmNotFoundError) {
+      return refusal(
+        'not_found',
+        'That company was not found. Nothing was written.',
+        { toolName: 'create_person' },
+      );
+    }
+
+    return upstreamFailure(error, 0);
+  }
+
+  const domain =
+    typeof company.properties.domain === 'string'
+      ? company.properties.domain
+      : typeof company.properties.website === 'string'
+        ? company.properties.website
+        : undefined;
+
+  if (!domain) {
+    return refusal(
+      'invalid_request',
+      'That company has no domain to link. Nothing was written.',
+    );
+  }
+
+  const rewritten = linkPeopleToExistingCompany(
+    peeked.proposal.tools,
+    company.id,
+    domainHostKey(domain),
+  );
+
+  if (!rewritten) {
+    return refusal(
+      'invalid_request',
+      'This preview has no new person to link to that company. Nothing was written.',
+    );
+  }
+
+  return previewTools(
+    client,
+    workspaceId,
+    withoutLiveEtag(rewritten),
+    options,
+    audience,
+    undefined,
+  );
+}
+
 async function previewTools(
   client: TwentyCrmClient,
   workspaceId: string,
@@ -637,7 +758,14 @@ function assignActor(
     return tool;
   }
 
-  if (!actorMemberId) {
+  // The mock member id is not a workspace member uuid. Leave "me" so confirm
+  // still validates. A real session replaces it with that member's id.
+  if (
+    !actorMemberId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      actorMemberId,
+    )
+  ) {
     return tool;
   }
 

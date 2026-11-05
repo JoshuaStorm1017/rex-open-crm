@@ -120,15 +120,17 @@ export async function compensate(
         continue;
       }
 
+      const currentValue = fieldValue(current.properties, effect.field);
+
+      // The loser of a stolen undo may already have written this value back.
+      // Dropping it lets the winner finish the other effects and clear the ticket.
+      if (valuesEqual(currentValue, effect.previous)) {
+        continue;
+      }
+
       // A later effect in this same undo already rewrote the row, so its etag moved.
       // Any other etag means the field may no longer hold the value this act wrote.
       if (!reversedInThisPass.has(key) && current.etag !== effect.etag) {
-        const currentValue = Object.prototype.hasOwnProperty.call(
-          current.properties,
-          effect.field,
-        )
-          ? current.properties[effect.field]
-          : undefined;
         // A newer undo on this row moves the etag while leaving this act's value in place.
         if (effect.written === undefined || currentValue !== effect.written) {
           remaining.push({ index, id: effect.id, reason: 'conflict' });
@@ -221,6 +223,34 @@ async function readCreatedEtag(
 
     throw error;
   }
+}
+
+function fieldValue(
+  properties: Record<string, string | number>,
+  field: string,
+): string | number | null {
+  if (!Object.prototype.hasOwnProperty.call(properties, field)) {
+    return null;
+  }
+
+  const value = properties[field];
+
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    return value;
+  }
+
+  return null;
+}
+
+function valuesEqual(
+  current: string | number | null,
+  previous: string | number | null,
+): boolean {
+  return current === previous;
 }
 
 function isWorkspaceObject(objectName: string): objectName is TwentyObjectName {

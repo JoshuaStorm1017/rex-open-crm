@@ -51,6 +51,11 @@ export type ProposalChange = {
   summary: string;
 };
 
+export type ProposalCompanyLink = {
+  companyId: string;
+  label: string;
+};
+
 export type ProposalWarning = {
   code:
     | 'duplicate_email'
@@ -58,12 +63,29 @@ export type ProposalWarning = {
     | 'duplicate_domain'
     | 'amount_mismatch';
   message: string;
+  link?: ProposalCompanyLink;
+};
+
+export const PROPOSAL_CREATE_FIELDS = [
+  'name',
+  'email',
+  'domain',
+  'amount',
+  'stage',
+] as const;
+
+export type ProposalCreateField = (typeof PROPOSAL_CREATE_FIELDS)[number];
+
+export type ProposalCreateCell = {
+  field: ProposalCreateField;
+  value: string;
 };
 
 export type ProposalCreate = {
-  objectName: 'person' | 'company';
+  objectName: 'person' | 'company' | 'opportunity';
   label: string;
   summary: string;
+  cells: ProposalCreateCell[];
 };
 
 export type PlanAnswerRecord = {
@@ -73,15 +95,33 @@ export type PlanAnswerRecord = {
   detail?: string;
 };
 
+export type FailedRead = {
+  tool: string;
+  message: string;
+  retry: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
+
 export type PlanAnswer = {
   summary: string;
   records: PlanAnswerRecord[];
+  failedReads?: FailedRead[];
 };
 
 export type ReadEvent = {
   tool: string;
   summary: string;
   records: PlanAnswerRecord[];
+  failed?: boolean;
+  message?: string;
+  retry?: FailedRead['retry'];
+};
+
+export type CaptureReview = {
+  text: string;
+  cardCount: number;
 };
 
 export type ActRefusal = {
@@ -235,6 +275,7 @@ export type PlanSuccess = {
   proposal?: PlanProposal;
   answer?: PlanAnswer;
   parameters?: SkillParameterPrompt[];
+  captureReview?: CaptureReview;
 };
 
 export type PlanResult = PlanSuccess | ActRefusal | ActUpstreamFailure;
