@@ -40,6 +40,12 @@ export async function compensate(
         if (effect.etag && !reversedInThisPass.has(key)) {
           const current = await readCreatedEtag(client, workspaceId, effect);
 
+          // The etag read yields. A newer act saved in that gap must not be followed by a delete.
+          if (!shouldContinue()) {
+            remaining.push({ index, id: effect.id, reason: 'superseded' });
+            continue;
+          }
+
           if (current === 'missing') {
             continue;
           }

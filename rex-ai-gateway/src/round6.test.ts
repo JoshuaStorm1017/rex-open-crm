@@ -79,6 +79,115 @@ describe('field locks on create', () => {
     expect(client.created.some((record) => record.properties.firstName === 'Ada')).toBe(true);
   });
 
+  it('refuses a locked company or point of contact on create', async () => {
+    const client = createMockTwentyCrmClient();
+    const company = await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme' });
+    const person = await client.createPerson({
+      workspaceId: 'ws_demo',
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+    });
+    client.loadCapabilities = async () => ({
+      objects: [
+        {
+          objectName: 'person',
+          canRead: true,
+          canUpdate: true,
+          canSoftDelete: false,
+          fieldPermissions: [
+            { name: 'firstName', canUpdate: true },
+            { name: 'lastName', canUpdate: true },
+            { name: 'email', canUpdate: true },
+            { name: 'jobTitle', canUpdate: true },
+            { name: 'phone', canUpdate: true },
+            { name: 'linkedin', canUpdate: true },
+            { name: 'companyId', canUpdate: false },
+          ],
+        },
+        {
+          objectName: 'opportunity',
+          canRead: true,
+          canUpdate: true,
+          canSoftDelete: false,
+          fieldPermissions: [
+            { name: 'name', canUpdate: true },
+            { name: 'stage', canUpdate: true },
+            { name: 'amount', canUpdate: true },
+            { name: 'closeDate', canUpdate: true },
+            { name: 'companyId', canUpdate: true },
+            { name: 'pointOfContactId', canUpdate: false },
+          ],
+        },
+      ],
+    });
+    const gateway = await openGateway(client);
+    const catalog: unknown = await (
+      await fetch(`${gateway.url}/v1/ai/tools`, { headers: { 'x-rex-member': 'ada@analytical.example' } })
+    ).json();
+    const personTool = findTool(catalog, 'create_person');
+    const dealTool = findTool(catalog, 'create_opportunity');
+    const personProperties = toolProperties(personTool);
+    const dealProperties = toolProperties(dealTool);
+    const linkedPerson = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_person',
+          args: { firstName: 'Grace', lastName: 'Hopper', companyId: company.id },
+        },
+      ],
+    });
+    const linkedDeal = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Pilot', stage: 'NEW', pointOfContactId: person.id },
+        },
+      ],
+    });
+    const plainDeal = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Pilot', stage: 'NEW', companyId: company.id },
+        },
+      ],
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(plainDeal.payload),
+    });
+
+    expect(personProperties).not.toHaveProperty('companyId');
+    expect(dealProperties).not.toHaveProperty('pointOfContactId');
+    expect(dealProperties).toHaveProperty('companyId');
+    expect(linkedPerson.payload).toMatchObject({
+      refused: true,
+      reason: 'forbidden',
+      message: expect.stringContaining('companyId'),
+    });
+    expect(linkedDeal.payload).toMatchObject({
+      refused: true,
+      reason: 'forbidden',
+      message: expect.stringContaining('pointOfContactId'),
+    });
+    expect(acted.payload).toMatchObject({ ok: true });
+    expect(client.created.some((record) => record.properties.firstName === 'Grace')).toBe(false);
+    expect(
+      client.created.some(
+        (record) => record.objectName === 'opportunity' && record.properties.pointOfContactId === person.id,
+      ),
+    ).toBe(false);
+    expect(
+      client.created.some(
+        (record) => record.objectName === 'opportunity' && record.properties.companyId === company.id,
+      ),
+    ).toBe(true);
+  });
+
   it('fails closed when create field permissions cannot be read', async () => {
     const client = createMockTwentyCrmClient();
     client.loadCapabilities = async () => ({
@@ -353,6 +462,43 @@ describe('undo race and chained archive', () => {
     expect(base.created.find((record) => record.id === person.id)?.properties.jobTitle).toBe('Manager');
   });
 
+  it('does not delete a created record when a newer act lands during undo', async () => {
+    const base = createMockTwentyCrmClient();
+    let gateway: RunningGateway | undefined;
+    let armed = false;
+    const client = wrapGetRecord(base, async () => {
+      if (!armed || !gateway) {
+        return;
+      }
+
+      armed = false;
+      await confirmTool(gateway, {
+        name: 'create_company',
+        args: { name: 'Other Labs' },
+      });
+    });
+    gateway = await openGateway(client);
+    const first = await confirmTool(gateway, {
+      name: 'create_company',
+      args: { name: 'Acme' },
+    });
+    const createdId = recordIdFrom(first.payload);
+    armed = true;
+    const undone = await postJson(gateway, '/v1/ai/undo', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      undoId: undoIdFrom(first.payload),
+    });
+
+    expect(undone.payload).toMatchObject({
+      refused: true,
+      reason: 'precondition_failed',
+      message: expect.stringContaining('newer change'),
+    });
+    expect(base.created.some((record) => record.id === createdId && record.properties.name === 'Acme')).toBe(true);
+    expect(base.created.some((record) => record.properties.name === 'Other Labs')).toBe(true);
+  });
+
   it('refuses a write chained after an archive and restores the archive', async () => {
     const client = createMockTwentyCrmClient();
     const company = await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme', city: 'Lisbon' });
@@ -457,6 +603,20 @@ function proposalId(payload: unknown): string {
   throw new Error('Missing proposal id');
 }
 
+function recordIdFrom(payload: unknown): string {
+  if (
+    isRecord(payload) &&
+    Array.isArray(payload.results) &&
+    isRecord(payload.results[0]) &&
+    isRecord(payload.results[0].record) &&
+    typeof payload.results[0].record.id === 'string'
+  ) {
+    return payload.results[0].record.id;
+  }
+
+  throw new Error('Missing created record id');
+}
+
 function undoIdFrom(payload: unknown): string {
   if (isRecord(payload) && isRecord(payload.undo) && typeof payload.undo.id === 'string') {
     return payload.undo.id;
@@ -479,6 +639,14 @@ function toolNames(catalog: unknown): string[] {
   }
 
   return catalog.tools.flatMap((tool) => (isRecord(tool) && typeof tool.name === 'string' ? [tool.name] : []));
+}
+
+function toolProperties(tool: unknown): Record<string, unknown> {
+  if (isRecord(tool) && isRecord(tool.inputSchema) && isRecord(tool.inputSchema.properties)) {
+    return tool.inputSchema.properties;
+  }
+
+  return {};
 }
 
 function findTool(catalog: unknown, name: string): unknown {

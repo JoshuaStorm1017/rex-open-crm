@@ -227,6 +227,7 @@ function fieldsOnPerson(input: {
   jobTitle?: string;
   phone?: string;
   linkedin?: string;
+  companyId?: string;
 }): string[] {
   return presentFields(
     [
@@ -236,6 +237,7 @@ function fieldsOnPerson(input: {
       ['jobTitle', input.jobTitle],
       ['phone', input.phone],
       ['linkedin', input.linkedin],
+      ['companyId', input.companyId],
     ],
   );
 }
@@ -261,12 +263,16 @@ function fieldsOnOpportunity(input: {
   stage: string;
   amount?: number;
   closeDate?: string;
+  companyId?: string;
+  pointOfContactId?: string;
 }): string[] {
   return presentFields([
     ['name', input.name],
     ['stage', input.stage],
     ['amount', input.amount],
     ['closeDate', input.closeDate],
+    ['companyId', input.companyId],
+    ['pointOfContactId', input.pointOfContactId],
   ]);
 }
 

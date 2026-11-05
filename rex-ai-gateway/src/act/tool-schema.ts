@@ -338,7 +338,7 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
   return tool;
 }
 
-const RELATION_CREATE_KEYS = new Set(['companyId', 'pointOfContactId', 'currencyCode']);
+const RELATION_CREATE_KEYS = new Set(['companyId', 'pointOfContactId']);
 
 function narrowCreateFields(tool: ToolSchema, audience: ToolAudience): ToolSchema {
   const objectName =
@@ -347,7 +347,16 @@ function narrowCreateFields(tool: ToolSchema, audience: ToolAudience): ToolSchem
   const properties = isProperties(tool.inputSchema.properties) ? { ...tool.inputSchema.properties } : {};
 
   for (const key of Object.keys(properties)) {
+    // currencyCode is stored inside amount. The amount lock covers it.
+    if (key === 'currencyCode') {
+      continue;
+    }
+
     if (RELATION_CREATE_KEYS.has(key)) {
+      if (!relationFieldAllowed(audience, objectName, key)) {
+        delete properties[key];
+      }
+
       continue;
     }
 
@@ -359,6 +368,28 @@ function narrowCreateFields(tool: ToolSchema, audience: ToolAudience): ToolSchem
   }
 
   return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
+}
+
+function relationFieldAllowed(
+  audience: ToolAudience,
+  objectName: UpdatableObjectName,
+  field: string,
+): boolean {
+  if (audience.fieldPermissionsUnreadable?.has(objectName)) {
+    return false;
+  }
+
+  if (audience.unreadableFields?.get(objectName)?.has(field)) {
+    return false;
+  }
+
+  const writable = audience.writableFields?.get(objectName);
+
+  if (!writable) {
+    return true;
+  }
+
+  return writable.has(field);
 }
 
 function requiredFieldsAllowed(

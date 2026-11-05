@@ -24,7 +24,7 @@ import {
   toUpdatePayload,
   updateManyName,
 } from './map-to-twenty-payload';
-import { FIELD_METADATA_NAMES } from './field-permission-names';
+import { CREATE_RELATION_FIELD_NAMES, FIELD_METADATA_NAMES } from './field-permission-names';
 import { activityRecordFromTwenty, crmRecordFromTwenty, labelFromProperties, projectField, readEtag } from './record-fields';
 import { UPDATABLE_FIELDS, isUpdatableObjectName } from '../act/writable-fields';
 import {
@@ -927,7 +927,7 @@ function fieldPermissionsFor(
 
   const fields: FieldCapability[] = [];
 
-  for (const fieldName of UPDATABLE_FIELDS[objectName]) {
+  for (const fieldName of [...UPDATABLE_FIELDS[objectName], ...CREATE_RELATION_FIELD_NAMES[objectName]]) {
     const metadataNames = FIELD_METADATA_NAMES[objectName][fieldName] ?? [fieldName];
     let canUpdate = true;
     let unreadable = false;

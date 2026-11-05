@@ -9,6 +9,7 @@ export const FIELD_METADATA_NAMES: Record<UpdatableObjectName, Record<string, re
     jobTitle: ['jobTitle'],
     phone: ['phones'],
     linkedin: ['linkedinLink'],
+    companyId: ['company'],
   },
   company: {
     name: ['name'],
@@ -25,5 +26,14 @@ export const FIELD_METADATA_NAMES: Record<UpdatableObjectName, Record<string, re
     amount: ['amount'],
     closeDate: ['closeDate'],
     owner: ['owner'],
+    companyId: ['company'],
+    pointOfContactId: ['pointOfContact'],
   },
 };
+
+// Relation ids are create-only. update_record does not accept them, so they stay out of UPDATABLE_FIELDS.
+export const CREATE_RELATION_FIELD_NAMES = {
+  person: ['companyId'],
+  company: [],
+  opportunity: ['companyId', 'pointOfContactId'],
+} as const satisfies Record<UpdatableObjectName, readonly string[]>;

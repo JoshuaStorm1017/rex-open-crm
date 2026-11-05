@@ -640,6 +640,8 @@ describe('createHttpTwentyCrmClient', () => {
                     { id: 'field_amount', name: 'amount' },
                     { id: 'field_close', name: 'closeDate' },
                     { id: 'field_opp_owner', name: 'owner' },
+                    { id: 'field_opp_company', name: 'company' },
+                    { id: 'field_poc', name: 'pointOfContact' },
                   ],
                 },
               },
@@ -653,6 +655,7 @@ describe('createHttpTwentyCrmClient', () => {
                     { id: 'field_job', name: 'jobTitle' },
                     { id: 'field_phones', name: 'phones' },
                     { id: 'field_person_linkedin', name: 'linkedinLink' },
+                    { id: 'field_company', name: 'company' },
                   ],
                 },
               },
@@ -686,6 +689,7 @@ describe('createHttpTwentyCrmClient', () => {
                   canSoftDeleteObjectRecords: true,
                   restrictedFields: {
                     field_emails: { canRead: false, canUpdate: false },
+                    field_company: { canRead: true, canUpdate: false },
                   },
                 },
               ],
@@ -720,9 +724,18 @@ describe('createHttpTwentyCrmClient', () => {
       expect.arrayContaining([expect.objectContaining({ name: 'accountOwner', unreadable: true })]),
     );
     expect(opportunityFields).toEqual(
-      expect.arrayContaining([{ name: 'owner', canUpdate: false }]),
+      expect.arrayContaining([
+        { name: 'owner', canUpdate: false },
+        { name: 'companyId', canUpdate: true },
+        { name: 'pointOfContactId', canUpdate: true },
+      ]),
     );
-    expect(personFields).toEqual(expect.arrayContaining([{ name: 'email', canUpdate: false }]));
+    expect(personFields).toEqual(
+      expect.arrayContaining([
+        { name: 'email', canUpdate: false },
+        { name: 'companyId', canUpdate: false },
+      ]),
+    );
     expect(personFields).toEqual(
       expect.arrayContaining([{ name: 'jobTitle', canUpdate: true }]),
     );
@@ -797,6 +810,25 @@ describe('createHttpTwentyCrmClient', () => {
         objectName: 'company',
         id: 'company_row',
         ifMatch: 'chained',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'city',
+        value: 'Lisbon',
+        ifMatch: 'created',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.clearRecordField({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'city',
+        ifMatch: 'created',
       }),
     ).rejects.toBeInstanceOf(CrmPreconditionError);
     expect(twenty.captured).toHaveLength(0);
