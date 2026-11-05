@@ -145,9 +145,9 @@ function companyLinkOffer(
 
     const companyId = slot.tool.input.companyId;
 
-    if (!companyId) {
-      person = true;
-    } else if (
+    // An unlinked person is not "the new person" for this company.
+    if (
+      companyId &&
       /^\$\d+$/.test(companyId) &&
       removed.has(Number(companyId.slice(1)))
     ) {

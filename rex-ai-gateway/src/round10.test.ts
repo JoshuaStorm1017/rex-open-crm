@@ -429,6 +429,183 @@ describe('link the company already on file', () => {
       client.created.find((record) => record.objectName === 'person')
         ?.properties.companyId,
     ).toBe(existing.id);
+    expect(JSON.stringify(linked.payload)).toContain(
+      'Linked to the company already on file.',
+    );
+  });
+
+  it('does not attach a person or opportunity that was not tied to the new company', async () => {
+    const client = createMockTwentyCrmClient();
+    const existing = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Analytical Engines',
+      domain: 'analytical.example',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_company',
+          args: { name: 'Northwind', domain: 'analytical.example' },
+        },
+        {
+          name: 'create_person',
+          args: {
+            firstName: 'Ada',
+            lastName: 'Lovelace',
+            companyId: '$0',
+          },
+        },
+        {
+          name: 'create_person',
+          args: { firstName: 'Grace', lastName: 'Hopper' },
+        },
+        {
+          name: 'create_opportunity',
+          args: { name: 'Pilot', companyId: '$0' },
+        },
+        {
+          name: 'create_opportunity',
+          args: { name: 'Unlinked deal' },
+        },
+      ],
+    });
+    const linked = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      proposalId: proposalId(planned.payload),
+      linkCompanyId: existing.id,
+    });
+    const tools = proposalTools(linked.payload);
+    const grace = tools.find((tool) => tool.args.firstName === 'Grace');
+    const unlinkedDeal = tools.find(
+      (tool) => tool.args.name === 'Unlinked deal',
+    );
+
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'create_person',
+      'create_person',
+      'create_opportunity',
+      'create_opportunity',
+    ]);
+    expect(
+      tools.find((tool) => tool.args.firstName === 'Ada')?.args.companyId,
+    ).toBe(existing.id);
+    expect(grace?.args.companyId).toBeUndefined();
+    expect(
+      tools.find((tool) => tool.args.name === 'Pilot')?.args.companyId,
+    ).toBe(existing.id);
+    expect(unlinkedDeal?.args.companyId).toBeUndefined();
+    expect(JSON.stringify(linked.payload)).toContain(
+      'Create person Grace Hopper.',
+    );
+    expect(JSON.stringify(linked.payload)).not.toContain(
+      'Create person Grace Hopper. Linked to the company already on file.',
+    );
+  });
+
+  it('does not offer a link when nobody points at the new company', async () => {
+    const client = createMockTwentyCrmClient();
+    await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Analytical Engines',
+      domain: 'analytical.example',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_company',
+          args: { name: 'Northwind', domain: 'analytical.example' },
+        },
+        {
+          name: 'create_person',
+          args: { firstName: 'Grace', lastName: 'Hopper' },
+        },
+      ],
+    });
+    const warning = proposalWarnings(planned.payload)[0];
+
+    expect(warning).toMatchObject({ code: 'duplicate_domain' });
+    expect(warning).not.toHaveProperty('link');
+  });
+
+  it('refuses the link when the person company field is locked', async () => {
+    const client = createMockTwentyCrmClient();
+    const existing = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Analytical Engines',
+      domain: 'analytical.example',
+    });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_company',
+          args: { name: 'Northwind', domain: 'analytical.example' },
+        },
+        {
+          name: 'create_person',
+          args: {
+            firstName: 'Ada',
+            lastName: 'Lovelace',
+            companyId: '$0',
+          },
+        },
+      ],
+    });
+
+    client.loadCapabilities = async () => ({
+      objects: [
+        {
+          objectName: 'person',
+          canRead: true,
+          canUpdate: true,
+          canCreate: true,
+          canSoftDelete: false,
+          fieldPermissions: [
+            { name: 'firstName', canUpdate: true },
+            { name: 'lastName', canUpdate: true },
+            { name: 'companyId', canUpdate: false },
+          ],
+        },
+        {
+          objectName: 'company',
+          canRead: true,
+          canUpdate: true,
+          canCreate: true,
+          canSoftDelete: false,
+          fieldPermissions: [{ name: 'name', canUpdate: true }],
+        },
+      ],
+    });
+
+    const linked = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      proposalId: proposalId(planned.payload),
+      linkCompanyId: existing.id,
+    });
+
+    client.loadCapabilities = undefined;
+    const reloaded = await postJson(gateway, '/v1/ai/repropose', {
+      workspaceId: 'ws_demo',
+      proposalId: proposalId(planned.payload),
+    });
+
+    expect(linked.payload).toMatchObject({
+      refused: true,
+      reason: 'forbidden',
+    });
+    expect(linked.payload).not.toHaveProperty('proposal');
+    expect(proposalTools(reloaded.payload).map((tool) => tool.name)).toEqual([
+      'create_company',
+      'create_person',
+    ]);
+    expect(
+      client.created.filter((record) => record.objectName === 'person'),
+    ).toHaveLength(0);
   });
 });
 
@@ -738,6 +915,20 @@ function proposalCreates(payload: unknown): unknown {
   }
 
   return [];
+}
+
+function proposalWarnings(payload: unknown): Array<Record<string, unknown>> {
+  if (
+    !isRecord(payload) ||
+    !isRecord(payload.proposal) ||
+    !Array.isArray(payload.proposal.warnings)
+  ) {
+    return [];
+  }
+
+  return payload.proposal.warnings.flatMap((warning) =>
+    isRecord(warning) ? [warning] : [],
+  );
 }
 
 function proposalTools(

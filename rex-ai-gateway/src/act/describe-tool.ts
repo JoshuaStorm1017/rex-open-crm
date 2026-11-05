@@ -11,11 +11,18 @@ export function describeTool(
   options?: { disambiguate?: boolean },
 ): ProposalLine {
   switch (tool.name) {
-    case 'create_person':
+    case 'create_person': {
+      // A concrete companyId is not in the name line. Confirm has to say it.
+      const linked =
+        tool.input.companyId && !tool.input.companyId.startsWith('$')
+          ? ' Linked to the company already on file.'
+          : '';
+
       return {
         tool: tool.name,
-        summary: `Create person ${tool.input.firstName} ${tool.input.lastName}.`,
+        summary: `Create person ${tool.input.firstName} ${tool.input.lastName}.${linked}`,
       };
+    }
     case 'create_company':
       return {
         tool: tool.name,
@@ -26,11 +33,16 @@ export function describeTool(
         tool.input.amount === undefined
           ? ''
           : ` for ${formatMajor(tool.input.amount, tool.input.currencyCode ?? 'USD')}`;
-      const linked =
+      const linkedToCreated =
         tool.input.companyId?.startsWith('$') ||
         tool.input.pointOfContactId?.startsWith('$')
           ? ' Linked to the records created in this step.'
           : '';
+      const linkedToCompany =
+        tool.input.companyId && !tool.input.companyId.startsWith('$')
+          ? ' Linked to the company already on file.'
+          : '';
+      const linked = `${linkedToCreated}${linkedToCompany}`;
 
       return {
         tool: tool.name,

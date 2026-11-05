@@ -3,9 +3,9 @@ import type { ToolCall } from './types';
 
 const TOOL_REF = /^\$(\d+)$/;
 
-// Drops the new company and points the new person at the company already on file.
-// Returns undefined when the preview does not have that person, so the caller
-// leaves the stored proposal untouched.
+// Drops the new company and retargets companyId refs that pointed at it.
+// A person with no company stays unlinked. Returns undefined when no person
+// pointed at the dropped company, so the caller leaves the stored proposal.
 export function linkPeopleToExistingCompany(
   tools: ToolCall[],
   companyId: string,
@@ -79,13 +79,6 @@ export function linkPeopleToExistingCompany(
       args[key] = `$${mapped}`;
     }
 
-    if (
-      tool.name === 'create_person' &&
-      (args.companyId === undefined || args.companyId === '')
-    ) {
-      args.companyId = companyId;
-    }
-
     rewritten.push({ name: tool.name, args });
   }
 
@@ -99,12 +92,7 @@ function hasPersonToLink(tools: ToolCall[], removed: Set<number>): boolean {
     }
 
     const companyId = stringArg(tool, 'companyId');
-
-    if (!companyId) {
-      return true;
-    }
-
-    const match = TOOL_REF.exec(companyId);
+    const match = companyId ? TOOL_REF.exec(companyId) : undefined;
 
     return match ? removed.has(Number(match[1])) : false;
   });
