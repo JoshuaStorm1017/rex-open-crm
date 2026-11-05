@@ -3,15 +3,17 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type { PendingChoice } from '../act/pending-choice';
-import type { ToolCall } from '../act/types';
+import type { ActEffect, ToolCall } from '../act/types';
 import { AuditLog, type AuditEntry } from '../audit/audit-log';
 import { IdempotencyStore, type IdempotentResponse } from '../http/idempotency-store';
 import { ProposalStore, type ClaimResult, type StoredProposal } from '../http/proposal-store';
+import { UndoStore, type TakeUndoResult, type UndoTicket } from '../http/undo-store';
 
 export type GatewayState = {
   proposals: ProposalStore;
   idempotency: IdempotencyStore;
   audit: AuditLog;
+  undos: UndoStore;
   close: () => void;
 };
 
@@ -42,6 +44,13 @@ export function openGatewayState(filename: string): GatewayState {
       body_json TEXT NOT NULL,
       PRIMARY KEY (member_id, key)
     );
+    CREATE TABLE IF NOT EXISTS undo_tickets (
+      member_id TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      effects_json TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
       at TEXT NOT NULL,
@@ -63,6 +72,7 @@ export function openGatewayState(filename: string): GatewayState {
     proposals: new SqliteProposalStore(database, () => restrictStateFiles(filename)),
     idempotency: new SqliteIdempotencyStore(database, () => restrictStateFiles(filename)),
     audit: new SqliteAuditLog(database, () => restrictStateFiles(filename)),
+    undos: new SqliteUndoStore(database, () => restrictStateFiles(filename)),
     close: () => {
       database.close();
       restrictStateFiles(filename);
@@ -196,6 +206,106 @@ class SqliteProposalStore extends ProposalStore {
       tools: tools as ToolCall[],
       ...(pendingChoice ? { pendingChoice } : {}),
       expiresAt: row.expires_at,
+    };
+  }
+}
+
+class SqliteUndoStore extends UndoStore {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly restrict: () => void,
+  ) {
+    super();
+  }
+
+  override save(
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): UndoTicket | undefined {
+    const ticket = this.createTicket(memberId, workspaceId, effects);
+
+    if (!ticket) {
+      return undefined;
+    }
+
+    this.database
+      .prepare(
+        `INSERT INTO undo_tickets (member_id, id, workspace_id, summary, effects_json)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(member_id) DO UPDATE SET
+           id = excluded.id,
+           workspace_id = excluded.workspace_id,
+           summary = excluded.summary,
+           effects_json = excluded.effects_json`,
+      )
+      .run(ticket.memberId, ticket.id, ticket.workspaceId, ticket.summary, JSON.stringify(ticket.effects));
+    this.restrict();
+
+    return ticket;
+  }
+
+  override peek(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+    return this.readTicket(id, memberId, workspaceId);
+  }
+
+  override take(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+    const result = this.readTicket(id, memberId, workspaceId);
+
+    if (result.ok) {
+      this.database.prepare('DELETE FROM undo_tickets WHERE member_id = ?').run(memberId);
+      this.restrict();
+    }
+
+    return result;
+  }
+
+  private createTicket(
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): UndoTicket | undefined {
+    return super.save(memberId, workspaceId, effects);
+  }
+
+  private readTicket(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+    const row = this.database
+      .prepare(
+        'SELECT id, workspace_id, summary, effects_json FROM undo_tickets WHERE member_id = ?',
+      )
+      .get(memberId) as
+      | { id: string; workspace_id: string; summary: string; effects_json: string }
+      | undefined;
+
+    if (!row || row.id !== id) {
+      return { ok: false, reason: 'missing' };
+    }
+
+    if (row.workspace_id !== workspaceId) {
+      return { ok: false, reason: 'workspace' };
+    }
+
+    let effects: unknown;
+
+    try {
+      effects = JSON.parse(row.effects_json);
+    } catch {
+      return { ok: false, reason: 'missing' };
+    }
+
+    if (!Array.isArray(effects)) {
+      return { ok: false, reason: 'missing' };
+    }
+
+    return {
+      ok: true,
+      ticket: {
+        id: row.id,
+        memberId,
+        workspaceId: row.workspace_id,
+        summary: row.summary,
+        effects: effects as ActEffect[],
+      },
     };
   }
 }

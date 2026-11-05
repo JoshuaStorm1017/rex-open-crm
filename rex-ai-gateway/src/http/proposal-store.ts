@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { CREATE_NEW_CHOICE_ID } from '../act/create-new-choice';
 import type { PendingChoice } from '../act/pending-choice';
 import type { ToolCall } from '../act/types';
 
@@ -103,6 +104,21 @@ export class ProposalStore {
 
     if (!candidate) {
       return { ok: false, reason: 'choice' };
+    }
+
+    if (candidate.id === CREATE_NEW_CHOICE_ID) {
+      if (!proposal.pendingChoice.createTools || proposal.pendingChoice.createTools.length === 0) {
+        return { ok: false, reason: 'choice' };
+      }
+
+      return {
+        ok: true,
+        proposal: {
+          ...proposal,
+          tools: proposal.pendingChoice.createTools,
+          pendingChoice: undefined,
+        },
+      };
     }
 
     return {

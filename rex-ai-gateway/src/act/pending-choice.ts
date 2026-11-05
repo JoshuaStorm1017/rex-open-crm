@@ -1,3 +1,5 @@
+import type { ToolCall } from './types';
+
 export type PendingChoice = {
   kind: 'update' | 'note';
   objectName: 'person' | 'company' | 'opportunity';
@@ -5,9 +7,11 @@ export type PendingChoice = {
   value: string | number;
   title?: string;
   body: string;
+  query?: string;
   candidates: Array<{
     id: string;
     label: string;
     etag: string;
   }>;
+  createTools?: ToolCall[];
 };

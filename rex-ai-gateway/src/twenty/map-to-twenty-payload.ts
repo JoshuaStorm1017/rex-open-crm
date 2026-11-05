@@ -123,6 +123,71 @@ export function updateManyName(objectName: TwentyObjectName): string {
   return `update${plural.charAt(0).toUpperCase()}${plural.slice(1)}`;
 }
 
+export function toClearPayload(
+  objectName: TwentyObjectName,
+  field: string,
+  current: Record<string, string | number>,
+  composites?: RecordComposites,
+): Record<string, unknown> {
+  if (objectName === 'person' && (field === 'firstName' || field === 'lastName')) {
+    return {
+      name: {
+        firstName: field === 'firstName' ? '' : (current.firstName ?? ''),
+        lastName: field === 'lastName' ? '' : (current.lastName ?? ''),
+      },
+    };
+  }
+
+  if (objectName === 'person' && field === 'email') {
+    return {
+      emails: {
+        primaryEmail: '',
+        additionalEmails: composites?.additionalEmails ?? [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && field === 'domain') {
+    return {
+      domainName: {
+        primaryLinkUrl: '',
+        primaryLinkLabel: composites?.primaryLinkLabel ?? '',
+        secondaryLinks: composites?.secondaryLinks ?? [],
+      },
+    };
+  }
+
+  if (objectName === 'person' && field === 'phone') {
+    return {
+      phones: {
+        primaryPhoneNumber: '',
+        primaryPhoneCountryCode: '',
+        primaryPhoneCallingCode: '',
+        additionalPhones: [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && field === 'accountOwner') {
+    return { accountOwnerId: null };
+  }
+
+  if (objectName === 'opportunity' && field === 'owner') {
+    return { ownerId: null };
+  }
+
+  if (objectName === 'opportunity' && field === 'amount') {
+    return {
+      amount: {
+        amountMicros: null,
+        currencyCode: typeof current.currencyCode === 'string' ? current.currencyCode : 'USD',
+      },
+    };
+  }
+
+  return { [field]: null };
+}
+
 export function toUpdatePayload(
   objectName: TwentyObjectName,
   field: string,

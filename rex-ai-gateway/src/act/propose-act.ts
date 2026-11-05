@@ -4,14 +4,18 @@ import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
 import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
 import type { ProposalStore } from '../http/proposal-store';
 import type { LlmProvider } from '../llm/llm-provider';
+import { bindOpenRecord } from './bind-open-record';
+import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, matchLabel } from './create-new-choice';
 import type { PendingChoice } from './pending-choice';
+import { assertToolPermitted, catalogForAudience, loadAudience, type AudienceLoad } from './permissions';
 import { describeTool, summarizeLines } from './describe-tool';
-import { parseGatewayRequest } from './parse-request';
+import { parseGatewayRequest, type OpenRecordContext } from './parse-request';
 import {
   MAX_TOOLS_PER_REQUEST,
   refusal,
   upstreamFailure,
   type ActRefusal,
+  type ActUpstreamFailure,
   type PlanProposal,
   type PlanResult,
   type ProposalLine,
@@ -44,8 +48,21 @@ export async function proposeAct(
     return workspaceRefusal;
   }
 
+  const audience = await loadAudience(client);
+  const catalog = catalogForAudience(audience);
+
+  if ('refused' in catalog) {
+    return catalog;
+  }
+
+  const openRecord = await loadOpenRecord(client, parsed.workspaceId, parsed.openRecord, parsed);
+
+  if (openRecord && 'refused' in openRecord) {
+    return openRecord;
+  }
+
   if (parsed.tools && parsed.tools.length > 0) {
-  return previewTools(client, parsed.workspaceId, parsed.tools, options);
+    return previewTools(client, parsed.workspaceId, parsed.tools, options, audience, openRecord);
   }
 
   if (parsed.intent === undefined || parsed.intent.trim().length === 0) {
@@ -59,6 +76,8 @@ export async function proposeAct(
       intent: parsed.intent,
       workspaceId: parsed.workspaceId,
       client,
+      catalog,
+      ...(openRecord ? { openRecord: { objectName: openRecord.objectName, label: openRecord.label } } : {}),
     });
   } catch (error) {
     return upstreamFailure(error, 0);
@@ -79,7 +98,53 @@ export async function proposeAct(
     );
   }
 
-  return previewTools(client, parsed.workspaceId, planned.tools, options);
+  return previewTools(client, parsed.workspaceId, planned.tools, options, audience, openRecord);
+}
+
+async function loadOpenRecord(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  openRecord: OpenRecordContext | undefined,
+  parsed: { tools?: unknown[]; intent?: string },
+): Promise<
+  (OpenRecordContext & { label: string }) | undefined | ActRefusal | ActUpstreamFailure
+> {
+  if (!openRecord) {
+    return undefined;
+  }
+
+  const toolsUseOpenRecord =
+    Array.isArray(parsed.tools) &&
+    parsed.tools.some(
+      (tool) =>
+        typeof tool === 'object' &&
+        tool !== null &&
+        'args' in tool &&
+        typeof (tool as { args?: unknown }).args === 'object' &&
+        (tool as { args?: { recordRef?: unknown } }).args?.recordRef === 'open',
+    );
+  const intentOnly = parsed.intent !== undefined && (!parsed.tools || parsed.tools.length === 0);
+  const needed = toolsUseOpenRecord || intentOnly;
+
+  if (!needed) {
+    return undefined;
+  }
+
+  try {
+    const record = await client.getRecord({
+      workspaceId,
+      objectName: openRecord.objectName,
+      id: openRecord.recordId,
+    });
+
+    return { ...openRecord, label: record.label };
+  } catch (error) {
+    if (error instanceof CrmNotFoundError) {
+      return refusal('not_found', 'The open record was not found.', { toolName: 'update_record' });
+    }
+
+    return upstreamFailure(error, 0);
+  }
 }
 
 async function previewTools(
@@ -87,6 +152,8 @@ async function previewTools(
   workspaceId: string,
   tools: ToolCall[],
   options: ProposeActOptions,
+  audience: AudienceLoad,
+  openRecord: (OpenRecordContext & { label: string }) | undefined,
 ): Promise<PlanResult> {
   const validated: ValidatedTool[] = [];
 
@@ -97,7 +164,19 @@ async function previewTools(
       return result;
     }
 
-    validated.push(assignActor(result, options.actorMemberId));
+    const permission = assertToolPermitted(result, audience);
+
+    if (permission) {
+      return permission;
+    }
+
+    const bound = bindOpenRecord(result, openRecord);
+
+    if ('refused' in bound) {
+      return bound;
+    }
+
+    validated.push(assignActor(bound, options.actorMemberId));
   }
 
   const lines: ProposalLine[] = [];
@@ -221,19 +300,33 @@ async function resolveNamedRecord(
       );
     }
 
+    const draft: Omit<PendingChoice, 'candidates' | 'createTools' | 'query'> & {
+      query: string;
+    } = {
+      kind: tool.name === 'create_note' ? 'note' : 'update',
+      objectName,
+      field: tool.name === 'update_record' ? tool.input.field : '',
+      value: tool.name === 'update_record' ? tool.input.value : '',
+      ...(tool.name === 'create_note' && tool.input.title ? { title: tool.input.title } : {}),
+      body: tool.name === 'create_note' ? tool.input.body : '',
+      query,
+    };
+    const createTools = createNewTools(draft);
+
     return {
       choice: {
-        kind: tool.name === 'create_note' ? 'note' : 'update',
-        objectName,
-        field: tool.name === 'update_record' ? tool.input.field : '',
-        value: tool.name === 'update_record' ? tool.input.value : '',
-        ...(tool.name === 'create_note' && tool.input.title ? { title: tool.input.title } : {}),
-        body: tool.name === 'create_note' ? tool.input.body : '',
-        candidates: matches.map((record) => ({
-          id: record.id,
-          label: record.label,
-          etag: record.etag,
-        })),
+        ...draft,
+        ...(createTools ? { createTools } : {}),
+        candidates: [
+          ...matches.map((record) => ({
+            id: record.id,
+            label: matchLabel(record),
+            etag: record.etag,
+          })),
+          ...(createTools
+            ? [{ id: CREATE_NEW_CHOICE_ID, label: createNewLabel(draft), etag: 'create' }]
+            : []),
+        ],
       },
     };
   }
@@ -258,8 +351,15 @@ function storeChoice(
   proposals: ProposalStore | undefined,
 ): PlanResult {
   const stored = proposals?.save(memberId, workspaceId, [], choice);
-  const objectLabel = choice.objectName === 'person' ? 'people' : `${choice.objectName} records`;
-  const summary = `Several ${objectLabel} match. Choose one, then confirm.`;
+  const objectLabel =
+    choice.objectName === 'person'
+      ? 'people'
+      : choice.objectName === 'company'
+        ? 'companies'
+        : 'opportunities';
+  const named = choice.query ? ` “${choice.query}”` : '';
+  const createHint = choice.createTools && choice.createTools.length > 0 ? ', or create a new one' : '';
+  const summary = `Several ${objectLabel} match${named}. Choose one${createHint}, then confirm.`;
 
   if (proposals && !stored) {
     return refusal(
@@ -285,6 +385,7 @@ function storeChoice(
           id: candidate.id,
           label: candidate.label,
           objectName: choice.objectName,
+          action: candidate.id === CREATE_NEW_CHOICE_ID ? ('create' as const) : ('use' as const),
         })),
       },
     },

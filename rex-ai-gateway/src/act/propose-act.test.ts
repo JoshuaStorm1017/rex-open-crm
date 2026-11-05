@@ -184,9 +184,9 @@ describe('proposeAct', () => {
     expect(planned).toMatchObject({
       ok: false,
       refused: true,
-      reason: 'unknown_tool',
-      toolName: 'delete_workspace',
+      reason: 'unmapped_intent',
     });
+    expect(JSON.stringify(planned)).toContain('free-form JSON');
     expect(client.created).toHaveLength(0);
   });
 });

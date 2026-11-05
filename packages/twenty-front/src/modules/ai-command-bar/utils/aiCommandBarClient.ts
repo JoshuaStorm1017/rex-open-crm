@@ -13,6 +13,7 @@ export type AiProposalChoice = {
     id: string;
     label: string;
     objectName: string;
+    action?: 'use' | 'create';
   }>;
 };
 
@@ -30,6 +31,21 @@ export type AiRecordLink = {
   label: string;
 };
 
+export type AiOpenRecord = {
+  objectName: 'person' | 'company' | 'opportunity';
+  recordId: string;
+};
+
+export type AiUndo = {
+  id: string;
+  summary: string;
+};
+
+export type AiActResult = {
+  links: AiRecordLink[];
+  undo?: AiUndo;
+};
+
 export type AiCommandOutcome<TData> =
   | { kind: 'data'; data: TData }
   | { kind: 'message'; message: string };
@@ -40,11 +56,16 @@ export const proposeAiCommand = async (
   config: AiCommandBarConfig,
   intent: string,
   fetchImpl: FetchImpl,
+  openRecord?: AiOpenRecord,
 ): Promise<AiCommandOutcome<AiProposal>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/plan',
-    { workspaceId: config.workspaceId, intent },
+    {
+      workspaceId: config.workspaceId,
+      intent,
+      ...(openRecord ? { context: openRecord } : {}),
+    },
     fetchImpl,
   );
 
@@ -70,7 +91,7 @@ export const executeAiCommand = async (
   idempotencyKey: string,
   fetchImpl: FetchImpl,
   choiceId?: string,
-): Promise<AiCommandOutcome<AiRecordLink[]>> => {
+): Promise<AiCommandOutcome<AiActResult>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/act',
@@ -88,7 +109,40 @@ export const executeAiCommand = async (
     return payload;
   }
 
-  return { kind: 'data', data: readRecordLinks(payload.data) };
+  const undo = readUndo(payload.data);
+
+  return {
+    kind: 'data',
+    data: {
+      links: readRecordLinks(payload.data),
+      ...(undo ? { undo } : {}),
+    },
+  };
+};
+
+export const undoAiCommand = async (
+  config: AiCommandBarConfig,
+  undoId: string,
+  idempotencyKey: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<true>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/undo',
+    {
+      workspaceId: config.workspaceId,
+      confirmed: true,
+      undoId,
+    },
+    fetchImpl,
+    idempotencyKey,
+  );
+
+  if (payload.kind === 'message') {
+    return payload;
+  }
+
+  return { kind: 'data', data: true };
 };
 
 const postAiCommand = async (
@@ -218,6 +272,9 @@ const readChoice = (value: unknown): AiProposalChoice | undefined => {
       id: candidate.id,
       label: candidate.label,
       objectName: candidate.objectName,
+      ...(candidate.action === 'create' || candidate.action === 'use'
+        ? { action: candidate.action }
+        : {}),
     });
   }
 
@@ -269,6 +326,27 @@ const pushRecord = (links: AiRecordLink[], record: unknown): void => {
         ? record.label
         : record.id,
   });
+};
+
+const UNDO_ID_PATTERN = /^undo_[0-9a-f-]{36}$/;
+
+const readUndo = (payload: unknown): AiUndo | undefined => {
+  if (!isPlainObject(payload) || !isPlainObject(payload.undo)) {
+    return undefined;
+  }
+
+  const { id, summary } = payload.undo;
+
+  if (
+    typeof id !== 'string' ||
+    !UNDO_ID_PATTERN.test(id) ||
+    typeof summary !== 'string' ||
+    summary.trim().length === 0
+  ) {
+    return undefined;
+  }
+
+  return { id, summary };
 };
 
 const readMessage = (payload: unknown): string => {

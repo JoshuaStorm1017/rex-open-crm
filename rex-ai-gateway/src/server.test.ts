@@ -30,7 +30,6 @@ describe('POST /v1/ai/act', () => {
             lastName: 'Lovelace',
             email: 'ada@analytical.example',
             jobTitle: 'Mathematician',
-            workspaceId: 'ws_demo',
           },
         },
         {

@@ -4,14 +4,16 @@ import {
   CrmPreconditionError,
 } from '../twenty/crm-errors';
 import { UnsafeSearchQueryError } from '../twenty/safe-search';
-import type { CreatedRecord, DeletableObjectName, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import { compensate, partialFailure } from './compensate';
 import { mapIntentToTool } from './map-intent';
+import { loadAudience, assertToolPermitted } from './permissions';
 import { parseGatewayRequest } from './parse-request';
 import { preflightRefs, resolveRelationId } from './resolve-refs';
 import {
   refusal,
   upstreamFailure,
-  type ActPartialFailure,
+  type ActEffect,
   type ActRefusal,
   type ActResult,
   type ToolCall,
@@ -47,6 +49,7 @@ export async function executeAct(
     return tools;
   }
 
+  const audience = await loadAudience(client);
   const validated: ValidatedTool[] = [];
 
   for (const tool of tools) {
@@ -56,11 +59,41 @@ export async function executeAct(
       return result;
     }
 
+    const permission = assertToolPermitted(result, audience);
+
+    if (permission) {
+      return permission;
+    }
+
+    if (result.name === 'update_record' && result.input.useOpenRecord) {
+      return refusal(
+        'ambiguous_intent',
+        'This update refers to the open record. Propose it from that record page.',
+        { toolName: 'update_record' },
+      );
+    }
+
+    if (result.name === 'create_note' && (result.input.useOpenRecord || !result.input.targetId)) {
+      return refusal(
+        'missing_required_fields',
+        'Refusing create_note: missing required fields: targetId.',
+        { toolName: 'create_note', missingFields: ['targetId'] },
+      );
+    }
+
     if (result.name === 'update_record' && !result.input.ifMatch) {
       return refusal(
         'missing_required_fields',
         'Refusing update_record: missing required fields: ifMatch.',
         { toolName: 'update_record', missingFields: ['ifMatch'] },
+      );
+    }
+
+    if (result.name === 'update_record' && !result.input.id) {
+      return refusal(
+        'missing_required_fields',
+        'Refusing update_record: missing required fields: id.',
+        { toolName: 'update_record', missingFields: ['id'] },
       );
     }
 
@@ -75,11 +108,12 @@ export async function executeAct(
 
   const results: ToolResult[] = [];
   const priorIds: Array<string | undefined> = [];
-  const effects: CompletedEffect[] = [];
+  const priorEtags: Array<string | undefined> = [];
+  const effects: ActEffect[] = [];
 
   try {
     for (const tool of validated) {
-      const resolved = resolveTool(tool, priorIds);
+      const resolved = resolveTool(tool, priorIds, priorEtags);
 
       if ('refused' in resolved) {
         const remaining = await compensate(client, parsed.workspaceId, effects);
@@ -96,6 +130,7 @@ export async function executeAct(
       const result = await dispatch(client, parsed.workspaceId, resolved);
       results.push(result);
       priorIds.push(recordId(result));
+      priorEtags.push(result.status === 'found' ? undefined : result.record.etag);
       effects.push(...effectsFor(resolved, result, snapshot));
     }
   } catch (error) {
@@ -137,6 +172,7 @@ export async function executeAct(
     ok: true,
     workspaceId: parsed.workspaceId,
     results,
+    ...(effects.length > 0 ? { effects } : {}),
   };
 }
 
@@ -164,7 +200,33 @@ function resolveTools(request: {
 function resolveTool(
   tool: ValidatedTool,
   priorIds: Array<string | undefined>,
+  priorEtags: Array<string | undefined>,
 ): ValidatedTool | ActRefusal {
+  if (tool.name === 'update_record' && tool.input.id?.startsWith('$')) {
+    const resolvedId = resolveRelationId(tool.input.id, priorIds, tool.name);
+
+    if (isRefusal(resolvedId) || !resolvedId) {
+      return isRefusal(resolvedId)
+        ? resolvedId
+        : refusal('invalid_request', `Refusing update_record: ${tool.input.id} did not resolve to a record id.`, {
+            toolName: 'update_record',
+          });
+    }
+
+    const match = /^\$(\d+)$/.exec(tool.input.id);
+    const etag = match?.[1] ? priorEtags[Number(match[1])] : undefined;
+
+    if (tool.input.ifMatch !== 'created' || !etag) {
+      return refusal(
+        'invalid_request',
+        `Refusing update_record: ${tool.input.id} has no etag from an earlier create.`,
+        { toolName: 'update_record' },
+      );
+    }
+
+    return { ...tool, input: { ...tool.input, id: resolvedId, ifMatch: etag } };
+  }
+
   if (tool.name === 'create_person' && tool.input.companyId) {
     const companyId = resolveRelationId(tool.input.companyId, priorIds, tool.name);
 
@@ -282,17 +344,6 @@ function recordId(result: ToolResult): string | undefined {
   return result.record.id;
 }
 
-type CompletedEffect =
-  | { kind: 'created'; objectName: DeletableObjectName; id: string }
-  | {
-      kind: 'updated';
-      objectName: 'person' | 'company' | 'opportunity';
-      id: string;
-      field: string;
-      previous: string | number | undefined;
-      etag: string;
-    };
-
 async function snapshotUpdate(
   client: TwentyCrmClient,
   workspaceId: string,
@@ -313,79 +364,31 @@ function effectsFor(
   tool: ValidatedTool,
   result: ToolResult,
   snapshot: CreatedRecord | undefined,
-): CompletedEffect[] {
+): ActEffect[] {
   if (result.status === 'created') {
     return [{ kind: 'created', objectName: result.record.objectName, id: result.record.id }];
   }
 
   if (result.status === 'updated' && tool.name === 'update_record' && tool.input.id) {
+    const field = tool.input.field;
+    const previous =
+      snapshot && Object.prototype.hasOwnProperty.call(snapshot.properties, field)
+        ? (snapshot.properties[field] ?? null)
+        : null;
+
     return [
       {
         kind: 'updated',
         objectName: tool.input.objectName,
         id: tool.input.id,
-        field: tool.input.field,
-        previous: snapshot?.properties[tool.input.field],
+        field,
+        previous,
         etag: result.record.etag,
       },
     ];
   }
 
   return [];
-}
-
-async function compensate(
-  client: TwentyCrmClient,
-  workspaceId: string,
-  effects: CompletedEffect[],
-): Promise<string[]> {
-  const remaining: string[] = [];
-
-  for (const effect of [...effects].reverse()) {
-    try {
-      if (effect.kind === 'created') {
-        await client.deleteRecord({
-          workspaceId,
-          objectName: effect.objectName,
-          id: effect.id,
-        });
-        continue;
-      }
-
-      if (effect.previous === undefined) {
-        remaining.push(effect.id);
-        continue;
-      }
-
-      const current = await client.getRecord({
-        workspaceId,
-        objectName: effect.objectName,
-        id: effect.id,
-      });
-      await client.updateRecord({
-        workspaceId,
-        objectName: effect.objectName,
-        id: effect.id,
-        field: effect.field,
-        value: effect.previous,
-        ifMatch: current.etag,
-      });
-    } catch {
-      remaining.push(effect.id);
-    }
-  }
-
-  return remaining;
-}
-
-function partialFailure(message: string, remainingRecordIds: string[]): ActPartialFailure {
-  return {
-    ok: false,
-    refused: false,
-    reason: 'partial_failure',
-    message: `${message} Some earlier changes could not be rolled back.`,
-    remainingRecordIds,
-  };
 }
 
 function withRollback(message: string, completedCount: number): string {

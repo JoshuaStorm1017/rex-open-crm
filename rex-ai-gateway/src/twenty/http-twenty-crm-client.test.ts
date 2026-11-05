@@ -172,7 +172,31 @@ describe('createHttpTwentyCrmClient', () => {
   });
 
   it('forwards a confirmed gateway act call through the HTTP client', async () => {
-    const twenty = await startFakeTwenty((_captured, response) => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      const query =
+        isRecord(captured.body) && typeof captured.body.query === 'string' ? captured.body.query : '';
+
+      if (query.includes('RexAiCapabilities')) {
+        sendJson(response, 200, {
+          data: {
+            objects: { edges: [{ node: { id: 'obj_person', nameSingular: 'person' } }] },
+            currentUser: {
+              currentUserWorkspace: {
+                objectPermissions: [
+                  {
+                    objectMetadataId: 'obj_person',
+                    canReadObjectRecords: true,
+                    canUpdateObjectRecords: true,
+                    canSoftDeleteObjectRecords: true,
+                  },
+                ],
+              },
+            },
+          },
+        });
+        return;
+      }
+
       sendJson(response, 201, {
         data: { createPerson: { id: 'person_from_twenty' } },
       });
@@ -217,7 +241,7 @@ describe('createHttpTwentyCrmClient', () => {
     });
 
     expect(direct.status).toBe(400);
-    expect(twenty.captured).toHaveLength(0);
+    expect(twenty.captured.every((entry) => entry.url === '/metadata')).toBe(true);
 
     const response = await fetch(`${gateway.url}/v1/ai/act`, {
       method: 'POST',
@@ -253,7 +277,7 @@ describe('createHttpTwentyCrmClient', () => {
         },
       ],
     });
-    expect(twenty.captured[0]?.url).toBe('/rest/people');
+    expect(twenty.captured.filter((entry) => entry.url === '/rest/people')).toHaveLength(1);
   });
 
   it('searches companies and patches only when If-Match matches', async () => {

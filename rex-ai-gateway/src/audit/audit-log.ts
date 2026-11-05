@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-export type AuditAction = 'plan' | 'act' | 'tools' | 'audit';
+export type AuditAction = 'plan' | 'act' | 'tools' | 'audit' | 'undo';
 
 export type AuditEntry = {
   id: string;

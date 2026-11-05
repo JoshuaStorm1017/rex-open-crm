@@ -77,6 +77,7 @@ const gateway = await startGateway({
   proposals: state.proposals,
   idempotency: state.idempotency,
   audit: state.audit,
+  undos: state.undos,
   onClose: () => state.close(),
 });
 

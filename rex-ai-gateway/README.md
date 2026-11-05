@@ -76,7 +76,8 @@ Refusals are HTTP 400 with `refused: true` and a `reason`:
 | `cross_workspace` | an arg names a workspace other than `workspaceId`, or the request workspace is not the one this process is bound to |
 | `unmapped_intent` | the intent is not one of the sentences the planner knows |
 | `unsafe_intent` | the planner refuses a delete, export, or credential request |
-| `ambiguous_intent` | an update does not name exactly one record |
+| `ambiguous_intent` | an update does not name exactly one record, or it says "this record" when none is open |
+| `forbidden` | the signed-in member's role cannot perform the tool (HTTP 403) |
 | `not_found` | the named record does not exist |
 | `precondition_failed` | `ifMatch` is not the current etag (HTTP 412) |
 | `unauthorized` | bearer token is missing or wrong (HTTP 401). Applies to plan, act, tools, and audit |
@@ -153,12 +154,31 @@ npm run start:twenty
 | `REX_AI_GATEWAY_TOKEN` | Service-to-service credential. Required to listen beyond loopback. Not a substitute for the member token, and not sent to the browser |
 | `REX_AI_STATE_PATH` | SQLite file for previews, idempotency, and audit. Default `data/gateway-state.sqlite` in the gateway directory. Survives a restart |
 | `REX_AI_CORS_ORIGINS` | Comma-separated browser origins. Unset allows `http://localhost:3001`, `http://127.0.0.1:3001`, `http://localhost:3000`, and `http://127.0.0.1:3000`. Credentialed responses set `Access-Control-Allow-Credentials` only for an allowlisted origin |
-| `REX_AI_PROVIDER` | `mock` (default) or `openai` |
-| `REX_AI_BASE_URL` | Public OpenAI-compatible origin, required when the provider is `openai`. Private, loopback, and metadata hosts are refused, and redirects are not followed |
-| `REX_AI_API_KEY` | Provider key. Never commit it |
+| `REX_AI_PROVIDER` | `mock` (default) or `openai`. Tests and `npm start` stay on `mock` |
+| `REX_AI_BASE_URL` | Public OpenAI-compatible origin, required when the provider is `openai`. Private, loopback, and metadata hosts are refused. DNS is pinned before the key is sent, and redirects are not followed |
+| `REX_AI_API_KEY` | Provider key. Read from the environment only. Never commit it, and never put it in `window._env_` |
 | `REX_AI_MODEL` | Model name, required when the provider is `openai` |
 
-The mock provider is deterministic and makes no network call. It is what `npm start` and the tests use. `openai` is any Chat Completions API: the base URL, key, and model come from the environment.
+The mock provider is deterministic and makes no network call. It is what `npm start` and the tests use.
+
+## Run with a real model
+
+`openai` is any Chat Completions API. The key stays in the environment. The gateway asks the model for tool calls from the allowlisted catalog (`additionalProperties: false`). A free-form JSON plan in the message content is refused and is not executed. Each tool call is checked again on the server against the allowlist and the argument schema, then shown as a preview. Confirm runs the stored preview. It does not call the model a second time and it does not trust a tools array on the act body.
+
+```bash
+cp .env.example .env
+# Set the key in .env. Do not commit that file.
+# REX_AI_PROVIDER=openai
+# REX_AI_BASE_URL=https://api.openai.com/v1
+# REX_AI_API_KEY=...
+# REX_AI_MODEL=gpt-4o-mini
+# TWENTY_API_URL=http://localhost:3000
+npm run start:twenty
+```
+
+Leave `REX_AI_PROVIDER` unset, or set it to `mock`, to keep the deterministic planner. A public `TWENTY_API_URL` hostname is resolved and the connection is pinned to that address so a later DNS answer cannot move the member credential onto a private host. Loopback origins are not pinned.
+
+`GET /v1/ai/tools` returns only the tools the signed-in member can perform. Create follows Twenty's update permission, because there is no separate create flag. Search and update also require read. Notes require update on `note` and read on the target. Plan and act refuse a hidden tool with `forbidden` even if a model asks for it. When permissions cannot be read, the catalog is empty and nothing is proposed.
 
 ## Plan, then confirm
 
@@ -181,9 +201,17 @@ Other mock sentences:
 find companies named Acme
 update company <id> set domain to acme.example
 update company named Acme set domain to acme.example
+update this deal's stage to Proposal
+add a note: Called the buyer
 ```
 
-A named update that matches zero records is `not_found`. More than one match is a preview with choices. Confirm sends `choiceId`. Nothing is written until one record is chosen. Deletes, exports, and credential requests are `unsafe_intent`.
+The last two need `context` for the open record. "this deal" means the open opportunity.
+
+A named update that matches zero records is `not_found`. More than one person or company is a preview with one radio per match (the label includes the email or domain when it is known) and a "create new" choice. Confirm sends `choiceId`. `create_new` creates the person or company, then applies the note or the field change. Opportunities can be chosen but not created from that picker. Nothing is written until one choice is confirmed. Deletes, exports, and credential requests are `unsafe_intent`.
+
+On a record page the command bar sends `context: { objectName, recordId }` for the open person, company, or opportunity. The mock planner accepts "update this deal's stage to Proposal" and "add a note: …". The model is told to set `recordRef` to `open` and is not given the record id. The gateway loads the open record and substitutes its id before the preview is stored.
+
+A successful write returns `undo: { id, summary }` when the act created records or changed fields. `POST /v1/ai/undo` with that id and `confirmed: true` soft-deletes created records and writes the previous field values back, including clearing a field that was empty. The undo is audited as `undo`. Only the last reversible act for that member is kept. Search-only acts do not replace it.
 
 A multi-tool act is not a Twenty transaction. If a later tool fails, the gateway deletes the records created earlier in that act and restores updated fields to the value loaded before the write. When a rollback itself fails, the response is `partial_failure` (HTTP 409) and names the records that remain.
 

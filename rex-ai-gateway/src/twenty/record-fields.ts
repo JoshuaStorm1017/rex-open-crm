@@ -79,9 +79,14 @@ export function cloneRecord(record: CreatedRecord): CreatedRecord {
 export function applyField(
   record: CreatedRecord,
   field: string,
-  value: string | number,
+  value: string | number | null,
 ): void {
-  record.properties[field] = value;
+  if (value === null) {
+    delete record.properties[field];
+  } else {
+    record.properties[field] = value;
+  }
+
   record.label = labelFromProperties(record.objectName, record.properties);
 }
 

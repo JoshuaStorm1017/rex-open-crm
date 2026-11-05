@@ -1,5 +1,6 @@
+import type { ToolSchema } from '../act/tool-schema';
 import type { ActRefusal, ToolCall } from '../act/types';
-import type { TwentyCrmClient } from '../twenty/twenty-crm-client';
+import type { TwentyCrmClient, TwentyObjectName } from '../twenty/twenty-crm-client';
 
 export type LlmProposal = {
   ok: true;
@@ -13,6 +14,11 @@ export type LlmPlanInput = {
   intent: string;
   workspaceId: string;
   client: TwentyCrmClient;
+  catalog?: { tools: ToolSchema[] };
+  openRecord?: {
+    objectName: TwentyObjectName;
+    label: string;
+  };
 };
 
 export type LlmProvider = {

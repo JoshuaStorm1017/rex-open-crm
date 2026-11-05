@@ -1,15 +1,18 @@
 import { useLingui } from '@lingui/react/macro';
 import { styled } from '@linaria/react';
 import { useEffect, useId, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { themeCssVariables } from 'twenty-ui/theme';
 
 import {
   executeAiCommand,
   proposeAiCommand,
+  undoAiCommand,
   type AiProposal,
   type AiRecordLink,
+  type AiUndo,
 } from '@/ai-command-bar/utils/aiCommandBarClient';
+import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
 import { isAiCommandBarShortcut } from '@/ai-command-bar/utils/isAiCommandBarShortcut';
 import {
   readAiCommandBarConfig,
@@ -29,7 +32,8 @@ type Phase =
       choiceId?: string;
     }
   | { name: 'executing'; draft: string; proposal: AiProposal }
-  | { name: 'done'; links: AiRecordLink[] }
+  | { name: 'done'; links: AiRecordLink[]; undo?: AiUndo }
+  | { name: 'undoing'; draft: string; links: AiRecordLink[]; undo: AiUndo }
   | { name: 'refused'; draft: string; message: string };
 
 type AiCommandBarProps = {
@@ -52,9 +56,10 @@ export const AiCommandBar = ({
   const launcherRef = useRef<HTMLButtonElement>(null);
   const [wasOpen, setWasOpen] = useState(initialOpen);
   const resolvedConfig = config ?? readAiCommandBarConfig();
+  const openRecord = readOpenRecordFromPath(useLocation().pathname);
   const [open, setOpen] = useState(initialOpen);
   const [phase, setPhase] = useState<Phase>({ name: 'compose', draft: '' });
-  const executing = phase.name === 'executing';
+  const executing = phase.name === 'executing' || phase.name === 'undoing';
   const busy = phase.name === 'planning' || executing;
 
   useEffect(() => {
@@ -186,7 +191,12 @@ export const AiCommandBar = ({
 
     setPhase({ name: 'planning', draft });
 
-    const outcome = await proposeAiCommand(resolvedConfig, intent, fetchImpl);
+    const outcome = await proposeAiCommand(
+      resolvedConfig,
+      intent,
+      fetchImpl,
+      openRecord,
+    );
 
     if (generation !== readGeneration()) {
       return;
@@ -232,7 +242,48 @@ export const AiCommandBar = ({
       return;
     }
 
-    setPhase({ name: 'done', links: outcome.data });
+    setPhase({
+      name: 'done',
+      links: outcome.data.links,
+      ...(outcome.data.undo ? { undo: outcome.data.undo } : {}),
+    });
+  };
+
+  const undo = async (current: Extract<Phase, { name: 'done' }>) => {
+    if (!current.undo) {
+      return;
+    }
+
+    const generation = readGeneration();
+
+    setPhase({
+      name: 'undoing',
+      draft: '',
+      links: current.links,
+      undo: current.undo,
+    });
+
+    const outcome = await undoAiCommand(
+      resolvedConfig,
+      current.undo.id,
+      crypto.randomUUID(),
+      fetchImpl,
+    );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    if (outcome.kind === 'message') {
+      setPhase({ name: 'refused', draft: '', message: outcome.message });
+      return;
+    }
+
+    setPhase({
+      name: 'compose',
+      draft: '',
+      notice: t`Undone. The last change was reversed.`,
+    });
   };
 
   const cancelPreview = (draft: string) => {
@@ -274,9 +325,15 @@ export const AiCommandBar = ({
             aria-busy={busy}
           >
             <StyledTitle id={titleId}>{t`AI command`}</StyledTitle>
-            <StyledHint
-              id={hintId}
-            >{t`Ctrl+Shift+K or ⌘⇧K. Writes wait for confirmation.`}</StyledHint>
+            <StyledHint id={hintId}>
+              {openRecord?.objectName === 'opportunity'
+                ? t`Ctrl+Shift+K or ⌘⇧K. This deal is included. Writes wait for confirmation.`
+                : openRecord?.objectName === 'person'
+                  ? t`Ctrl+Shift+K or ⌘⇧K. This person is included. Writes wait for confirmation.`
+                  : openRecord
+                    ? t`Ctrl+Shift+K or ⌘⇧K. This company is included. Writes wait for confirmation.`
+                    : t`Ctrl+Shift+K or ⌘⇧K. Writes wait for confirmation.`}
+            </StyledHint>
             {phase.name !== 'done' && (
               <form
                 onSubmit={(event) => {
@@ -292,7 +349,15 @@ export const AiCommandBar = ({
                   aria-label={t`Command`}
                   value={phase.draft}
                   disabled={phase.name !== 'compose'}
-                  placeholder={t`Add Acme Corp as a company and a $50k deal for Jane Doe`}
+                  placeholder={
+                    openRecord?.objectName === 'opportunity'
+                      ? t`Update this deal's stage to Proposal`
+                      : openRecord?.objectName === 'person'
+                        ? t`Add a note to this person: Followed up`
+                        : openRecord
+                          ? t`Update this company's domain to acme.example`
+                          : t`Add Acme Corp as a company and a $50k deal for Jane Doe`
+                  }
                   onChange={(event) => {
                     if (phase.name === 'compose') {
                       setPhase({ name: 'compose', draft: event.target.value });
@@ -323,8 +388,10 @@ export const AiCommandBar = ({
             {phase.name === 'planning' && (
               <StyledNotice role="status">{t`Proposing actions…`}</StyledNotice>
             )}
-            {phase.name === 'executing' && (
-              <StyledNotice role="status">{t`Working…`}</StyledNotice>
+            {(phase.name === 'executing' || phase.name === 'undoing') && (
+              <StyledNotice role="status">
+                {phase.name === 'undoing' ? t`Undoing…` : t`Working…`}
+              </StyledNotice>
             )}
             {(phase.name === 'preview' || phase.name === 'executing') && (
               <>
@@ -333,21 +400,26 @@ export const AiCommandBar = ({
                   <StyledChoices>
                     <legend>{phase.proposal.choice.prompt}</legend>
                     {phase.proposal.choice.candidates.map((candidate) => (
-                      <label key={candidate.id}>
-                        <input
-                          type="radio"
-                          name="ai-record-choice"
-                          value={candidate.id}
-                          checked={phase.choiceId === candidate.id}
-                          onChange={() =>
-                            setPhase({
-                              ...phase,
-                              choiceId: candidate.id,
-                            })
-                          }
-                        />
-                        {candidate.label}
-                      </label>
+                      <StyledChoice key={candidate.id}>
+                        <label>
+                          <input
+                            type="radio"
+                            name="ai-record-choice"
+                            value={candidate.id}
+                            checked={phase.choiceId === candidate.id}
+                            onChange={() =>
+                              setPhase({
+                                ...phase,
+                                choiceId: candidate.id,
+                              })
+                            }
+                          />
+                          {candidate.label}
+                        </label>
+                        {candidate.action === 'create' && (
+                          <StyledChoiceHint>{t`New record`}</StyledChoiceHint>
+                        )}
+                      </StyledChoice>
                     ))}
                   </StyledChoices>
                 )}
@@ -423,6 +495,14 @@ export const AiCommandBar = ({
                   </StyledList>
                 )}
                 <StyledActions>
+                  {phase.undo && (
+                    <StyledSecondary
+                      type="button"
+                      onClick={() => void undo(phase)}
+                    >
+                      {t`Undo`}
+                    </StyledSecondary>
+                  )}
                   <StyledSecondary type="button" onClick={close}>
                     {t`Close`}
                   </StyledSecondary>
@@ -568,6 +648,18 @@ const StyledChoices = styled.fieldset`
     display: flex;
     gap: ${themeCssVariables.spacing[2]};
   }
+`;
+
+const StyledChoice = styled.div`
+  align-items: center;
+  display: flex;
+  gap: ${themeCssVariables.spacing[2]};
+  justify-content: space-between;
+`;
+
+const StyledChoiceHint = styled.span`
+  color: ${themeCssVariables.font.color.tertiary};
+  font-size: ${themeCssVariables.font.size.xs};
 `;
 
 const StyledList = styled.ul`

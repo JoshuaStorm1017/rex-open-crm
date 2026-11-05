@@ -1,4 +1,5 @@
 import { currentTwentyCredential, twentyAuthHeaders } from '../auth/call-context';
+import { fetchWithPinnedDns } from '../http/pinned-fetch';
 import { isRecord } from '../is-record';
 import {
   CrmNotFoundError,
@@ -11,6 +12,7 @@ import {
   conditionalUpdateFilter,
   graphqlSearchFilter,
   restSearchFilter,
+  toClearPayload,
   toCompanyPayload,
   toOpportunityPayload,
   toPersonPayload,
@@ -30,6 +32,9 @@ import {
   type SearchRecordsInput,
   type TwentyCrmClient,
   type TwentyObjectName,
+  type ClearRecordFieldInput,
+  type MemberCapabilities,
+  type ObjectCapabilityName,
   type UpdateRecordInput,
   companyProperties,
   opportunityProperties,
@@ -134,12 +139,17 @@ export function createHttpTwentyCrmClient(
       headers['If-Match'] = init.ifMatch;
     }
 
-    const response = await fetchImpl(`${apiUrl}${path}`, {
-      method: init.method,
-      headers,
-      redirect: 'error',
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
-    });
+    const response = await fetchWithPinnedDns(
+      `${apiUrl}${path}`,
+      {
+        method: init.method,
+        headers,
+        redirect: 'error',
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      },
+      fetchImpl,
+      'TWENTY_API_URL',
+    );
     const text = await response.text();
     let body: unknown;
 
@@ -223,6 +233,78 @@ export function createHttpTwentyCrmClient(
     return record;
   };
 
+  const commitFieldWrite = async (
+    input: ClearRecordFieldInput,
+    current: CreatedRecord,
+    data: Record<string, unknown>,
+    nextProperties: Record<string, string | number>,
+  ): Promise<CreatedRecord> => {
+    if (current.etag !== input.ifMatch) {
+      throw new CrmPreconditionError(
+        `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}.`,
+        current.etag,
+      );
+    }
+
+    const target = TWENTY_OBJECT_PATH[input.objectName];
+    const manyName = updateManyName(input.objectName);
+    let filter: string;
+
+    try {
+      filter = conditionalUpdateFilter(input.id, input.ifMatch);
+    } catch {
+      throw new CrmPreconditionError(
+        `If-Match ${input.ifMatch} cannot be compared for ${input.objectName} ${input.id}.`,
+        current.etag,
+      );
+    }
+
+    // Twenty ignores If-Match. The etag is updatedAt, applied as a filter on update-many so a stale row matches nothing.
+    const result =
+      style === 'rest'
+        ? await requestJson(`${target.restPath}?filter=${encodeURIComponent(filter)}`, {
+            method: 'PATCH',
+            body: data,
+          })
+        : await requestJson('/graphql', {
+            method: 'POST',
+            body: {
+              query: `mutation Update($filter: ${target.filterInputType}!, $data: ${target.updateInputType}!) { ${manyName}(filter: $filter, data: $data) { id updatedAt } }`,
+              variables: {
+                filter: {
+                  and: [{ id: { eq: input.id } }, { updatedAt: { eq: input.ifMatch } }],
+                },
+                data,
+              },
+            },
+          });
+    const updatedRows = readUpdatedList(result.body, manyName);
+
+    if (updatedRows.length !== 1) {
+      throw new CrmPreconditionError(
+        `If-Match ${input.ifMatch} did not match the current ${input.objectName} row. Nothing was written.`,
+        current.etag,
+      );
+    }
+
+    const raw = updatedRows[0] ?? {};
+    const updated = crmRecordFromTwenty(input.objectName, input.workspaceId, {
+      ...nextProperties,
+      id: input.id,
+      ...(isRecord(raw) ? raw : {}),
+    });
+
+    if (!updated) {
+      throw new Error(`Twenty response is missing ${target.updateMutationName}.id`);
+    }
+
+    return {
+      ...updated,
+      properties: nextProperties,
+      label: labelFromProperties(input.objectName, nextProperties),
+    };
+  };
+
   return {
     createPerson: (input: CreatePersonInput) =>
       create('person', toPersonPayload(input), personProperties(input), input.workspaceId),
@@ -267,85 +349,44 @@ export function createHttpTwentyCrmClient(
     getRecord: (input: GetRecordInput) => loadRecord(input),
     async updateRecord(input: UpdateRecordInput) {
       const current = await loadRecord(input);
+      const nextProperties = { ...current.properties, [input.field]: input.value };
 
-      if (current.etag !== input.ifMatch) {
-        throw new CrmPreconditionError(
-          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}.`,
-          current.etag,
-        );
-      }
-
-      const target = TWENTY_OBJECT_PATH[input.objectName];
-      const data = toUpdatePayload(
-        input.objectName,
-        input.field,
-        input.value,
-        current.properties,
-        current.composites,
+      return commitFieldWrite(
+        input,
+        current,
+        toUpdatePayload(
+          input.objectName,
+          input.field,
+          input.value,
+          current.properties,
+          current.composites,
+        ),
+        nextProperties,
       );
-      const manyName = updateManyName(input.objectName);
-      let filter: string;
+    },
+    async clearRecordField(input: ClearRecordFieldInput) {
+      const current = await loadRecord(input);
+      const nextProperties = { ...current.properties };
+      delete nextProperties[input.field];
 
-      try {
-        filter = conditionalUpdateFilter(input.id, input.ifMatch);
-      } catch {
-        throw new CrmPreconditionError(
-          `If-Match ${input.ifMatch} cannot be compared for ${input.objectName} ${input.id}.`,
-          current.etag,
-        );
-      }
-
-      // Twenty ignores If-Match. The etag is updatedAt, applied as a filter on update-many so a stale row matches nothing.
-      const result =
-        style === 'rest'
-          ? await requestJson(
-              `${target.restPath}?filter=${encodeURIComponent(filter)}`,
-              { method: 'PATCH', body: data },
-            )
-          : await requestJson('/graphql', {
-              method: 'POST',
-              body: {
-                query: `mutation Update($filter: ${target.filterInputType}!, $data: ${target.updateInputType}!) { ${manyName}(filter: $filter, data: $data) { id updatedAt } }`,
-                variables: {
-                  filter: {
-                    and: [{ id: { eq: input.id } }, { updatedAt: { eq: input.ifMatch } }],
-                  },
-                  data,
-                },
-              },
-            });
-      const updatedRows = readUpdatedList(result.body, manyName);
-
-      if (updatedRows.length !== 1) {
-        throw new CrmPreconditionError(
-          `If-Match ${input.ifMatch} did not match the current ${input.objectName} row. Nothing was written.`,
-          current.etag,
-        );
-      }
-
-      const raw = updatedRows[0] ?? {};
-      const updated = crmRecordFromTwenty(input.objectName, input.workspaceId, {
-        ...current.properties,
-        id: input.id,
-        ...(isRecord(raw) ? raw : {}),
-        [input.field]: input.value,
-      });
-
-      if (!updated) {
-        throw new Error(`Twenty response is missing ${target.updateMutationName}.id`);
-      }
-
-      return {
-        ...updated,
-        properties: {
-          ...current.properties,
-          [input.field]: input.value,
+      return commitFieldWrite(
+        input,
+        current,
+        toClearPayload(input.objectName, input.field, current.properties, current.composites),
+        nextProperties,
+      );
+    },
+    async loadCapabilities(): Promise<MemberCapabilities> {
+      const result = await requestJson('/metadata', {
+        method: 'POST',
+        body: {
+          query: `query RexAiCapabilities {
+            objects(paging: { first: 200 }) { edges { node { id nameSingular } } }
+            currentUser { currentUserWorkspace { objectPermissions { objectMetadataId canReadObjectRecords canUpdateObjectRecords canSoftDeleteObjectRecords } } }
+          }`,
         },
-        label: labelFromProperties(input.objectName, {
-          ...current.properties,
-          [input.field]: input.value,
-        }),
-      };
+      });
+      return readCapabilities(result.body);
     },
     async createNote(input: CreateNoteInput) {
       if (!input.targetId) {
@@ -526,5 +567,72 @@ function readList(body: unknown, plural: string): unknown[] {
   }
 
   return [];
+}
+
+const CAPABILITY_NAMES = new Set<ObjectCapabilityName>([
+  'person',
+  'company',
+  'opportunity',
+  'note',
+]);
+
+function readCapabilities(body: unknown): MemberCapabilities {
+  if (!isRecord(body) || !isRecord(body.data)) {
+    return { unavailable: true, objects: [] };
+  }
+
+  const objectsConnection = body.data.objects;
+  const currentUser = body.data.currentUser;
+
+  if (
+    !isRecord(objectsConnection) ||
+    !Array.isArray(objectsConnection.edges) ||
+    !isRecord(currentUser) ||
+    !isRecord(currentUser.currentUserWorkspace) ||
+    !Array.isArray(currentUser.currentUserWorkspace.objectPermissions)
+  ) {
+    return { unavailable: true, objects: [] };
+  }
+
+  const names = new Map<string, ObjectCapabilityName>();
+
+  for (const edge of objectsConnection.edges) {
+    if (!isRecord(edge) || !isRecord(edge.node)) {
+      continue;
+    }
+
+    const { id, nameSingular } = edge.node;
+
+    if (
+      typeof id === 'string' &&
+      typeof nameSingular === 'string' &&
+      CAPABILITY_NAMES.has(nameSingular as ObjectCapabilityName)
+    ) {
+      names.set(id, nameSingular as ObjectCapabilityName);
+    }
+  }
+
+  const objects: MemberCapabilities['objects'] = [];
+
+  for (const permission of currentUser.currentUserWorkspace.objectPermissions) {
+    if (!isRecord(permission) || typeof permission.objectMetadataId !== 'string') {
+      continue;
+    }
+
+    const objectName = names.get(permission.objectMetadataId);
+
+    if (!objectName) {
+      continue;
+    }
+
+    objects.push({
+      objectName,
+      canRead: permission.canReadObjectRecords === true,
+      canUpdate: permission.canUpdateObjectRecords === true,
+      canSoftDelete: permission.canSoftDeleteObjectRecords === true,
+    });
+  }
+
+  return { objects };
 }
 

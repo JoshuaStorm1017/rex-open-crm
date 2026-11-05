@@ -9,6 +9,13 @@ import {
 
 const PROPOSAL_ID_PATTERN = /^proposal_[0-9a-f-]{36}$/;
 const CHOICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const UNDO_ID_PATTERN = /^undo_[0-9a-f-]{36}$/;
+const RECORD_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+
+export type OpenRecordContext = {
+  objectName: 'person' | 'company' | 'opportunity';
+  recordId: string;
+};
 
 export type ParsedRequest = {
   workspaceId: string;
@@ -17,6 +24,8 @@ export type ParsedRequest = {
   confirmed: boolean;
   proposalId?: string;
   choiceId?: string;
+  undoId?: string;
+  openRecord?: OpenRecordContext;
 };
 
 const MAX_INTENT_CHARS = 500;
@@ -94,6 +103,20 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     return refusal('invalid_request', 'choiceId is not one of the preview choices.');
   }
 
+  if (body.undoId !== undefined && typeof body.undoId !== 'string') {
+    return refusal('invalid_request', 'undoId must be a string.');
+  }
+
+  if (typeof body.undoId === 'string' && !UNDO_ID_PATTERN.test(body.undoId)) {
+    return refusal('invalid_request', 'undoId is not an undo id from a confirmed act.');
+  }
+
+  const openRecord = parseOpenRecord(body.context);
+
+  if (openRecord && 'refused' in openRecord) {
+    return openRecord;
+  }
+
   return {
     workspaceId: body.workspaceId,
     ...(tools ? { tools } : {}),
@@ -101,7 +124,34 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     confirmed: body.confirmed === true,
     ...(typeof body.proposalId === 'string' ? { proposalId: body.proposalId } : {}),
     ...(typeof body.choiceId === 'string' ? { choiceId: body.choiceId } : {}),
+    ...(typeof body.undoId === 'string' ? { undoId: body.undoId } : {}),
+    ...(openRecord ? { openRecord } : {}),
   };
+}
+
+function parseOpenRecord(value: unknown): OpenRecordContext | undefined | ActRefusal {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    return refusal('invalid_request', 'context must be an object.');
+  }
+
+  const { objectName, recordId } = value;
+
+  if (objectName !== 'person' && objectName !== 'company' && objectName !== 'opportunity') {
+    return refusal(
+      'invalid_request',
+      'context.objectName must be person, company, or opportunity.',
+    );
+  }
+
+  if (typeof recordId !== 'string' || !RECORD_ID_PATTERN.test(recordId)) {
+    return refusal('invalid_request', 'context.recordId is not a record id.');
+  }
+
+  return { objectName, recordId };
 }
 
 function parseToolCall(value: unknown, index: number): ToolCall | ActRefusal {
