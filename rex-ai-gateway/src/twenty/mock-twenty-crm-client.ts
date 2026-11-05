@@ -279,13 +279,20 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
           candidate.id === input.id,
       );
 
+      if (!input.ifMatch) {
+        throw new CrmPreconditionError(
+          `Restore of ${input.objectName} requires If-Match. Nothing was restored.`,
+          'missing',
+        );
+      }
+
       if (!record || !archived.has(record.id)) {
         throw new CrmNotFoundError(
           `No ${input.objectName} found with id ${input.id}.`,
         );
       }
 
-      if (input.ifMatch && record.etag !== input.ifMatch) {
+      if (record.etag !== input.ifMatch) {
         throw new CrmPreconditionError(
           `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${record.etag}. Nothing was restored.`,
           record.etag,

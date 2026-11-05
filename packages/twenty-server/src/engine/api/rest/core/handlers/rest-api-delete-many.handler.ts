@@ -40,9 +40,10 @@ export class RestApiDeleteManyHandler extends RestApiBaseHandler {
     } = await this.buildCommonOptions(request);
 
     try {
+      // Soft-delete bumps updatedAt. Callers that restore with If-Match need that new value.
       const { results: records } =
         await this.commonDeleteManyQueryRunnerService.execute(
-          { filter, selectedFields: { id: true } },
+          { filter, selectedFields: { id: true, updatedAt: true } },
           {
             authContext,
             flatObjectMetadata,

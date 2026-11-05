@@ -262,6 +262,12 @@ export function deleteManyName(objectName: TwentyObjectName): string {
   return `delete${plural.charAt(0).toUpperCase()}${plural.slice(1)}`;
 }
 
+export function restoreManyName(objectName: TwentyObjectName): string {
+  const deleted = deleteManyName(objectName);
+
+  return `restore${deleted.slice('delete'.length)}`;
+}
+
 export function toClearPayload(
   objectName: TwentyObjectName,
   field: string,

@@ -16,6 +16,7 @@ import {
   companyIdEqualsFilter,
   conditionalUpdateFilter,
   deleteManyName,
+  restoreManyName,
   graphqlSearchFilter,
   graphqlTimelineRecordFilter,
   graphqlTimelineSearchFilter,
@@ -512,6 +513,60 @@ export function createHttpTwentyCrmClient(
     }
   };
 
+  const restoreWhereEtag = async (input: DeleteRecordInput): Promise<void> => {
+    const ifMatch = input.ifMatch;
+
+    if (!ifMatch || !isWorkspaceObject(input.objectName)) {
+      throw new CrmPreconditionError(
+        `Restore of ${input.objectName} requires If-Match. Nothing was restored.`,
+        ifMatch ?? 'missing',
+      );
+    }
+
+    const target = TWENTY_OBJECT_PATH[input.objectName];
+    const manyName = restoreManyName(input.objectName);
+    let filter: string;
+
+    try {
+      filter = conditionalUpdateFilter(input.id, ifMatch);
+    } catch {
+      throw new CrmPreconditionError(
+        `If-Match ${ifMatch} cannot be compared for ${input.objectName} ${input.id}. Nothing was restored.`,
+        ifMatch,
+      );
+    }
+
+    // Restore-one has no filter. Restore-many matches id and the post-archive updatedAt, including trashed rows.
+    const result =
+      style === 'rest'
+        ? await requestJson(
+            `${target.restPath}/restore?filter=${encodeURIComponent(filter)}`,
+            { method: 'PATCH' },
+          )
+        : await requestJson('/graphql', {
+            method: 'POST',
+            body: {
+              query: `mutation Restore($filter: ${target.filterInputType}!) { ${manyName}(filter: $filter) { id } }`,
+              variables: {
+                filter: {
+                  and: [
+                    { id: { eq: input.id } },
+                    { updatedAt: { eq: ifMatch } },
+                  ],
+                },
+              },
+            },
+          });
+    const restored = readUpdatedList(result.body, manyName);
+
+    if (restored.length !== 1) {
+      throw new CrmPreconditionError(
+        `If-Match ${ifMatch} did not match the archived ${input.objectName} row. Nothing was restored.`,
+        ifMatch,
+      );
+    }
+  };
+
   const deleteNoteTargets = async (noteId: string): Promise<void> => {
     let listed: unknown;
 
@@ -885,7 +940,7 @@ export function createHttpTwentyCrmClient(
           : await requestJson('/graphql', {
               method: 'POST',
               body: {
-                query: `mutation Delete($filter: ${target.filterInputType}!) { ${manyName}(filter: $filter) { id } }`,
+                query: `mutation Delete($filter: ${target.filterInputType}!) { ${manyName}(filter: $filter) { id updatedAt } }`,
                 variables: {
                   filter: {
                     and: [
@@ -905,73 +960,64 @@ export function createHttpTwentyCrmClient(
         );
       }
 
-      return current;
+      const archivedEtag = readEtag(deleted[0]);
+
+      return {
+        ...current,
+        etag: archivedEtag === 'unversioned' ? current.etag : archivedEtag,
+      };
     },
     async restoreRecord(input: DeleteRecordInput) {
-      const id = recordPathId(input.id);
-      const target = deleteTarget(input.objectName);
+      if (!isWorkspaceObject(input.objectName) || !input.ifMatch) {
+        throw new CrmPreconditionError(
+          `Restore of ${input.objectName} requires If-Match. Nothing was restored.`,
+          input.ifMatch ?? 'missing',
+        );
+      }
 
-      if (input.ifMatch && isWorkspaceObject(input.objectName)) {
-        rejectEtagSentinel(input.ifMatch, input.objectName);
+      rejectEtagSentinel(input.ifMatch, input.objectName);
 
-        try {
-          const current = await loadRecord({
-            workspaceId: input.workspaceId,
-            objectName: input.objectName,
-            id: input.id,
-          });
+      try {
+        const current = await loadRecord({
+          workspaceId: input.workspaceId,
+          objectName: input.objectName,
+          id: input.id,
+        });
 
-          if (current.etag !== input.ifMatch) {
-            throw new CrmPreconditionError(
-              `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}. Nothing was restored.`,
-              current.etag,
-            );
-          }
+        if (current.etag !== input.ifMatch) {
+          throw new CrmPreconditionError(
+            `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}. Nothing was restored.`,
+            current.etag,
+          );
+        }
 
-          // The row is already live at this etag. Twenty's restore route has no filter, so a matching live row is left alone.
-          return;
-        } catch (error) {
-          if (!(error instanceof CrmNotFoundError)) {
-            throw error;
-          }
+        // Already live at this etag. Restore would bump updatedAt, so the row is left alone.
+        return;
+      } catch (error) {
+        if (!(error instanceof CrmNotFoundError)) {
+          throw error;
         }
       }
 
-      const ifMatch = input.ifMatch ? { ifMatch: input.ifMatch } : {};
-
-      if (style === 'rest') {
-        await requestJson(`${target.restPath}/${id}/restore`, {
-          method: 'PATCH',
-          ...ifMatch,
-        });
-        return;
-      }
-
-      const mutationName = `restore${target.mutationName.slice('delete'.length)}`;
-
-      await requestJson('/graphql', {
-        method: 'POST',
-        ...ifMatch,
-        body: {
-          query: `mutation Restore($id: UUID!) { ${mutationName}(id: $id) { id } }`,
-          variables: { id },
-        },
-      });
+      await restoreWhereEtag(input);
     },
     async deleteRecord(input: DeleteRecordInput) {
       const id = recordPathId(input.id);
 
       if (input.ifMatch) {
         await assertDeleteEtag(input);
+        await deleteWhereEtag(input);
+
+        if (input.objectName === 'note') {
+          // Targets follow the conditional note delete so a stale If-Match removes nothing.
+          await deleteNoteTargets(id);
+        }
+
+        return;
       }
 
       if (input.objectName === 'note') {
         await deleteNoteTargets(id);
-      }
-
-      if (input.ifMatch) {
-        await deleteWhereEtag(input);
-        return;
       }
 
       await deleteById(input.objectName, id);

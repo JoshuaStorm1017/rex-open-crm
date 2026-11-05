@@ -215,7 +215,17 @@ class SqliteProposalStore extends ProposalStore {
       return claimed;
     }
 
-    this.database.prepare('DELETE FROM proposals WHERE id = ?').run(id);
+    // Two processes can both read the preview. Only the delete that removes the row may write.
+    const removed = this.database
+      .prepare(
+        'DELETE FROM proposals WHERE id = ? AND member_id = ? RETURNING id',
+      )
+      .get(id, memberId) as { id: string } | undefined;
+
+    if (!removed) {
+      return { ok: false, reason: 'missing' };
+    }
+
     return claimed;
   }
 
@@ -378,13 +388,12 @@ class SqliteUndoStore extends UndoStore {
 
   protected override noteSaved(memberId: string): void {
     super.noteSaved(memberId);
-    const next = this.readGeneration(memberId) + 1;
     this.database
       .prepare(
-        `INSERT INTO undo_generation (member_id, generation) VALUES (?, ?)
-         ON CONFLICT(member_id) DO UPDATE SET generation = excluded.generation`,
+        `INSERT INTO undo_generation (member_id, generation) VALUES (?, 1)
+         ON CONFLICT(member_id) DO UPDATE SET generation = undo_generation.generation + 1`,
       )
-      .run(memberId, next);
+      .run(memberId);
     this.restrict();
   }
 

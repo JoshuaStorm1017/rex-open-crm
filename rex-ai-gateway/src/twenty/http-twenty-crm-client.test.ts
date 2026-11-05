@@ -594,11 +594,17 @@ describe('createHttpTwentyCrmClient', () => {
   });
 
   it('soft-deletes on archive, restores on undo, and writes website, city, and linkedin composites', async () => {
+    let archived = false;
     const twenty = await startFakeTwenty((captured, response) => {
       if (
         captured.method === 'GET' &&
         captured.url?.startsWith('/rest/companies/')
       ) {
+        if (archived) {
+          sendJson(response, 404, { data: {} });
+          return;
+        }
+
         sendJson(response, 200, {
           data: {
             company: {
@@ -613,8 +619,23 @@ describe('createHttpTwentyCrmClient', () => {
       }
 
       if (captured.method === 'DELETE') {
+        archived = true;
         sendJson(response, 200, {
-          data: { deleteCompanies: [{ id: 'company_row' }] },
+          data: {
+            deleteCompanies: [
+              {
+                id: 'company_row',
+                updatedAt: '2026-01-03T00:00:00.000Z',
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (captured.url?.includes('/restore')) {
+        sendJson(response, 200, {
+          data: { restoreCompanies: [{ id: 'company_row' }] },
         });
         return;
       }
@@ -645,16 +666,19 @@ describe('createHttpTwentyCrmClient', () => {
       value: 'acme.example',
       ifMatch: '2026-01-01T00:00:00.000Z',
     });
-    await client.archiveRecord({
+    const archivedRecord = await client.archiveRecord({
       workspaceId: 'ws_demo',
       objectName: 'company',
       id: 'company_row',
       ifMatch: '2026-01-01T00:00:00.000Z',
     });
+
+    expect(archivedRecord.etag).toBe('2026-01-03T00:00:00.000Z');
     await client.restoreRecord({
       workspaceId: 'ws_demo',
       objectName: 'company',
       id: 'company_row',
+      ifMatch: archivedRecord.etag,
     });
 
     const patches = twenty.captured.filter(
@@ -687,8 +711,109 @@ describe('createHttpTwentyCrmClient', () => {
       'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
       'GET /rest/companies/company_row?depth=1',
       'DELETE /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)&soft_delete=true',
-      'PATCH /rest/companies/company_row/restore',
+      'GET /rest/companies/company_row?depth=1',
+      'PATCH /rest/companies/restore?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-03T00%3A00%3A00.000Z%22)',
     ]);
+  });
+
+  it('does not restore an archived row when If-Match has moved', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET') {
+        sendJson(response, 404, { data: {} });
+        return;
+      }
+
+      sendJson(response, 200, { data: { restoreCompanies: [] } });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.restoreRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        ifMatch: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.restoreRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+
+    const urls = twenty.captured.map((request) => request.url ?? '');
+
+    expect(urls.some((url) => url.includes('/company_row/restore'))).toBe(
+      false,
+    );
+    expect(urls.filter((url) => url.includes('/restore'))).toHaveLength(1);
+    expect(
+      decodeURIComponent(urls.find((url) => url.includes('/restore')) ?? ''),
+    ).toContain('updatedAt[eq]:"2026-01-01T00:00:00.000Z"');
+  });
+
+  it('does not restore a live row whose etag has moved', async () => {
+    const twenty = await startFakeTwenty((_captured, response) => {
+      sendJson(response, 200, {
+        data: {
+          company: {
+            id: 'company_row',
+            updatedAt: '2026-01-02T00:00:00.000Z',
+            name: 'Acme',
+          },
+        },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.restoreRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        ifMatch: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    expect(
+      twenty.captured.some((request) => request.url?.includes('/restore')),
+    ).toBe(false);
+  });
+
+  it('does not delete note targets when the note If-Match no longer matches', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (
+        captured.method === 'GET' &&
+        captured.url?.includes('/rest/notes/note_row')
+      ) {
+        sendJson(response, 200, {
+          data: {
+            note: {
+              id: 'note_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              title: 'Call',
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, { data: { deleteNotes: [] } });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.deleteRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'note',
+        id: 'note_row',
+        ifMatch: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    expect(
+      twenty.captured.some((request) => request.url?.includes('noteTargets')),
+    ).toBe(false);
   });
 
   it('locks relation fields by their metadata name', async () => {
