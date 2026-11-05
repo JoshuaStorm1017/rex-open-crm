@@ -14,6 +14,7 @@ export type AiProposalChoice = {
     label: string;
     objectName: string;
     action?: 'use' | 'create';
+    detail?: string;
   }>;
 };
 
@@ -274,6 +275,9 @@ const readChoice = (value: unknown): AiProposalChoice | undefined => {
       objectName: candidate.objectName,
       ...(candidate.action === 'create' || candidate.action === 'use'
         ? { action: candidate.action }
+        : {}),
+      ...(typeof candidate.detail === 'string' && candidate.detail.length > 0
+        ? { detail: candidate.detail }
         : {}),
     });
   }

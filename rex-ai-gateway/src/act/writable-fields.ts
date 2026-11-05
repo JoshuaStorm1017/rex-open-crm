@@ -1,7 +1,7 @@
 export const UPDATABLE_FIELDS = {
-  person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone'],
-  company: ['name', 'domain', 'accountOwner'],
-  opportunity: ['name', 'stage', 'amount', 'owner'],
+  person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone', 'linkedin'],
+  company: ['name', 'domain', 'website', 'linkedin', 'address', 'city', 'accountOwner'],
+  opportunity: ['name', 'stage', 'amount', 'closeDate', 'owner'],
 } as const;
 
 export type UpdatableObjectName = keyof typeof UPDATABLE_FIELDS;

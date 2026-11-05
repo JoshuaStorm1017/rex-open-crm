@@ -7,7 +7,7 @@ import type { ActEffect, ToolCall } from '../act/types';
 import { AuditLog, type AuditEntry } from '../audit/audit-log';
 import { IdempotencyStore, type IdempotentResponse } from '../http/idempotency-store';
 import { ProposalStore, type ClaimResult, type StoredProposal } from '../http/proposal-store';
-import { UndoStore, type TakeUndoResult, type UndoTicket } from '../http/undo-store';
+import { summarizeUndo, UndoStore, type TakeUndoResult, type UndoTicket } from '../http/undo-store';
 
 export type GatewayState = {
   proposals: ProposalStore;
@@ -258,6 +258,35 @@ class SqliteUndoStore extends UndoStore {
     }
 
     return result;
+  }
+
+  override finish(memberId: string): void {
+    super.finish(memberId);
+    this.database.prepare('DELETE FROM undo_tickets WHERE member_id = ?').run(memberId);
+    this.restrict();
+  }
+
+  override retain(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): boolean {
+    const current = this.readTicket(id, memberId, workspaceId);
+
+    if (!current.ok || effects.length === 0) {
+      return false;
+    }
+
+    const summary = current.ticket.summary;
+    this.database
+      .prepare(
+        `UPDATE undo_tickets SET summary = ?, effects_json = ? WHERE member_id = ? AND id = ?`,
+      )
+      .run(summarizeUndo(effects) || summary, JSON.stringify(effects), memberId, id);
+    this.restrict();
+
+    return true;
   }
 
   private createTicket(

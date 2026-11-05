@@ -27,6 +27,12 @@ const UPDATE_BY_ID_PATTERN =
 const UPDATE_BY_NAME_PATTERN =
   /^update (?<object>person|company|opportunity) named (?<query>.+?) set (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+?)(?: ifMatch (?<ifMatch>\S+))?$/i;
 
+const ARCHIVE_BY_NAME_PATTERN =
+  /^archive (?<object>person|company|opportunity|deal) named (?<query>.+)$/i;
+
+const ARCHIVE_THIS_PATTERN =
+  /^archive this (?<object>deal|opportunity|person|company|record)$/i;
+
 const AMBIGUOUS_PATTERN = /^(?:update|change|edit|set|rename|modify)\b/i;
 
 export function createMockLlmProvider(): LlmProvider {
@@ -84,6 +90,29 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
             companyId: '$0',
             pointOfContactId: '$1',
           },
+        },
+      ],
+    };
+  }
+
+  const archiveThis = ARCHIVE_THIS_PATTERN.exec(text);
+
+  if (archiveThis?.groups?.object) {
+    return thisRecordArchive(input, archiveThis.groups.object);
+  }
+
+  const archiveNamed = ARCHIVE_BY_NAME_PATTERN.exec(text);
+
+  if (archiveNamed?.groups?.object && archiveNamed.groups.query) {
+    const objectName = objectNameFor(archiveNamed.groups.object);
+
+    return {
+      ok: true,
+      summary: `Archive ${objectName} named ${trimValue(archiveNamed.groups.query)}.`,
+      tools: [
+        {
+          name: 'archive_record',
+          args: { object: objectName, query: trimValue(archiveNamed.groups.query) },
         },
       ],
     };
@@ -195,6 +224,25 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
   }
 
   return mapped;
+}
+
+function thisRecordArchive(input: LlmPlanInput, word: string): LlmPlan {
+  const objectName = openObject(word, input.openRecord);
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  return {
+    ok: true,
+    summary: `Archive the open ${objectName}.`,
+    tools: [
+      {
+        name: 'archive_record',
+        args: { object: objectName, recordRef: 'open' },
+      },
+    ],
+  };
 }
 
 function thisRecordUpdate(

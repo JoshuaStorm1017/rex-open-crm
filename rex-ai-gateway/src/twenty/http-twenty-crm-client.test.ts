@@ -245,7 +245,9 @@ describe('createHttpTwentyCrmClient', () => {
     });
 
     expect(direct.status).toBe(400);
-    expect(twenty.captured.every((entry) => entry.url === '/metadata')).toBe(true);
+    expect(twenty.captured.some((entry) => entry.method === 'POST' && entry.url === '/rest/people')).toBe(
+      false,
+    );
 
     const response = await fetch(`${gateway.url}/v1/ai/act`, {
       method: 'POST',
@@ -417,7 +419,7 @@ describe('createHttpTwentyCrmClient', () => {
     expect(twenty.captured.map((request) => request.url)).toEqual([
       '/rest/notes',
       '/rest/noteTargets',
-      '/rest/notes/note_orphan',
+      '/rest/notes/note_orphan?soft_delete=true',
     ]);
   });
 
@@ -485,8 +487,8 @@ describe('createHttpTwentyCrmClient', () => {
 
     expect(twenty.captured.map((request) => request.url)).toEqual([
       '/rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
-      '/rest/noteTargets/noteTarget_row',
-      '/rest/notes/note_row',
+      '/rest/noteTargets/noteTarget_row?soft_delete=true',
+      '/rest/notes/note_row?soft_delete=true',
     ]);
   });
 
@@ -505,7 +507,83 @@ describe('createHttpTwentyCrmClient', () => {
 
     expect(twenty.captured.map((request) => `${request.method} ${request.url}`)).toEqual([
       'GET /rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
-      'DELETE /rest/notes/note_row',
+      'DELETE /rest/notes/note_row?soft_delete=true',
+    ]);
+  });
+
+  it('soft-deletes on archive, restores on undo, and writes website, city, and linkedin composites', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET' && captured.url?.startsWith('/rest/companies/')) {
+        sendJson(response, 200, {
+          data: {
+            company: {
+              id: 'company_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              name: 'Acme',
+              address: { addressStreet1: '1 Old Road', addressCity: 'Porto' },
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        data: { updateCompanies: [{ id: 'company_row', updatedAt: '2026-01-02T00:00:00.000Z' }] },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+      field: 'city',
+      value: 'Lisbon',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+      field: 'website',
+      value: 'acme.example',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+    await client.archiveRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+    await client.restoreRecord({ workspaceId: 'ws_demo', objectName: 'company', id: 'company_row' });
+
+    const patches = twenty.captured.filter((request) => request.method === 'PATCH');
+
+    expect(patches[0]?.body).toEqual({
+      address: {
+        addressStreet1: '1 Old Road',
+        addressStreet2: '',
+        addressCity: 'Lisbon',
+        addressState: '',
+        addressPostcode: '',
+        addressCountry: '',
+      },
+    });
+    expect(patches[1]?.body).toEqual({
+      domainName: {
+        primaryLinkUrl: 'https://acme.example',
+        primaryLinkLabel: '',
+        secondaryLinks: [],
+      },
+    });
+    expect(twenty.captured.map((request) => `${request.method} ${request.url}`)).toEqual([
+      'GET /rest/companies/company_row?depth=1',
+      'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
+      'GET /rest/companies/company_row?depth=1',
+      'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
+      'GET /rest/companies/company_row?depth=1',
+      'DELETE /rest/companies/company_row?soft_delete=true',
+      'PATCH /rest/companies/company_row/restore',
     ]);
   });
 });

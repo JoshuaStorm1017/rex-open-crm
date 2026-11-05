@@ -32,7 +32,7 @@ type Phase =
       choiceId?: string;
     }
   | { name: 'executing'; draft: string; proposal: AiProposal }
-  | { name: 'done'; links: AiRecordLink[]; undo?: AiUndo }
+  | { name: 'done'; links: AiRecordLink[]; undo?: AiUndo; notice?: string }
   | { name: 'undoing'; draft: string; links: AiRecordLink[]; undo: AiUndo }
   | { name: 'refused'; draft: string; message: string };
 
@@ -275,7 +275,12 @@ export const AiCommandBar = ({
     }
 
     if (outcome.kind === 'message') {
-      setPhase({ name: 'refused', draft: '', message: outcome.message });
+      setPhase({
+        name: 'done',
+        links: current.links,
+        undo: current.undo,
+        notice: outcome.message,
+      });
       return;
     }
 
@@ -414,7 +419,12 @@ export const AiCommandBar = ({
                               })
                             }
                           />
-                          {candidate.label}
+                          <StyledChoiceText>
+                            <span>{candidate.label}</span>
+                            {candidate.detail && (
+                              <StyledChoiceDetail>{candidate.detail}</StyledChoiceDetail>
+                            )}
+                          </StyledChoiceText>
                         </label>
                         {candidate.action === 'create' && (
                           <StyledChoiceHint>{t`New record`}</StyledChoiceHint>
@@ -475,6 +485,9 @@ export const AiCommandBar = ({
             {phase.name === 'done' && (
               <>
                 <StyledSummary>{t`Done`}</StyledSummary>
+                {phase.notice && (
+                  <StyledError role="alert">{phase.notice}</StyledError>
+                )}
                 {phase.links.length === 0 ? (
                   <StyledNotice>{t`No matching records.`}</StyledNotice>
                 ) : (
@@ -655,6 +668,17 @@ const StyledChoice = styled.div`
   display: flex;
   gap: ${themeCssVariables.spacing[2]};
   justify-content: space-between;
+`;
+
+const StyledChoiceText = styled.span`
+  display: flex;
+  flex-direction: column;
+  gap: ${themeCssVariables.spacing[1]};
+`;
+
+const StyledChoiceDetail = styled.span`
+  color: ${themeCssVariables.font.color.tertiary};
+  font-size: ${themeCssVariables.font.size.xs};
 `;
 
 const StyledChoiceHint = styled.span`

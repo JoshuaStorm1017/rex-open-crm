@@ -24,6 +24,7 @@ const INITIAL_ETAG = 'v1';
 
 export function createMockTwentyCrmClient(): MockTwentyCrmClient {
   const created: CreatedRecord[] = [];
+  const archived = new Set<string>();
 
   const remember = (
     objectName: CreatedRecord['objectName'],
@@ -55,12 +56,14 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
         candidate.id === id,
     );
 
-    if (!record) {
+    if (!record || archived.has(record.id)) {
       throw new CrmNotFoundError(`No ${objectName} found with id ${id}.`);
     }
 
     return record;
   };
+
+  const visible = (record: CreatedRecord): boolean => !archived.has(record.id);
 
   return {
     created,
@@ -102,7 +105,11 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
 
       return created
         .filter((record) => {
-          if (record.workspaceId !== input.workspaceId || record.objectName !== input.objectName) {
+          if (
+            !visible(record) ||
+            record.workspaceId !== input.workspaceId ||
+            record.objectName !== input.objectName
+          ) {
             return false;
           }
 
@@ -114,6 +121,33 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
         })
         .slice(0, input.limit)
         .map(cloneRecord);
+    },
+    async listRecent(input) {
+      return created
+        .filter(
+          (record) =>
+            visible(record) &&
+            record.workspaceId === input.workspaceId &&
+            record.objectName === input.objectName,
+        )
+        .slice(-input.limit)
+        .reverse()
+        .map(cloneRecord);
+    },
+    async getNote(input) {
+      const record = created.find(
+        (candidate) =>
+          candidate.workspaceId === input.workspaceId &&
+          candidate.objectName === 'note' &&
+          candidate.id === input.id &&
+          !archived.has(candidate.id),
+      );
+
+      if (!record) {
+        throw new CrmNotFoundError(`No note found with id ${input.id}.`);
+      }
+
+      return cloneRecord(record);
     },
     async getRecord(input) {
       return cloneRecord(findStored(input.workspaceId, input.objectName, input.id));
@@ -145,6 +179,32 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       applyField(record, input.field, null);
       record.etag = nextVersionEtag(record.etag);
       return cloneRecord(record);
+    },
+    async archiveRecord(input) {
+      const record = findStored(input.workspaceId, input.objectName, input.id);
+
+      if (record.etag !== input.ifMatch) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${record.etag}.`,
+          record.etag,
+        );
+      }
+
+      archived.add(record.id);
+      record.etag = nextVersionEtag(record.etag);
+      return cloneRecord(record);
+    },
+    async restoreRecord(input) {
+      const record = created.find(
+        (candidate) => candidate.workspaceId === input.workspaceId && candidate.id === input.id,
+      );
+
+      if (!record || !archived.has(record.id)) {
+        throw new CrmNotFoundError(`No ${input.objectName} found with id ${input.id}.`);
+      }
+
+      archived.delete(record.id);
+      record.etag = nextVersionEtag(record.etag);
     },
     async deleteRecord(input) {
       const index = created.findIndex(

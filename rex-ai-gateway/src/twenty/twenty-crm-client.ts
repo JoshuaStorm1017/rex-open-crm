@@ -5,6 +5,7 @@ export type CreatePersonInput = {
   email?: string;
   jobTitle?: string;
   phone?: string;
+  linkedin?: string;
   companyId?: string;
 };
 
@@ -12,6 +13,9 @@ export type CreateCompanyInput = {
   workspaceId: string;
   name: string;
   domain?: string;
+  linkedin?: string;
+  address?: string;
+  city?: string;
 };
 
 export type CreateOpportunityInput = {
@@ -38,10 +42,22 @@ export type TwentyObjectName = 'person' | 'company' | 'opportunity';
 
 export type DeletableObjectName = TwentyObjectName | 'note' | 'noteTarget';
 
+export type AddressFields = {
+  addressStreet1?: string;
+  addressStreet2?: string;
+  addressCity?: string;
+  addressState?: string;
+  addressPostcode?: string;
+  addressCountry?: string;
+};
+
 export type RecordComposites = {
   additionalEmails?: string[];
   primaryLinkLabel?: string;
   secondaryLinks?: Array<Record<string, string>>;
+  linkedinLabel?: string;
+  linkedinSecondaryLinks?: Array<Record<string, string>>;
+  address?: AddressFields;
 };
 
 export type CreatedRecord = {
@@ -90,6 +106,24 @@ export type ClearRecordFieldInput = {
   ifMatch: string;
 };
 
+export type ListRecentInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  limit: number;
+};
+
+export type NoteLookupInput = {
+  workspaceId: string;
+  id: string;
+};
+
+export type ArchiveRecordInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+  ifMatch: string;
+};
+
 export type ObjectCapabilityName = TwentyObjectName | 'note';
 
 export type MemberCapabilities = {
@@ -98,6 +132,8 @@ export type MemberCapabilities = {
     objectName: ObjectCapabilityName;
     canRead: boolean;
     canUpdate: boolean;
+    // Twenty has no create flag. Omit this and create follows canUpdate.
+    canCreate?: boolean;
     canSoftDelete: boolean;
   }>;
 };
@@ -108,9 +144,13 @@ export type TwentyCrmClient = {
   createOpportunity: (input: CreateOpportunityInput) => Promise<CreatedRecord>;
   createNote: (input: CreateNoteInput) => Promise<CreatedRecord>;
   searchRecords: (input: SearchRecordsInput) => Promise<CreatedRecord[]>;
+  listRecent: (input: ListRecentInput) => Promise<CreatedRecord[]>;
   getRecord: (input: GetRecordInput) => Promise<CreatedRecord>;
+  getNote: (input: NoteLookupInput) => Promise<CreatedRecord>;
   updateRecord: (input: UpdateRecordInput) => Promise<CreatedRecord>;
   clearRecordField: (input: ClearRecordFieldInput) => Promise<CreatedRecord>;
+  archiveRecord: (input: ArchiveRecordInput) => Promise<CreatedRecord>;
+  restoreRecord: (input: DeleteRecordInput) => Promise<void>;
   deleteRecord: (input: DeleteRecordInput) => Promise<void>;
   loadCapabilities?: () => Promise<MemberCapabilities>;
 };
@@ -138,6 +178,7 @@ export function personProperties(
     email: input.email,
     jobTitle: input.jobTitle,
     phone: input.phone,
+    linkedin: input.linkedin,
     companyId: input.companyId,
   });
 }
@@ -145,9 +186,15 @@ export function personProperties(
 export function companyProperties(
   input: CreateCompanyInput,
 ): Record<string, string | number> {
+  const website = input.domain;
+
   return withDefinedStrings({
     name: input.name,
-    domain: input.domain,
+    domain: website,
+    website,
+    linkedin: input.linkedin,
+    address: input.address,
+    city: input.city,
   });
 }
 

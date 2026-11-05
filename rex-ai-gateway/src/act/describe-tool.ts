@@ -42,6 +42,11 @@ export function describeTool(
         tool: tool.name,
         summary: `Search ${plural(tool.input.objectName)} for “${tool.input.query}”.`,
       };
+    case 'archive_record':
+      return {
+        tool: tool.name,
+        summary: `Archive ${tool.input.objectName} ${current?.label ?? tool.input.id ?? tool.input.query ?? 'record'}. If-Match ${tool.input.ifMatch}.`,
+      };
     case 'update_record': {
       const previous = current?.properties[tool.input.field];
       const from =

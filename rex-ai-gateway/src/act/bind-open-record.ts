@@ -35,6 +35,31 @@ export function bindOpenRecord(
     };
   }
 
+  if (tool.name === 'archive_record' && tool.input.useOpenRecord) {
+    if (!openRecord) {
+      return refusal(
+        'ambiguous_intent',
+        'This archive refers to the open record, but no record is open.',
+        { toolName: tool.name },
+      );
+    }
+
+    if (tool.input.objectName !== openRecord.objectName) {
+      return refusal(
+        'invalid_request',
+        `The open record is a ${openRecord.objectName}, not a ${tool.input.objectName}.`,
+        { toolName: tool.name },
+      );
+    }
+
+    const { useOpenRecord: _useOpenRecord, ...input } = tool.input;
+
+    return {
+      ...tool,
+      input: { ...input, id: openRecord.recordId, query: undefined },
+    };
+  }
+
   if (tool.name === 'create_note' && tool.input.useOpenRecord) {
     if (!openRecord) {
       return refusal(

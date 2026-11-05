@@ -1,6 +1,7 @@
 import { parsePhone } from './parse-phone';
 import { quoteFilterValue } from './safe-search';
 import type {
+  AddressFields,
   CreateCompanyInput,
   CreateOpportunityInput,
   CreatePersonInput,
@@ -187,13 +188,29 @@ export function toClearPayload(
     };
   }
 
-  if (objectName === 'company' && field === 'domain') {
+  if (objectName === 'company' && (field === 'domain' || field === 'website')) {
     return {
       domainName: {
         primaryLinkUrl: '',
         primaryLinkLabel: composites?.primaryLinkLabel ?? '',
         secondaryLinks: composites?.secondaryLinks ?? [],
       },
+    };
+  }
+
+  if ((objectName === 'person' || objectName === 'company') && field === 'linkedin') {
+    return {
+      linkedinLink: {
+        primaryLinkUrl: '',
+        primaryLinkLabel: composites?.linkedinLabel ?? '',
+        secondaryLinks: composites?.linkedinSecondaryLinks ?? [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && (field === 'address' || field === 'city')) {
+    return {
+      address: addressPayload(composites?.address, field, ''),
     };
   }
 
@@ -253,13 +270,29 @@ export function toUpdatePayload(
     };
   }
 
-  if (objectName === 'company' && field === 'domain' && typeof value === 'string') {
+  if (objectName === 'company' && (field === 'domain' || field === 'website') && typeof value === 'string') {
     return {
       domainName: {
         primaryLinkUrl: toCompanyLinkUrl(value),
         primaryLinkLabel: composites?.primaryLinkLabel ?? '',
         secondaryLinks: composites?.secondaryLinks ?? [],
       },
+    };
+  }
+
+  if ((objectName === 'person' || objectName === 'company') && field === 'linkedin' && typeof value === 'string') {
+    return {
+      linkedinLink: {
+        primaryLinkUrl: value,
+        primaryLinkLabel: composites?.linkedinLabel ?? '',
+        secondaryLinks: composites?.linkedinSecondaryLinks ?? [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && (field === 'address' || field === 'city') && typeof value === 'string') {
+    return {
+      address: addressPayload(composites?.address, field, value),
     };
   }
 
@@ -322,6 +355,14 @@ export function toPersonPayload(
     payload.jobTitle = input.jobTitle;
   }
 
+  if (input.linkedin) {
+    payload.linkedinLink = {
+      primaryLinkUrl: input.linkedin,
+      primaryLinkLabel: '',
+      secondaryLinks: [],
+    };
+  }
+
   if (input.phone) {
     const phone = parsePhone(input.phone);
 
@@ -366,8 +407,47 @@ export function toCompanyPayload(
     };
   }
 
+  if (input.linkedin) {
+    payload.linkedinLink = {
+      primaryLinkUrl: input.linkedin,
+      primaryLinkLabel: '',
+      secondaryLinks: [],
+    };
+  }
+
+  if (input.address || input.city) {
+    payload.address = {
+      ...(input.address ? { addressStreet1: input.address } : {}),
+      ...(input.city ? { addressCity: input.city } : {}),
+    };
+  }
+
   return payload;
 }
+
+function addressPayload(
+  current: AddressFields | undefined,
+  field: 'address' | 'city',
+  value: string,
+): AddressFields {
+  return {
+    addressStreet1: field === 'address' ? value : (current?.addressStreet1 ?? ''),
+    addressStreet2: current?.addressStreet2 ?? '',
+    addressCity: field === 'city' ? value : (current?.addressCity ?? ''),
+    addressState: current?.addressState ?? '',
+    addressPostcode: current?.addressPostcode ?? '',
+    addressCountry: current?.addressCountry ?? '',
+  };
+}
+
+export const RECORD_GRAPHQL_FIELDS: Record<TwentyObjectName, string> = {
+  person:
+    'id updatedAt jobTitle companyId name { firstName lastName } emails { primaryEmail additionalEmails } phones { primaryPhoneNumber primaryPhoneCallingCode } linkedinLink { primaryLinkUrl primaryLinkLabel secondaryLinks }',
+  company:
+    'id updatedAt name accountOwnerId domainName { primaryLinkUrl primaryLinkLabel secondaryLinks } linkedinLink { primaryLinkUrl primaryLinkLabel secondaryLinks } address { addressStreet1 addressStreet2 addressCity addressState addressPostcode addressCountry }',
+  opportunity:
+    'id updatedAt name stage closeDate companyId pointOfContactId ownerId amount { amountMicros currencyCode }',
+};
 
 // Twenty stores currency as micros (1 major unit = 1_000_000).
 export function toAmountMicros(amount: number): number {

@@ -65,11 +65,14 @@ export async function executeAct(
       return permission;
     }
 
-    if (result.name === 'update_record' && result.input.useOpenRecord) {
+    if (
+      (result.name === 'update_record' || result.name === 'archive_record') &&
+      result.input.useOpenRecord
+    ) {
       return refusal(
         'ambiguous_intent',
-        'This update refers to the open record. Propose it from that record page.',
-        { toolName: 'update_record' },
+        'This action refers to the open record. Propose it from that record page.',
+        { toolName: result.name },
       );
     }
 
@@ -94,6 +97,22 @@ export async function executeAct(
         'missing_required_fields',
         'Refusing update_record: missing required fields: id.',
         { toolName: 'update_record', missingFields: ['id'] },
+      );
+    }
+
+    if (result.name === 'archive_record' && !result.input.ifMatch) {
+      return refusal(
+        'missing_required_fields',
+        'Refusing archive_record: missing required fields: ifMatch.',
+        { toolName: 'archive_record', missingFields: ['ifMatch'] },
+      );
+    }
+
+    if (result.name === 'archive_record' && !result.input.id) {
+      return refusal(
+        'missing_required_fields',
+        'Refusing archive_record: missing required fields: id.',
+        { toolName: 'archive_record', missingFields: ['id'] },
       );
     }
 
@@ -336,6 +355,21 @@ async function dispatch(
       });
       return { tool: tool.name, status: 'updated', record };
     }
+    case 'archive_record': {
+      const ifMatch = tool.input.ifMatch;
+
+      if (!ifMatch || !tool.input.id) {
+        throw new Error('archive_record is missing id or ifMatch.');
+      }
+
+      const record = await client.archiveRecord({
+        workspaceId,
+        objectName: tool.input.objectName,
+        id: tool.input.id,
+        ifMatch,
+      });
+      return { tool: tool.name, status: 'archived', record };
+    }
   }
 }
 
@@ -374,6 +408,17 @@ function effectsFor(
         kind: 'created',
         objectName: result.record.objectName,
         id: result.record.id,
+        etag: result.record.etag,
+      },
+    ];
+  }
+
+  if (result.status === 'archived' && tool.name === 'archive_record' && tool.input.id) {
+    return [
+      {
+        kind: 'archived',
+        objectName: tool.input.objectName,
+        id: tool.input.id,
         etag: result.record.etag,
       },
     ];

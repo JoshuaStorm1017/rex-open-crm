@@ -19,6 +19,12 @@ export type LlmPlanInput = {
     objectName: TwentyObjectName;
     label: string;
   };
+  visibleRecords?: Array<{
+    ref: string;
+    objectName: TwentyObjectName;
+    label: string;
+    detail: string;
+  }>;
 };
 
 export type LlmProvider = {
