@@ -51,7 +51,7 @@ export type ProposalChange = {
 };
 
 export type ProposalWarning = {
-  code: 'duplicate_email' | 'amount_mismatch';
+  code: 'duplicate_email' | 'duplicate_name' | 'amount_mismatch';
   message: string;
 };
 

@@ -24,7 +24,9 @@ const OBJECT_NAMES = new Set([
   'timelineActivity',
 ]);
 
-export async function loadAudience(client: TwentyCrmClient): Promise<AudienceLoad> {
+export async function loadAudience(
+  client: TwentyCrmClient,
+): Promise<AudienceLoad> {
   if (!client.loadCapabilities) {
     return { kind: 'unrestricted' };
   }
@@ -40,6 +42,53 @@ export async function loadAudience(client: TwentyCrmClient): Promise<AudienceLoa
   } catch {
     return { kind: 'unavailable' };
   }
+}
+
+export function canCreateObject(
+  load: AudienceLoad,
+  objectName: 'person' | 'company',
+): boolean {
+  if (load.kind === 'unrestricted') {
+    return true;
+  }
+
+  if (load.kind === 'unavailable') {
+    return false;
+  }
+
+  return load.audience.canCreate.has(objectName);
+}
+
+export function canSetField(
+  load: AudienceLoad,
+  objectName: 'person' | 'company',
+  field: string,
+): boolean {
+  if (load.kind === 'unrestricted') {
+    return true;
+  }
+
+  if (load.kind === 'unavailable') {
+    return false;
+  }
+
+  const { audience } = load;
+
+  if (audience.fieldPermissionsUnreadable?.has(objectName)) {
+    return false;
+  }
+
+  if (audience.unreadableFields?.get(objectName)?.has(field)) {
+    return false;
+  }
+
+  const writable = audience.writableFields?.get(objectName);
+
+  if (!writable) {
+    return true;
+  }
+
+  return writable.has(field);
 }
 
 export function catalogForAudience(
@@ -79,14 +128,31 @@ export function assertToolPermitted(
 
   switch (tool.name) {
     case 'create_person':
-      return assertCreate(audience, 'person', tool.name, fieldsOnPerson(tool.input));
+      return assertCreate(
+        audience,
+        'person',
+        tool.name,
+        fieldsOnPerson(tool.input),
+      );
     case 'create_company':
-      return assertCreate(audience, 'company', tool.name, fieldsOnCompany(tool.input));
+      return assertCreate(
+        audience,
+        'company',
+        tool.name,
+        fieldsOnCompany(tool.input),
+      );
     case 'create_opportunity':
-      return assertCreate(audience, 'opportunity', tool.name, fieldsOnOpportunity(tool.input));
+      return assertCreate(
+        audience,
+        'opportunity',
+        tool.name,
+        fieldsOnOpportunity(tool.input),
+      );
     case 'create_note':
       if (!audience.canCreate.has('note')) {
-        return refusal('forbidden', 'You cannot add notes.', { toolName: tool.name });
+        return refusal('forbidden', 'You cannot add notes.', {
+          toolName: tool.name,
+        });
       }
 
       if (!audience.canRead.has(tool.input.targetObject)) {
@@ -101,48 +167,77 @@ export function assertToolPermitted(
     case 'search_records':
       return audience.canRead.has(tool.input.objectName)
         ? undefined
-        : refusal('forbidden', `You cannot search ${tool.input.objectName} records.`, {
-            toolName: tool.name,
-          });
+        : refusal(
+            'forbidden',
+            `You cannot search ${tool.input.objectName} records.`,
+            {
+              toolName: tool.name,
+            },
+          );
     case 'search_notes':
       return requireTimelineRead(audience, 'note', tool.name, 'notes');
     case 'search_tasks':
       return requireTimelineRead(audience, 'task', tool.name, 'tasks');
     case 'search_activities':
-      return requireTimelineRead(audience, 'timelineActivity', tool.name, 'activities');
+      return requireTimelineRead(
+        audience,
+        'timelineActivity',
+        tool.name,
+        'activities',
+      );
     case 'update_record':
     case 'update_matching_records':
       if (
         !audience.canRead.has(tool.input.objectName) ||
         !audience.canUpdate.has(tool.input.objectName)
       ) {
-        return refusal('forbidden', `You cannot update ${tool.input.objectName} records.`, {
-          toolName: tool.name,
-        });
+        return refusal(
+          'forbidden',
+          `You cannot update ${tool.input.objectName} records.`,
+          {
+            toolName: tool.name,
+          },
+        );
       }
 
-      return assertFieldWritable(audience, tool.input.objectName, tool.input.field, tool.name, 'changed');
+      return assertFieldWritable(
+        audience,
+        tool.input.objectName,
+        tool.input.field,
+        tool.name,
+        'changed',
+      );
     case 'archive_record':
       if (
         !audience.canRead.has(tool.input.objectName) ||
         !audience.canSoftDelete.has(tool.input.objectName)
       ) {
-        return refusal('forbidden', `You cannot archive ${tool.input.objectName} records.`, {
-          toolName: tool.name,
-        });
+        return refusal(
+          'forbidden',
+          `You cannot archive ${tool.input.objectName} records.`,
+          {
+            toolName: tool.name,
+          },
+        );
       }
 
       return undefined;
   }
 }
 
-export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefusal | undefined {
+export function assertCanUndo(
+  effects: ActEffect[],
+  load: AudienceLoad,
+): ActRefusal | undefined {
   if (load.kind === 'unrestricted') {
     return undefined;
   }
 
   if (load.kind === 'unavailable') {
-    return refusal('forbidden', 'Permissions could not be read from Twenty, so this undo was not run.');
+    return refusal(
+      'forbidden',
+      'Permissions could not be read from Twenty, so this undo was not run.',
+    );
   }
 
   for (const effect of effects) {
@@ -159,7 +254,8 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
     }
 
     if (effect.kind === 'created') {
-      const permissionObject = effect.objectName === 'noteTarget' ? 'note' : effect.objectName;
+      const permissionObject =
+        effect.objectName === 'noteTarget' ? 'note' : effect.objectName;
 
       if (!load.audience.canSoftDelete.has(permissionObject)) {
         return refusal(
@@ -210,7 +306,13 @@ function assertCreate(
   }
 
   for (const field of fields) {
-    const fieldRefusal = assertFieldWritable(audience, objectName, field, toolName, 'set');
+    const fieldRefusal = assertFieldWritable(
+      audience,
+      objectName,
+      field,
+      toolName,
+      'set',
+    );
 
     if (fieldRefusal) {
       return fieldRefusal;
@@ -229,17 +331,15 @@ function fieldsOnPerson(input: {
   linkedin?: string;
   companyId?: string;
 }): string[] {
-  return presentFields(
-    [
-      ['firstName', input.firstName],
-      ['lastName', input.lastName],
-      ['email', input.email],
-      ['jobTitle', input.jobTitle],
-      ['phone', input.phone],
-      ['linkedin', input.linkedin],
-      ['companyId', input.companyId],
-    ],
-  );
+  return presentFields([
+    ['firstName', input.firstName],
+    ['lastName', input.lastName],
+    ['email', input.email],
+    ['jobTitle', input.jobTitle],
+    ['phone', input.phone],
+    ['linkedin', input.linkedin],
+    ['companyId', input.companyId],
+  ]);
 }
 
 function fieldsOnCompany(input: {
@@ -276,7 +376,9 @@ function fieldsOnOpportunity(input: {
   ]);
 }
 
-function presentFields(fields: Array<[string, string | number | undefined]>): string[] {
+function presentFields(
+  fields: Array<[string, string | number | undefined]>,
+): string[] {
   return fields.flatMap(([name, value]) => (value === undefined ? [] : [name]));
 }
 
@@ -300,7 +402,10 @@ function assertFieldWritable(
   toolName: AllowedToolName,
   verb: 'changed' | 'restored' | 'set',
 ): ActRefusal | undefined {
-  if (audience.fieldPermissionsUnreadable?.has(objectName) || audience.unreadableFields?.get(objectName)?.has(field)) {
+  if (
+    audience.fieldPermissionsUnreadable?.has(objectName) ||
+    audience.unreadableFields?.get(objectName)?.has(field)
+  ) {
     return refusal(
       'forbidden',
       `Field permissions for ${objectName}.${field} could not be read from Twenty, so it was not ${verb}.`,
@@ -318,9 +423,14 @@ function assertFieldWritable(
     return undefined;
   }
 
-  const action = verb === 'set' ? 'set' : verb === 'restored' ? 'restore' : 'update';
+  const action =
+    verb === 'set' ? 'set' : verb === 'restored' ? 'restore' : 'update';
 
-  return refusal('forbidden', `You cannot ${action} ${field} on ${objectName} records.`, { toolName });
+  return refusal(
+    'forbidden',
+    `You cannot ${action} ${field} on ${objectName} records.`,
+    { toolName },
+  );
 }
 
 function isRecordPermissionObject(
@@ -343,7 +453,9 @@ function requireCreate(
     return undefined;
   }
 
-  return refusal('forbidden', `You cannot create ${objectName} records.`, { toolName });
+  return refusal('forbidden', `You cannot create ${objectName} records.`, {
+    toolName,
+  });
 }
 
 function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
@@ -361,12 +473,19 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
       continue;
     }
 
-    if (object.objectName !== 'note' && object.objectName !== 'task' && object.objectName !== 'timelineActivity' && object.canRead) {
+    if (
+      object.objectName !== 'note' &&
+      object.objectName !== 'task' &&
+      object.objectName !== 'timelineActivity' &&
+      object.canRead
+    ) {
       canRead.add(object.objectName);
     }
 
     if (
-      (object.objectName === 'note' || object.objectName === 'task' || object.objectName === 'timelineActivity') &&
+      (object.objectName === 'note' ||
+        object.objectName === 'task' ||
+        object.objectName === 'timelineActivity') &&
       object.canRead
     ) {
       canReadTimeline.add(object.objectName);
@@ -386,7 +505,10 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
       }
     }
 
-    if (!isUpdatableObjectName(object.objectName) || object.fieldPermissions === undefined) {
+    if (
+      !isUpdatableObjectName(object.objectName) ||
+      object.fieldPermissions === undefined
+    ) {
       continue;
     }
 
@@ -423,6 +545,8 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
     canReadTimeline,
     ...(writableFields.size > 0 ? { writableFields } : {}),
     ...(unreadableFields.size > 0 ? { unreadableFields } : {}),
-    ...(fieldPermissionsUnreadable.size > 0 ? { fieldPermissionsUnreadable } : {}),
+    ...(fieldPermissionsUnreadable.size > 0
+      ? { fieldPermissionsUnreadable }
+      : {}),
   };
 }

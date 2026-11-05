@@ -6,6 +6,7 @@ import type {
   TwentyCrmClient,
 } from '../twenty/twenty-crm-client';
 import type { ProposalStore } from '../http/proposal-store';
+import type { SkillStore } from '../http/skill-store';
 import type { LlmProvider } from '../llm/llm-provider';
 import { bindOpenRecord } from './bind-open-record';
 import {
@@ -31,9 +32,11 @@ import {
   type AudienceLoad,
 } from './permissions';
 import { answerReads, isReadTool } from './answer-reads';
-import { describeTool, summarizeLines } from './describe-tool';
+import { captureToTools } from './capture-text';
+import { describeTool, partialsForRole, summarizeLines } from './describe-tool';
 import { changesFromSlots } from './preview-changes';
 import { collectWarnings } from './preview-warnings';
+import { withoutLiveEtag } from './strip-live-etag';
 import type { PartialToolCall } from '../llm/llm-provider';
 import { parseGatewayRequest, type OpenRecordContext } from './parse-request';
 import {
@@ -56,6 +59,7 @@ import type { ExecuteActOptions } from './execute-act';
 
 export type ProposeActOptions = ExecuteActOptions & {
   proposals?: ProposalStore;
+  skills?: SkillStore;
   memberId?: string;
   actorMemberId?: string;
   onPartial?: (tools: PartialToolCall[]) => void;
@@ -111,6 +115,49 @@ export async function proposeAct(
     );
   }
 
+  if (parsed.capture) {
+    const captured = captureToTools(parsed.capture, audience);
+
+    if ('refused' in captured) {
+      return captured;
+    }
+
+    return previewTools(
+      client,
+      parsed.workspaceId,
+      captured,
+      options,
+      audience,
+      undefined,
+    );
+  }
+
+  if (parsed.skillId) {
+    const skill = options.skills?.read(parsed.skillId, options.memberId ?? '');
+
+    if (!skill) {
+      return refusal('not_found', 'No saved skill with that id.', {
+        toolName: 'create_person',
+      });
+    }
+
+    if (skill.workspaceId !== parsed.workspaceId) {
+      return refusal(
+        'cross_workspace',
+        'This skill belongs to a different workspace.',
+      );
+    }
+
+    return previewTools(
+      client,
+      parsed.workspaceId,
+      withoutLiveEtag(skill.tools),
+      options,
+      audience,
+      undefined,
+    );
+  }
+
   if (parsed.intent === undefined || parsed.intent.trim().length === 0) {
     return refusal('invalid_request', 'Provide an intent string.');
   }
@@ -140,7 +187,9 @@ export async function proposeAct(
 
   const emitPartial = options.onPartial
     ? (tools: PartialToolCall[]) => {
-        options.onPartial?.(tools.filter((tool) => allowed.has(tool.name)));
+        options.onPartial?.(
+          partialsForRole(tools, parsed.workspaceId, audience, allowed),
+        );
       }
     : undefined;
 
@@ -184,6 +233,78 @@ export async function proposeAct(
     options,
     audience,
     openRecord,
+  );
+}
+
+export async function reproposeAct(
+  body: unknown,
+  client: TwentyCrmClient,
+  options: ProposeActOptions = {},
+): Promise<PlanResult> {
+  const parsed = parseGatewayRequest(body);
+
+  if ('refused' in parsed) {
+    return parsed;
+  }
+
+  const workspaceRefusal = rejectForeignWorkspace(
+    parsed.workspaceId,
+    options.boundWorkspaceId,
+  );
+
+  if (workspaceRefusal) {
+    return workspaceRefusal;
+  }
+
+  if (!parsed.proposalId) {
+    return refusal(
+      'invalid_request',
+      'proposalId is required to reload a preview.',
+    );
+  }
+
+  if (!options.proposals || !options.memberId) {
+    return refusal('invalid_request', 'This preview cannot be reloaded.');
+  }
+
+  const peeked = options.proposals.peek(
+    parsed.proposalId,
+    parsed.workspaceId,
+    options.memberId,
+    parsed.choiceId,
+    parsed.choices,
+  );
+
+  if (!peeked.ok) {
+    if (peeked.reason === 'choice') {
+      return refusal(
+        'confirmation_required',
+        'Choose a record for each name, then confirm. Nothing was written.',
+      );
+    }
+
+    return refusal(
+      'not_found',
+      'That preview expired or does not exist. Nothing was written.',
+    );
+  }
+
+  const audience = await loadAudience(client);
+
+  if (audience.kind === 'unavailable') {
+    return refusal(
+      'forbidden',
+      'Permissions could not be read from Twenty, so this preview was not reloaded.',
+    );
+  }
+
+  return previewTools(
+    client,
+    parsed.workspaceId,
+    withoutLiveEtag(peeked.proposal.tools),
+    options,
+    audience,
+    undefined,
   );
 }
 

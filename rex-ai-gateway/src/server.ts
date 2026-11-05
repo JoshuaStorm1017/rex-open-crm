@@ -18,11 +18,14 @@ import {
   loadAudience,
 } from './act/permissions';
 import { findStaleChanges } from './act/live-etag';
-import { proposeAct } from './act/propose-act';
+import { WORKSPACE_ID_PATTERN } from './act/find-foreign-workspace-id';
+import { proposeAct, reproposeAct } from './act/propose-act';
+import { withoutLiveEtag } from './act/strip-live-etag';
 import { isRecord } from './is-record';
 import {
   refusal,
   upstreamFailure,
+  type ActRefusal,
   type ActResult,
   type PlanResult,
 } from './act/types';
@@ -36,6 +39,7 @@ import { AuditLog, type AuditAction, type AuditEntry } from './audit/audit-log';
 import { corsHeadersFor, DEFAULT_ALLOWED_ORIGINS } from './http/cors';
 import { IdempotencyStore, readIdempotencyKey } from './http/idempotency-store';
 import { ProposalStore } from './http/proposal-store';
+import { SkillStore } from './http/skill-store';
 import { UndoStore } from './http/undo-store';
 import { createMockLlmProvider } from './llm/mock-llm-provider';
 import type { LlmProvider } from './llm/llm-provider';
@@ -46,12 +50,16 @@ const PLAN_PATH = '/v1/ai/plan';
 const UNDO_PATH = '/v1/ai/undo';
 const TOOLS_PATH = '/v1/ai/tools';
 const AUDIT_PATH = '/v1/ai/audit';
+const SKILLS_PATH = '/v1/ai/skills';
+const REPROPOSE_PATH = '/v1/ai/repropose';
 const KNOWN_PATHS = new Set([
   ACT_PATH,
   PLAN_PATH,
   UNDO_PATH,
   TOOLS_PATH,
   AUDIT_PATH,
+  SKILLS_PATH,
+  REPROPOSE_PATH,
 ]);
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -65,6 +73,7 @@ export type GatewayOptions = ExecuteActOptions & {
   idempotency?: IdempotencyStore;
   proposals?: ProposalStore;
   undos?: UndoStore;
+  skills?: SkillStore;
   allowedOrigins?: string[];
   authenticator?: Authenticator;
   onClose?: () => void;
@@ -85,6 +94,7 @@ type GatewayRuntime = {
   idempotency: IdempotencyStore;
   proposals: ProposalStore;
   undos: UndoStore;
+  skills: SkillStore;
   allowedOrigins: ReadonlySet<string>;
   authenticator: Authenticator;
   onClose?: () => void;
@@ -115,6 +125,7 @@ export function startGateway(options: GatewayOptions): Promise<RunningGateway> {
     idempotency: options.idempotency ?? new IdempotencyStore(),
     proposals: options.proposals ?? new ProposalStore(),
     undos: options.undos ?? new UndoStore(),
+    skills: options.skills ?? new SkillStore(),
     allowedOrigins: new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS),
     authenticator: options.authenticator ?? createMockAuthenticator(),
     onClose: options.onClose,
@@ -245,6 +256,21 @@ async function handleAuthenticated(
     return;
   }
 
+  if (request.method === 'GET' && url.pathname === SKILLS_PATH) {
+    listSkills(url, response, runtime, principal, cors);
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === REPROPOSE_PATH) {
+    await postRepropose(request, response, runtime, principal, cors);
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === SKILLS_PATH) {
+    await postSkill(request, response, runtime, principal, cors);
+    return;
+  }
+
   if (
     request.method !== 'POST' ||
     (url.pathname !== ACT_PATH &&
@@ -294,6 +320,7 @@ async function handleAuthenticated(
     const result = await proposeAct(parsed, runtime.client, runtime.llm, {
       boundWorkspaceId: runtime.boundWorkspaceId,
       proposals: runtime.proposals,
+      skills: runtime.skills,
       memberId: principal.memberId,
       actorMemberId: principal.memberId,
     });
@@ -610,9 +637,17 @@ async function executeConfirmedAct(
   }
 
   const { effects, ...publicResult } = executed;
+  const confirmedPlan = runtime.skills.saveConfirmed(
+    principal.memberId,
+    parsed.workspaceId,
+    withoutLiveEtag(claimed.proposal.tools),
+  );
+  const withPlan = confirmedPlan
+    ? { ...publicResult, confirmedPlanId: confirmedPlan.id }
+    : publicResult;
 
   if (!effects || effects.length === 0) {
-    return publicResult;
+    return withPlan;
   }
 
   const ticket = runtime.undos.save(
@@ -622,14 +657,226 @@ async function executeConfirmedAct(
   );
 
   if (!ticket) {
-    return publicResult;
+    return withPlan;
   }
 
   return {
-    ...publicResult,
+    ...withPlan,
     undo: { id: ticket.id, summary: ticket.summary },
     undos: publicUndos(runtime, principal.memberId, parsed.workspaceId),
   };
+}
+
+function listSkills(
+  url: URL,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+): void {
+  const workspaceId = url.searchParams.get('workspaceId') ?? '';
+
+  if (!WORKSPACE_ID_PATTERN.test(workspaceId)) {
+    sendJson(
+      response,
+      400,
+      refusal(
+        'invalid_request',
+        'workspaceId must be a gateway token such as "ws_demo".',
+      ),
+      cors,
+    );
+    return;
+  }
+
+  if (runtime.boundWorkspaceId && workspaceId !== runtime.boundWorkspaceId) {
+    sendJson(
+      response,
+      400,
+      refusal(
+        'cross_workspace',
+        `Request workspace "${workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
+      ),
+      cors,
+    );
+    return;
+  }
+
+  sendJson(
+    response,
+    200,
+    {
+      ok: true,
+      workspaceId,
+      skills: runtime.skills.list(principal.memberId, workspaceId),
+    },
+    cors,
+  );
+}
+
+async function postRepropose(
+  request: IncomingMessage,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+): Promise<void> {
+  const parsed = await readJsonBody(request, response, cors);
+
+  if (parsed === undefined) {
+    return;
+  }
+
+  const result = await reproposeAct(parsed, runtime.client, {
+    boundWorkspaceId: runtime.boundWorkspaceId,
+    proposals: runtime.proposals,
+    memberId: principal.memberId,
+    actorMemberId: principal.memberId,
+  });
+  rememberOutcome(runtime, principal, REPROPOSE_PATH, false, result);
+  sendJson(response, statusFor(result), result, cors);
+}
+
+async function postSkill(
+  request: IncomingMessage,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+): Promise<void> {
+  const parsedBody = await readJsonBody(request, response, cors);
+
+  if (parsedBody === undefined) {
+    return;
+  }
+
+  const parsed = parseGatewayRequest(parsedBody);
+
+  if ('refused' in parsed) {
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, parsed);
+    sendJson(response, statusFor(parsed), parsed, cors);
+    return;
+  }
+
+  if (
+    runtime.boundWorkspaceId &&
+    parsed.workspaceId !== runtime.boundWorkspaceId
+  ) {
+    const body = refusal(
+      'cross_workspace',
+      `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${runtime.boundWorkspaceId}".`,
+    );
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+    sendJson(response, statusFor(body), body, cors);
+    return;
+  }
+
+  if (!parsed.confirmedPlanId || !parsed.skillName) {
+    const body = refusal(
+      'invalid_request',
+      'Saving a skill needs confirmedPlanId and skillName. Nothing was written.',
+    );
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+    sendJson(response, statusFor(body), body, cors);
+    return;
+  }
+
+  const plan = runtime.skills.readConfirmed(
+    parsed.confirmedPlanId,
+    principal.memberId,
+  );
+
+  if (!plan) {
+    const body = refusal(
+      'not_found',
+      'That confirmed plan expired or does not exist. Nothing was written.',
+    );
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+    sendJson(response, statusFor(body), body, cors);
+    return;
+  }
+
+  if (plan.workspaceId !== parsed.workspaceId) {
+    const body = refusal(
+      'cross_workspace',
+      'This confirmed plan belongs to a different workspace.',
+    );
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+    sendJson(response, statusFor(body), body, cors);
+    return;
+  }
+
+  const saved = runtime.skills.saveSkill(
+    principal.memberId,
+    parsed.workspaceId,
+    parsed.skillName,
+    plan.tools,
+  );
+
+  if (!saved.ok) {
+    const body = refusal(
+      'invalid_request',
+      saved.reason === 'duplicate'
+        ? 'A skill with that name is already saved.'
+        : saved.reason === 'full'
+          ? 'Too many saved skills. Nothing was written.'
+          : 'That confirmed plan has no tools to save.',
+    );
+    rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+    sendJson(response, statusFor(body), body, cors);
+    return;
+  }
+
+  const body = {
+    ok: true as const,
+    workspaceId: parsed.workspaceId,
+    summary: `Saved skill ${saved.skill.name}.`,
+    skill: {
+      id: saved.skill.id,
+      name: saved.skill.name,
+      tools: saved.skill.tools.map((tool) => tool.name),
+    },
+  };
+  rememberOutcome(runtime, principal, SKILLS_PATH, false, body);
+  sendJson(response, 200, body, cors);
+}
+
+async function readJsonBody(
+  request: IncomingMessage,
+  response: ServerResponse,
+  cors: Record<string, string>,
+): Promise<unknown | undefined> {
+  const rawBody = await readBody(request);
+
+  if (rawBody === undefined) {
+    sendJson(
+      response,
+      400,
+      {
+        ok: false,
+        refused: true,
+        reason: 'invalid_request',
+        message: `Body exceeds ${MAX_BODY_BYTES} bytes.`,
+      },
+      cors,
+    );
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    const body = refusal('invalid_request', 'Body must be JSON.');
+    sendJson(response, 400, body, cors);
+    return undefined;
+  }
+}
+
+function undoLockLost(): ActRefusal {
+  return refusal(
+    'precondition_failed',
+    'Another process took this undo. This process stopped and left the ticket in place.',
+  );
 }
 
 async function executeConfirmedUndo(
@@ -712,6 +959,11 @@ async function executeConfirmedUndo(
     );
   }
 
+  if (!runtime.undos.holdsLock(principal.memberId)) {
+    runtime.undos.release(principal.memberId);
+    return undoLockLost();
+  }
+
   let failures;
 
   try {
@@ -719,11 +971,18 @@ async function executeConfirmedUndo(
       runtime.client,
       parsed.workspaceId,
       begun.ticket.effects,
-      () => !runtime.undos.superseded(principal.memberId),
+      () =>
+        runtime.undos.holdsLock(principal.memberId) &&
+        !runtime.undos.superseded(principal.memberId),
     );
   } catch (error) {
     runtime.undos.release(principal.memberId);
     return upstreamFailure(error, 0);
+  }
+
+  if (!runtime.undos.holdsLock(principal.memberId)) {
+    runtime.undos.release(principal.memberId);
+    return undoLockLost();
   }
 
   if (failures.some((failure) => failure.reason === 'superseded')) {
@@ -822,6 +1081,7 @@ async function streamPlan(
   const result = await proposeAct(parsed, runtime.client, runtime.llm, {
     boundWorkspaceId: runtime.boundWorkspaceId,
     proposals: runtime.proposals,
+    skills: runtime.skills,
     memberId: principal.memberId,
     actorMemberId: principal.memberId,
     onPartial: (tools) => {
@@ -1013,7 +1273,11 @@ function remember(
 }
 
 function actionForPath(pathname: string): AuditAction {
-  if (pathname === PLAN_PATH) {
+  if (
+    pathname === PLAN_PATH ||
+    pathname === REPROPOSE_PATH ||
+    pathname === SKILLS_PATH
+  ) {
     return 'plan';
   }
 

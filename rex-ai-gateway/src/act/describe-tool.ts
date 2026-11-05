@@ -1,8 +1,9 @@
+import type { PartialToolCall } from '../llm/llm-provider';
 import type { CreatedRecord } from '../twenty/twenty-crm-client';
 import { isAllowedToolName } from './allowlist';
+import { assertToolPermitted, type AudienceLoad } from './permissions';
 import type { ProposalLine } from './types';
 import { validateTool, type ValidatedTool } from './validate-tool';
-import type { PartialToolCall } from '../llm/llm-provider';
 
 export function describeTool(
   tool: ValidatedTool,
@@ -92,6 +93,35 @@ export function describeTool(
       };
     }
   }
+}
+
+// A completed partial would otherwise name a field this role cannot write.
+export function partialsForRole(
+  tools: PartialToolCall[],
+  workspaceId: string,
+  audience: AudienceLoad,
+  allowed: ReadonlySet<string>,
+): PartialToolCall[] {
+  return tools.flatMap((tool) => {
+    if (!allowed.has(tool.name)) {
+      return [];
+    }
+
+    if (!tool.complete) {
+      return [tool];
+    }
+
+    const validated = validateTool(
+      { name: tool.name, args: tool.args },
+      workspaceId,
+    );
+
+    if ('refused' in validated || assertToolPermitted(validated, audience)) {
+      return [{ name: tool.name, args: {}, complete: false }];
+    }
+
+    return [tool];
+  });
 }
 
 export function describePartialTools(
