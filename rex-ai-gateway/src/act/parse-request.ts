@@ -24,6 +24,7 @@ export type ParsedRequest = {
   confirmed: boolean;
   proposalId?: string;
   choiceId?: string;
+  choices?: Record<string, string>;
   undoId?: string;
   openRecord?: OpenRecordContext;
 };
@@ -103,6 +104,12 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     return refusal('invalid_request', 'choiceId is not one of the preview choices.');
   }
 
+  const choices = parseChoices(body.choices);
+
+  if ('refused' in choices) {
+    return choices;
+  }
+
   if (body.undoId !== undefined && typeof body.undoId !== 'string') {
     return refusal('invalid_request', 'undoId must be a string.');
   }
@@ -124,9 +131,44 @@ export function parseGatewayRequest(body: unknown): ParsedRequest | ActRefusal {
     confirmed: body.confirmed === true,
     ...(typeof body.proposalId === 'string' ? { proposalId: body.proposalId } : {}),
     ...(typeof body.choiceId === 'string' ? { choiceId: body.choiceId } : {}),
+    ...(choices.choices ? { choices: choices.choices } : {}),
     ...(typeof body.undoId === 'string' ? { undoId: body.undoId } : {}),
     ...(openRecord ? { openRecord } : {}),
   };
+}
+
+function parseChoices(value: unknown): { choices?: Record<string, string> } | ActRefusal {
+  if (value === undefined) {
+    return {};
+  }
+
+  if (!isRecord(value)) {
+    return refusal('invalid_request', 'choices must be an object.');
+  }
+
+  const keys = Object.keys(value);
+
+  if (keys.length > MAX_TOOLS_PER_REQUEST) {
+    return refusal('invalid_request', 'choices has too many names.');
+  }
+
+  const choices: Record<string, string> = {};
+
+  for (const key of keys) {
+    if (!/^[0-9]{1,2}$/.test(key)) {
+      return refusal('invalid_request', 'choices keys must be preview group ids.');
+    }
+
+    const choiceId = value[key];
+
+    if (typeof choiceId !== 'string' || !CHOICE_ID_PATTERN.test(choiceId)) {
+      return refusal('invalid_request', 'choices values must be preview choice ids.');
+    }
+
+    choices[key] = choiceId;
+  }
+
+  return { choices };
 }
 
 function parseOpenRecord(value: unknown): OpenRecordContext | undefined | ActRefusal {

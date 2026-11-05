@@ -80,6 +80,49 @@ export function createNewTools(choice: ChoiceDraft): ToolCall[] | undefined {
   return updateAsCreate(choice);
 }
 
+export function createToolsForGroup(group: {
+  kind: PendingChoice['kind'];
+  objectName: PendingChoice['objectName'];
+  query: string;
+  updates: Array<{ field: string; value: string | number }>;
+  title?: string;
+  body: string;
+}): ToolCall[] | undefined {
+  const first = group.updates[0];
+
+  if (!first) {
+    return undefined;
+  }
+
+  const base = createNewTools({
+    kind: group.kind,
+    objectName: group.objectName,
+    field: first.field,
+    value: first.value,
+    ...(group.title ? { title: group.title } : {}),
+    body: group.body,
+    query: group.query,
+  });
+
+  if (!base || group.updates.length === 1) {
+    return base;
+  }
+
+  return [
+    ...base,
+    ...group.updates.slice(1).map((update) => ({
+      name: 'update_record',
+      args: {
+        object: group.objectName,
+        id: '$0',
+        field: update.field,
+        value: update.value,
+        ifMatch: 'created',
+      },
+    })),
+  ];
+}
+
 export function createNewLabel(choice: ChoiceDraft): string {
   if (choice.kind === 'note') {
     return `Create new ${choice.objectName} “${choice.query}” and add the note`;

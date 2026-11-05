@@ -148,12 +148,28 @@ export async function executeAct(
         });
       }
 
-      const snapshot = await snapshotUpdate(client, parsed.workspaceId, resolved);
-      const result = await dispatch(client, parsed.workspaceId, resolved);
+      const fresh = applyPriorEtag(resolved, results);
+
+      if ('refused' in fresh) {
+        const remaining = await compensate(client, parsed.workspaceId, effects);
+        if (remaining.length > 0) {
+          return partialFailure(
+            fresh.message,
+            remaining.map((failure) => failure.id),
+          );
+        }
+        return refusal(fresh.reason, withRollback(fresh.message, effects.length), {
+          toolName: fresh.toolName,
+          missingFields: fresh.missingFields,
+        });
+      }
+
+      const snapshot = await snapshotUpdate(client, parsed.workspaceId, fresh);
+      const result = await dispatch(client, parsed.workspaceId, fresh);
       results.push(result);
       priorIds.push(recordId(result));
       priorEtags.push(result.status === 'found' ? undefined : result.record.etag);
-      effects.push(...effectsFor(resolved, result, snapshot));
+      effects.push(...effectsFor(fresh, result, snapshot));
     }
   } catch (error) {
     const orphans =
@@ -373,6 +389,63 @@ async function dispatch(
   }
 }
 
+function applyPriorEtag(tool: ValidatedTool, results: ToolResult[]): ValidatedTool | ActRefusal {
+  if (tool.name === 'update_record') {
+    return withFreshEtag(tool, results);
+  }
+
+  if (tool.name === 'archive_record') {
+    return withFreshEtag(tool, results);
+  }
+
+  return tool;
+}
+
+function withFreshEtag<TTool extends ValidatedTool & { name: 'update_record' | 'archive_record' }>(
+  tool: TTool,
+  results: ToolResult[],
+): TTool | ActRefusal {
+  const priorEtag = etagFromPriorWrite(tool.input.objectName, tool.input.id, results);
+
+  if (priorEtag) {
+    return { ...tool, input: { ...tool.input, ifMatch: priorEtag } };
+  }
+
+  if (tool.input.ifMatch === 'chained') {
+    return refusal(
+      'precondition_failed',
+      `Refusing ${tool.name}: ${tool.input.id ?? 'the record'} has no etag from an earlier write in this preview.`,
+      { toolName: tool.name },
+    );
+  }
+
+  return tool;
+}
+
+function etagFromPriorWrite(
+  objectName: string,
+  id: string | undefined,
+  results: ToolResult[],
+): string | undefined {
+  if (!id) {
+    return undefined;
+  }
+
+  for (let index = results.length - 1; index >= 0; index -= 1) {
+    const result = results[index];
+
+    if (!result || result.status === 'found') {
+      continue;
+    }
+
+    if (result.record.id === id && result.record.objectName === objectName) {
+      return result.record.etag;
+    }
+  }
+
+  return undefined;
+}
+
 function recordId(result: ToolResult): string | undefined {
   if (result.status === 'found') {
     return undefined;
@@ -438,6 +511,7 @@ function effectsFor(
         id: tool.input.id,
         field,
         previous,
+        written: tool.input.value,
         etag: result.record.etag,
       },
     ];

@@ -14,6 +14,8 @@ import {
 } from '@/ai-command-bar/utils/aiCommandBarClient';
 import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
 import { isAiCommandBarShortcut } from '@/ai-command-bar/utils/isAiCommandBarShortcut';
+import { sidePanelNavigationStackState } from '@/side-panel/states/sidePanelNavigationStackState';
+import { useAtomStateValue } from '@/ui/utilities/state/jotai/hooks/useAtomStateValue';
 import {
   readAiCommandBarConfig,
   type AiCommandBarConfig,
@@ -30,9 +32,16 @@ type Phase =
       proposal: AiProposal;
       idempotencyKey: string;
       choiceId?: string;
+      choiceIds: Record<string, string>;
     }
   | { name: 'executing'; draft: string; proposal: AiProposal }
-  | { name: 'done'; links: AiRecordLink[]; undo?: AiUndo; notice?: string }
+  | {
+      name: 'done';
+      links: AiRecordLink[];
+      undo?: AiUndo;
+      undos?: AiUndo[];
+      notice?: string;
+    }
   | { name: 'undoing'; draft: string; links: AiRecordLink[]; undo: AiUndo }
   | { name: 'refused'; draft: string; message: string };
 
@@ -56,7 +65,11 @@ export const AiCommandBar = ({
   const launcherRef = useRef<HTMLButtonElement>(null);
   const [wasOpen, setWasOpen] = useState(initialOpen);
   const resolvedConfig = config ?? readAiCommandBarConfig();
-  const openRecord = readOpenRecordFromPath(useLocation().pathname);
+  const routeRecord = readOpenRecordFromPath(useLocation().pathname);
+  const panelPath = useAtomStateValue(sidePanelNavigationStackState).at(-1)
+    ?.routedLocation?.pathname;
+  const panelRecord = panelPath ? readOpenRecordFromPath(panelPath) : undefined;
+  const openRecord = panelRecord ?? routeRecord;
   const [open, setOpen] = useState(initialOpen);
   const [phase, setPhase] = useState<Phase>({ name: 'compose', draft: '' });
   const executing = phase.name === 'executing' || phase.name === 'undoing';
@@ -212,6 +225,7 @@ export const AiCommandBar = ({
       draft,
       proposal: outcome.data,
       idempotencyKey: crypto.randomUUID(),
+      choiceIds: {},
     });
   };
 
@@ -220,6 +234,7 @@ export const AiCommandBar = ({
     idempotencyKey: string,
     draft: string,
     choiceId?: string,
+    choiceIds?: Record<string, string>,
   ) => {
     const generation = readGeneration();
 
@@ -231,6 +246,7 @@ export const AiCommandBar = ({
       idempotencyKey,
       fetchImpl,
       choiceId,
+      choiceIds,
     );
 
     if (generation !== readGeneration()) {
@@ -246,6 +262,7 @@ export const AiCommandBar = ({
       name: 'done',
       links: outcome.data.links,
       ...(outcome.data.undo ? { undo: outcome.data.undo } : {}),
+      ...(outcome.data.undos ? { undos: outcome.data.undos } : {}),
     });
   };
 
@@ -279,7 +296,19 @@ export const AiCommandBar = ({
         name: 'done',
         links: current.links,
         undo: current.undo,
+        ...(current.undos ? { undos: current.undos } : {}),
         notice: outcome.message,
+      });
+      return;
+    }
+
+    if (outcome.data.next) {
+      setPhase({
+        name: 'done',
+        links: current.links,
+        undo: outcome.data.next,
+        undos: outcome.data.undos ?? [outcome.data.next],
+        notice: t`Undone. The next recent change can still be reversed.`,
       });
       return;
     }
@@ -401,43 +430,96 @@ export const AiCommandBar = ({
             {(phase.name === 'preview' || phase.name === 'executing') && (
               <>
                 <StyledSummary>{phase.proposal.summary}</StyledSummary>
-                {phase.name === 'preview' && phase.proposal.choice && (
-                  <StyledChoices>
-                    <legend>{phase.proposal.choice.prompt}</legend>
-                    {phase.proposal.choice.candidates.map((candidate) => (
-                      <StyledChoice key={candidate.id}>
-                        <label>
-                          <input
-                            type="radio"
-                            name="ai-record-choice"
-                            value={candidate.id}
-                            checked={phase.choiceId === candidate.id}
-                            onChange={() =>
-                              setPhase({
-                                ...phase,
-                                choiceId: candidate.id,
-                              })
-                            }
-                          />
-                          <StyledChoiceText>
-                            <span>{candidate.label}</span>
-                            {candidate.detail && (
-                              <StyledChoiceDetail>{candidate.detail}</StyledChoiceDetail>
-                            )}
-                          </StyledChoiceText>
-                        </label>
-                        {candidate.action === 'create' && (
-                          <StyledChoiceHint>{t`New record`}</StyledChoiceHint>
-                        )}
-                      </StyledChoice>
-                    ))}
-                  </StyledChoices>
-                )}
-                {!phase.proposal.choice && (
+                {phase.name === 'preview' &&
+                  phase.proposal.choice?.groups?.map((group) => (
+                    <StyledChoices key={group.id}>
+                      <legend>{group.prompt}</legend>
+                      {group.candidates.map((candidate) => (
+                        <StyledChoice key={`${group.id}-${candidate.id}`}>
+                          <label>
+                            <input
+                              type="radio"
+                              name={`ai-record-choice-${group.id}`}
+                              value={candidate.id}
+                              checked={
+                                phase.choiceIds[group.id] === candidate.id
+                              }
+                              onChange={() =>
+                                setPhase({
+                                  ...phase,
+                                  choiceIds: {
+                                    ...phase.choiceIds,
+                                    [group.id]: candidate.id,
+                                  },
+                                })
+                              }
+                            />
+                            <StyledChoiceText>
+                              <span>{candidate.label}</span>
+                              {candidate.detail && (
+                                <StyledChoiceDetail>
+                                  {candidate.detail}
+                                </StyledChoiceDetail>
+                              )}
+                            </StyledChoiceText>
+                          </label>
+                          {candidate.action === 'create' && (
+                            <StyledChoiceHint>{t`New record`}</StyledChoiceHint>
+                          )}
+                        </StyledChoice>
+                      ))}
+                    </StyledChoices>
+                  ))}
+                {phase.name === 'preview' &&
+                  phase.proposal.choice &&
+                  !phase.proposal.choice.groups && (
+                    <StyledChoices>
+                      <legend>{phase.proposal.choice.prompt}</legend>
+                      {phase.proposal.choice.candidates.map((candidate) => (
+                        <StyledChoice key={candidate.id}>
+                          <label>
+                            <input
+                              type="radio"
+                              name="ai-record-choice"
+                              value={candidate.id}
+                              checked={phase.choiceId === candidate.id}
+                              onChange={() =>
+                                setPhase({
+                                  ...phase,
+                                  choiceId: candidate.id,
+                                })
+                              }
+                            />
+                            <StyledChoiceText>
+                              <span>{candidate.label}</span>
+                              {candidate.detail && (
+                                <StyledChoiceDetail>
+                                  {candidate.detail}
+                                </StyledChoiceDetail>
+                              )}
+                            </StyledChoiceText>
+                          </label>
+                          {candidate.action === 'create' && (
+                            <StyledChoiceHint>{t`New record`}</StyledChoiceHint>
+                          )}
+                        </StyledChoice>
+                      ))}
+                    </StyledChoices>
+                  )}
+                {(!phase.proposal.choice ||
+                  (phase.proposal.choice.groups &&
+                    phase.proposal.lines.some(
+                      (line) => line.summary !== phase.proposal.choice?.prompt,
+                    ))) && (
                   <StyledList>
-                    {phase.proposal.lines.map((line, index) => (
-                      <li key={`${index}-${line.tool}`}>{line.summary}</li>
-                    ))}
+                    {phase.proposal.lines
+                      .filter(
+                        (line) =>
+                          line.summary !== phase.proposal.choice?.prompt,
+                      )
+                      .map((line, index) => (
+                        <li key={`${index}-${line.tool}`}>{line.summary}</li>
+                      ))}
                   </StyledList>
                 )}
               </>
@@ -447,13 +529,24 @@ export const AiCommandBar = ({
                 <StyledPrimary
                   ref={confirmRef}
                   type="button"
-                  disabled={Boolean(phase.proposal.choice) && !phase.choiceId}
+                  disabled={
+                    phase.proposal.choice?.groups
+                      ? !phase.proposal.choice.groups.every(
+                          (group) => phase.choiceIds[group.id],
+                        )
+                      : Boolean(phase.proposal.choice) && !phase.choiceId
+                  }
                   onClick={() =>
                     void confirm(
                       phase.proposal,
                       phase.idempotencyKey,
                       phase.draft,
-                      phase.choiceId,
+                      phase.proposal.choice?.groups
+                        ? undefined
+                        : phase.choiceId,
+                      phase.proposal.choice?.groups
+                        ? phase.choiceIds
+                        : undefined,
                     )
                   }
                 >
@@ -505,6 +598,13 @@ export const AiCommandBar = ({
                         </li>
                       );
                     })}
+                  </StyledList>
+                )}
+                {(phase.undos ?? []).length > 1 && (
+                  <StyledList>
+                    {(phase.undos ?? []).map((item) => (
+                      <li key={item.id}>{item.summary}</li>
+                    ))}
                   </StyledList>
                 )}
                 <StyledActions>

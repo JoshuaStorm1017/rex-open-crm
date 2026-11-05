@@ -527,6 +527,13 @@ describe('createHttpTwentyCrmClient', () => {
         return;
       }
 
+      if (captured.method === 'DELETE') {
+        sendJson(response, 200, {
+          data: { deleteCompanies: [{ id: 'company_row' }] },
+        });
+        return;
+      }
+
       sendJson(response, 200, {
         data: { updateCompanies: [{ id: 'company_row', updatedAt: '2026-01-02T00:00:00.000Z' }] },
       });
@@ -582,9 +589,173 @@ describe('createHttpTwentyCrmClient', () => {
       'GET /rest/companies/company_row?depth=1',
       'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
       'GET /rest/companies/company_row?depth=1',
-      'DELETE /rest/companies/company_row?soft_delete=true',
+      'DELETE /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)&soft_delete=true',
       'PATCH /rest/companies/company_row/restore',
     ]);
+  });
+
+  it('locks relation fields by their metadata name', async () => {
+    const twenty = await startFakeTwenty((_captured, response) => {
+      sendJson(response, 200, {
+        data: {
+          objects: {
+            edges: [
+              {
+                node: {
+                  id: 'obj_company',
+                  nameSingular: 'company',
+                  fieldsList: [
+                    { id: 'field_name', name: 'name' },
+                    { id: 'field_domain', name: 'domainName' },
+                    { id: 'field_linkedin', name: 'linkedinLink' },
+                    { id: 'field_address', name: 'address' },
+                    { id: 'field_owner', name: 'accountOwner' },
+                  ],
+                },
+              },
+              {
+                node: {
+                  id: 'obj_opportunity',
+                  nameSingular: 'opportunity',
+                  fieldsList: [
+                    { id: 'field_opp_name', name: 'name' },
+                    { id: 'field_stage', name: 'stage' },
+                    { id: 'field_amount', name: 'amount' },
+                    { id: 'field_close', name: 'closeDate' },
+                    { id: 'field_opp_owner', name: 'owner' },
+                  ],
+                },
+              },
+              {
+                node: {
+                  id: 'obj_person',
+                  nameSingular: 'person',
+                  fieldsList: [
+                    { id: 'field_person_name', name: 'name' },
+                    { id: 'field_emails', name: 'emails' },
+                    { id: 'field_job', name: 'jobTitle' },
+                    { id: 'field_phones', name: 'phones' },
+                    { id: 'field_person_linkedin', name: 'linkedinLink' },
+                  ],
+                },
+              },
+            ],
+          },
+          currentUser: {
+            currentUserWorkspace: {
+              objectPermissions: [
+                {
+                  objectMetadataId: 'obj_company',
+                  canReadObjectRecords: true,
+                  canUpdateObjectRecords: true,
+                  canSoftDeleteObjectRecords: true,
+                  restrictedFields: {
+                    field_owner: { canRead: true, canUpdate: false },
+                  },
+                },
+                {
+                  objectMetadataId: 'obj_opportunity',
+                  canReadObjectRecords: true,
+                  canUpdateObjectRecords: true,
+                  canSoftDeleteObjectRecords: true,
+                  restrictedFields: {
+                    field_opp_owner: { canRead: true, canUpdate: false },
+                  },
+                },
+                {
+                  objectMetadataId: 'obj_person',
+                  canReadObjectRecords: true,
+                  canUpdateObjectRecords: true,
+                  canSoftDeleteObjectRecords: true,
+                  restrictedFields: {
+                    field_emails: { canRead: false, canUpdate: false },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'graphql' });
+
+    if (!client.loadCapabilities) {
+      throw new Error('loadCapabilities is missing');
+    }
+
+    const capabilities = await client.loadCapabilities();
+    const company = capabilities.objects.find((object) => object.objectName === 'company');
+    const opportunity = capabilities.objects.find((object) => object.objectName === 'opportunity');
+    const person = capabilities.objects.find((object) => object.objectName === 'person');
+    const companyFields = company?.fieldPermissions;
+    const opportunityFields = opportunity?.fieldPermissions;
+    const personFields = person?.fieldPermissions;
+
+    expect(Array.isArray(companyFields)).toBe(true);
+    expect(companyFields).toEqual(
+      expect.arrayContaining([
+        { name: 'accountOwner', canUpdate: false },
+        { name: 'name', canUpdate: true },
+        { name: 'city', canUpdate: true },
+      ]),
+    );
+    expect(companyFields).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'accountOwner', unreadable: true })]),
+    );
+    expect(opportunityFields).toEqual(
+      expect.arrayContaining([{ name: 'owner', canUpdate: false }]),
+    );
+    expect(personFields).toEqual(expect.arrayContaining([{ name: 'email', canUpdate: false }]));
+    expect(personFields).toEqual(
+      expect.arrayContaining([{ name: 'jobTitle', canUpdate: true }]),
+    );
+  });
+
+  it('fails closed when restrictedFields cannot be read', async () => {
+    const twenty = await startFakeTwenty((_captured, response) => {
+      sendJson(response, 200, {
+        data: {
+          objects: {
+            edges: [
+              {
+                node: {
+                  id: 'obj_company',
+                  nameSingular: 'company',
+                  fieldsList: [
+                    { id: 'field_name', name: 'name' },
+                    { id: 'field_owner', name: 'accountOwner' },
+                  ],
+                },
+              },
+            ],
+          },
+          currentUser: {
+            currentUserWorkspace: {
+              objectPermissions: [
+                {
+                  objectMetadataId: 'obj_company',
+                  canReadObjectRecords: true,
+                  canUpdateObjectRecords: true,
+                  canSoftDeleteObjectRecords: true,
+                  restrictedFields: null,
+                },
+              ],
+            },
+          },
+        },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'graphql' });
+
+    if (!client.loadCapabilities) {
+      throw new Error('loadCapabilities is missing');
+    }
+
+    const capabilities = await client.loadCapabilities();
+
+    expect(capabilities.objects.find((object) => object.objectName === 'company')?.fieldPermissions).toBe(
+      'unavailable',
+    );
   });
 });
 

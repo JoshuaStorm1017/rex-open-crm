@@ -16,6 +16,7 @@ export type AuditEntry = {
   confirmed?: boolean;
   reason?: string;
   replayed?: boolean;
+  reverses?: string;
 };
 
 const MAX_ENTRIES = 200;

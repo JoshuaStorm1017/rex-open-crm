@@ -21,6 +21,15 @@ const THIS_UPDATE_PATTERN =
 const THIS_NOTE_PATTERN =
   /^add (?:a )?note(?: titled (?<title>[^:]+?))?(?: to this (?<object>deal|opportunity|person|company|record))?: (?<body>.+)$/i;
 
+const TWO_NAMED_UPDATES_PATTERN =
+  /^update (?<object1>person|company|opportunity) named (?<query1>.+?) set (?<field1>[A-Za-z][A-Za-z0-9]*) to (?<value1>.+?) and update (?<object2>person|company|opportunity) named (?<query2>.+?) set (?<field2>[A-Za-z][A-Za-z0-9]*) to (?<value2>.+)$/i;
+
+const MULTI_FIELD_BY_NAME_PATTERN =
+  /^update (?<object>person|company|opportunity) named (?<query>.+?) set (?<field1>[A-Za-z][A-Za-z0-9]*) to (?<value1>.+?) and (?<field2>[A-Za-z][A-Za-z0-9]*) to (?<value2>.+?)(?: ifMatch (?<ifMatch>\S+))?$/i;
+
+const THIS_MULTI_UPDATE_PATTERN =
+  /^(?:update|set|change) this (?<object>deal|opportunity|person|company|record)(?:['’]s)? (?<field1>[A-Za-z][A-Za-z0-9]*) to (?<value1>.+?) and (?<field2>[A-Za-z][A-Za-z0-9]*) to (?<value2>.+)$/i;
+
 const UPDATE_BY_ID_PATTERN =
   /^update (?<object>person|company|opportunity) (?<id>[A-Za-z0-9_-]+) set (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+?)(?: ifMatch (?<ifMatch>\S+))?$/i;
 
@@ -118,6 +127,12 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
     };
   }
 
+  const thisMulti = THIS_MULTI_UPDATE_PATTERN.exec(text);
+
+  if (thisMulti?.groups?.object && thisMulti.groups.field1 && thisMulti.groups.field2) {
+    return thisRecordFields(input, thisMulti.groups);
+  }
+
   const thisUpdate = THIS_UPDATE_PATTERN.exec(text);
 
   if (thisUpdate?.groups?.object && thisUpdate.groups.field && thisUpdate.groups.value) {
@@ -164,6 +179,56 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
             query: trimValue(search.groups.query),
           },
         },
+      ],
+    };
+  }
+
+  const twoNamed = TWO_NAMED_UPDATES_PATTERN.exec(text);
+
+  if (twoNamed?.groups?.object1 && twoNamed.groups.object2 && twoNamed.groups.query1 && twoNamed.groups.query2) {
+    return {
+      ok: true,
+      summary: `Update ${twoNamed.groups.object1} named ${trimValue(twoNamed.groups.query1)} and ${twoNamed.groups.object2} named ${trimValue(twoNamed.groups.query2)}.`,
+      tools: [
+        updateTool({
+          object: twoNamed.groups.object1,
+          query: trimValue(twoNamed.groups.query1),
+          field: twoNamed.groups.field1,
+          value: twoNamed.groups.value1,
+        }),
+        updateTool({
+          object: twoNamed.groups.object2,
+          query: trimValue(twoNamed.groups.query2),
+          field: twoNamed.groups.field2,
+          value: twoNamed.groups.value2,
+        }),
+      ],
+    };
+  }
+
+  const multiField = MULTI_FIELD_BY_NAME_PATTERN.exec(text);
+
+  if (multiField?.groups?.object && multiField.groups.query && multiField.groups.field1 && multiField.groups.field2) {
+    const query = trimValue(multiField.groups.query);
+
+    return {
+      ok: true,
+      summary: `Update ${multiField.groups.object} named ${query}.`,
+      tools: [
+        updateTool({
+          object: multiField.groups.object,
+          query,
+          field: multiField.groups.field1,
+          value: multiField.groups.value1,
+          ifMatch: multiField.groups.ifMatch,
+        }),
+        updateTool({
+          object: multiField.groups.object,
+          query,
+          field: multiField.groups.field2,
+          value: multiField.groups.value2,
+          ifMatch: multiField.groups.ifMatch,
+        }),
       ],
     };
   }
@@ -242,6 +307,31 @@ function thisRecordArchive(input: LlmPlanInput, word: string): LlmPlan {
         args: { object: objectName, recordRef: 'open' },
       },
     ],
+  };
+}
+
+function thisRecordFields(
+  input: LlmPlanInput,
+  groups: Record<string, string | undefined>,
+): LlmPlan {
+  const objectName = openObject(groups.object ?? '', input.openRecord);
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  return {
+    ok: true,
+    summary: `Update the open ${objectName}.`,
+    tools: [groups.field1, groups.field2].filter((field): field is string => Boolean(field)).map((field, index) => ({
+      name: 'update_record',
+      args: {
+        object: objectName,
+        field,
+        value: fieldValue(field, index === 0 ? groups.value1 : groups.value2),
+        recordRef: 'open',
+      },
+    })),
   };
 }
 
@@ -339,7 +429,7 @@ function updateTool(groups: Record<string, string | undefined>): ToolCall {
   const args: Record<string, unknown> = {
     object: objectNameFor(groups.object ?? ''),
     field,
-    value: field === 'amount' ? Number((groups.value ?? '').replace(/,/g, '')) : trimValue(groups.value ?? ''),
+    value: fieldValue(field, groups.value),
   };
 
   if (groups.id) {
@@ -379,6 +469,14 @@ function parseMoney(amount: string, multiplier: string | undefined): number | un
   }
 
   return multiplier ? numeric * 1000 : numeric;
+}
+
+function fieldValue(field: string, value: string | undefined): string | number {
+  if (field === 'amount') {
+    return Number((value ?? '').replace(/,/g, ''));
+  }
+
+  return trimValue(value ?? '');
 }
 
 function trimValue(value: string): string {

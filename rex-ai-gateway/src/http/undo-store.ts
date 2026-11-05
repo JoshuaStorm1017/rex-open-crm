@@ -2,17 +2,21 @@ import { randomUUID } from 'node:crypto';
 
 import type { ActEffect } from '../act/types';
 
+export const UNDO_STACK_LIMIT = 8;
+
 export type UndoTicket = {
   id: string;
   memberId: string;
   workspaceId: string;
   summary: string;
   effects: ActEffect[];
+  createdAt: number;
+  actAuditId?: string;
 };
 
 export type TakeUndoResult =
   | { ok: true; ticket: UndoTicket }
-  | { ok: false; reason: 'missing' | 'workspace' | 'busy' };
+  | { ok: false; reason: 'missing' | 'workspace' | 'busy' | 'order' };
 
 export function summarizeUndo(effects: ActEffect[]): string {
   const created = effects.filter((effect) => effect.kind === 'created').length;
@@ -36,29 +40,34 @@ export function summarizeUndo(effects: ActEffect[]): string {
 }
 
 export class UndoStore {
-  private readonly tickets = new Map<string, UndoTicket>();
-  private readonly running = new Set<string>();
+  private readonly stacks = new Map<string, UndoTicket[]>();
+  private readonly running = new Map<string, string>();
+  private stamp = 0;
 
-  save(
-    memberId: string,
-    workspaceId: string,
-    effects: ActEffect[],
-  ): UndoTicket | undefined {
-    if (effects.length === 0) {
+  save(memberId: string, workspaceId: string, effects: ActEffect[]): UndoTicket | undefined {
+    const ticket = this.buildTicket(memberId, workspaceId, effects);
+
+    if (!ticket) {
       return undefined;
     }
 
-    const ticket: UndoTicket = {
-      id: `undo_${randomUUID()}`,
-      memberId,
-      workspaceId,
-      summary: summarizeUndo(effects),
-      effects,
-    };
-
-    this.tickets.set(memberId, ticket);
+    const stack = this.stacks.get(memberId) ?? [];
+    stack.unshift(ticket);
+    this.stacks.set(memberId, stack.slice(0, UNDO_STACK_LIMIT));
 
     return ticket;
+  }
+
+  list(memberId: string, workspaceId: string): UndoTicket[] {
+    return (this.stacks.get(memberId) ?? []).filter((ticket) => ticket.workspaceId === workspaceId);
+  }
+
+  linkAct(id: string, memberId: string, auditId: string): void {
+    const ticket = (this.stacks.get(memberId) ?? []).find((item) => item.id === id);
+
+    if (ticket) {
+      ticket.actAuditId = auditId;
+    }
   }
 
   peek(id: string, memberId: string, workspaceId: string): TakeUndoResult {
@@ -73,15 +82,25 @@ export class UndoStore {
     const result = this.peek(id, memberId, workspaceId);
 
     if (result.ok) {
-      this.running.add(memberId);
+      this.running.set(memberId, id);
     }
 
     return result;
   }
 
   finish(memberId: string): void {
+    const id = this.running.get(memberId);
     this.running.delete(memberId);
-    this.tickets.delete(memberId);
+
+    if (!id) {
+      return;
+    }
+
+    const stack = this.stacks.get(memberId) ?? [];
+    this.stacks.set(
+      memberId,
+      stack.filter((ticket) => ticket.id !== id),
+    );
   }
 
   release(memberId: string): void {
@@ -95,11 +114,8 @@ export class UndoStore {
       return false;
     }
 
-    this.tickets.set(memberId, {
-      ...current.ticket,
-      summary: summarizeUndo(effects),
-      effects,
-    });
+    current.ticket.summary = summarizeUndo(effects);
+    current.ticket.effects = effects;
 
     return true;
   }
@@ -109,21 +125,58 @@ export class UndoStore {
 
     if (result.ok) {
       this.running.delete(memberId);
-      this.tickets.delete(memberId);
+      const stack = this.stacks.get(memberId) ?? [];
+      this.stacks.set(
+        memberId,
+        stack.filter((ticket) => ticket.id !== id),
+      );
     }
 
     return result;
   }
 
-  private read(id: string, memberId: string, workspaceId: string): TakeUndoResult {
-    const ticket = this.tickets.get(memberId);
+  protected buildTicket(
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): UndoTicket | undefined {
+    if (effects.length === 0) {
+      return undefined;
+    }
 
-    if (!ticket || ticket.id !== id) {
+    const now = Date.now();
+    this.stamp = now > this.stamp ? now : this.stamp + 1;
+
+    return {
+      id: `undo_${randomUUID()}`,
+      memberId,
+      workspaceId,
+      summary: summarizeUndo(effects),
+      effects,
+      createdAt: this.stamp,
+    };
+  }
+
+  protected runningUndoId(memberId: string): string | undefined {
+    return this.running.get(memberId);
+  }
+
+  private read(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+    const stack = this.stacks.get(memberId) ?? [];
+    const ticket = stack.find((item) => item.id === id);
+
+    if (!ticket) {
       return { ok: false, reason: 'missing' };
     }
 
     if (ticket.workspaceId !== workspaceId) {
       return { ok: false, reason: 'workspace' };
+    }
+
+    const newest = stack.find((item) => item.workspaceId === workspaceId);
+
+    if (newest && newest.id !== id) {
+      return { ok: false, reason: 'order' };
     }
 
     return { ok: true, ticket };

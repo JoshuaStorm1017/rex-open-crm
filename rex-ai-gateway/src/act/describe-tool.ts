@@ -45,7 +45,7 @@ export function describeTool(
     case 'archive_record':
       return {
         tool: tool.name,
-        summary: `Archive ${tool.input.objectName} ${current?.label ?? tool.input.id ?? tool.input.query ?? 'record'}. If-Match ${tool.input.ifMatch}.`,
+        summary: `Archive ${tool.input.objectName} ${current?.label ?? tool.input.id ?? tool.input.query ?? 'record'}. If-Match ${etagLabel(tool.input.ifMatch)}.`,
       };
     case 'update_record': {
       const previous = current?.properties[tool.input.field];
@@ -55,7 +55,7 @@ export function describeTool(
 
       return {
         tool: tool.name,
-        summary: `Set ${tool.input.objectName} ${label} ${tool.input.field}${from} to ${formatValue(tool.input.value)}. If-Match ${tool.input.ifMatch}.`,
+        summary: `Set ${tool.input.objectName} ${label} ${tool.input.field}${from} to ${formatValue(tool.input.value)}. If-Match ${etagLabel(tool.input.ifMatch)}.`,
       };
     }
   }
@@ -71,6 +71,14 @@ export function summarizeLines(lines: ProposalLine[]): string {
   }
 
   return lines.map((line) => line.summary.replace(/\.$/, '')).join(' ');
+}
+
+function etagLabel(ifMatch: string | undefined): string {
+  if (ifMatch === 'chained') {
+    return 'the etag from the previous write in this preview';
+  }
+
+  return ifMatch ?? 'the current record';
 }
 
 function plural(objectName: 'person' | 'company' | 'opportunity'): string {

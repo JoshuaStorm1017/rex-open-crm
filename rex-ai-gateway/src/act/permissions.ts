@@ -7,6 +7,7 @@ import type { ActEffect } from './types';
 import { refusal, type ActRefusal, type AllowedToolName } from './types';
 import { toolCatalog, type ToolAudience } from './tool-schema';
 import type { ValidatedTool } from './validate-tool';
+import { isUpdatableObjectName } from './writable-fields';
 
 export type AudienceLoad =
   | { kind: 'unrestricted' }
@@ -105,7 +106,7 @@ export function assertToolPermitted(
         });
       }
 
-      return undefined;
+      return assertFieldWritable(audience, tool.input.objectName, tool.input.field, tool.name, 'changed');
     case 'archive_record':
       if (
         !audience.canRead.has(tool.input.objectName) ||
@@ -133,11 +134,11 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
     if (effect.kind === 'archived') {
       if (
         !load.audience.canRead.has(effect.objectName) ||
-        !load.audience.canUpdate.has(effect.objectName)
+        !load.audience.canSoftDelete.has(effect.objectName)
       ) {
         return refusal(
           'forbidden',
-          `You cannot update ${effect.objectName} records, so this archive cannot be undone.`,
+          `You cannot archive ${effect.objectName} records, so this archive cannot be undone.`,
         );
       }
     }
@@ -153,19 +154,60 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
       }
     }
 
-    if (
-      effect.kind === 'updated' &&
-      (!load.audience.canRead.has(effect.objectName) ||
-        !load.audience.canUpdate.has(effect.objectName))
-    ) {
-      return refusal(
-        'forbidden',
-        `You cannot update ${effect.objectName} records, so this change cannot be undone.`,
+    if (effect.kind === 'updated') {
+      if (
+        !load.audience.canRead.has(effect.objectName) ||
+        !load.audience.canUpdate.has(effect.objectName)
+      ) {
+        return refusal(
+          'forbidden',
+          `You cannot update ${effect.objectName} records, so this change cannot be undone.`,
+        );
+      }
+
+      const fieldRefusal = assertFieldWritable(
+        load.audience,
+        effect.objectName,
+        effect.field,
+        'update_record',
+        'restored',
       );
+
+      if (fieldRefusal) {
+        return fieldRefusal;
+      }
     }
   }
 
   return undefined;
+}
+
+function assertFieldWritable(
+  audience: ToolAudience,
+  objectName: TwentyObjectName,
+  field: string,
+  toolName: AllowedToolName,
+  verb: 'changed' | 'restored',
+): ActRefusal | undefined {
+  if (audience.fieldPermissionsUnreadable?.has(objectName) || audience.unreadableFields?.get(objectName)?.has(field)) {
+    return refusal(
+      'forbidden',
+      `Field permissions for ${objectName}.${field} could not be read from Twenty, so it was not ${verb}.`,
+      { toolName },
+    );
+  }
+
+  const writable = audience.writableFields?.get(objectName);
+
+  if (!writable) {
+    return undefined;
+  }
+
+  if (writable.has(field)) {
+    return undefined;
+  }
+
+  return refusal('forbidden', `You cannot update ${field} on ${objectName} records.`, { toolName });
 }
 
 function requireCreate(
@@ -185,6 +227,9 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
   const canCreate = new Set<TwentyObjectName | 'note'>();
   const canUpdate = new Set<TwentyObjectName | 'note'>();
   const canSoftDelete = new Set<TwentyObjectName | 'note'>();
+  const writableFields = new Map<TwentyObjectName, Set<string>>();
+  const unreadableFields = new Map<TwentyObjectName, Set<string>>();
+  const fieldPermissionsUnreadable = new Set<TwentyObjectName>();
 
   for (const object of capabilities.objects) {
     if (!OBJECT_NAMES.has(object.objectName)) {
@@ -206,7 +251,43 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
     if (object.canSoftDelete) {
       canSoftDelete.add(object.objectName);
     }
+
+    if (!isUpdatableObjectName(object.objectName) || object.fieldPermissions === undefined) {
+      continue;
+    }
+
+    if (object.fieldPermissions === 'unavailable') {
+      fieldPermissionsUnreadable.add(object.objectName);
+      continue;
+    }
+
+    const writable = new Set<string>();
+    const unreadable = new Set<string>();
+
+    for (const field of object.fieldPermissions) {
+      if (field.unreadable) {
+        unreadable.add(field.name);
+        continue;
+      }
+
+      if (field.canUpdate) {
+        writable.add(field.name);
+      }
+    }
+
+    writableFields.set(object.objectName, writable);
+    if (unreadable.size > 0) {
+      unreadableFields.set(object.objectName, unreadable);
+    }
   }
 
-  return { canRead, canCreate, canUpdate, canSoftDelete };
+  return {
+    canRead,
+    canCreate,
+    canUpdate,
+    canSoftDelete,
+    ...(writableFields.size > 0 ? { writableFields } : {}),
+    ...(unreadableFields.size > 0 ? { unreadableFields } : {}),
+    ...(fieldPermissionsUnreadable.size > 0 ? { fieldPermissionsUnreadable } : {}),
+  };
 }

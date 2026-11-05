@@ -282,7 +282,8 @@ async function handleAuthenticated(
 
   if (!idempotencyKey) {
     const result = await execute();
-    rememberOutcome(runtime, principal, url.pathname, confirmed, result.body);
+    const entry = rememberOutcome(runtime, principal, url.pathname, confirmed, result.body);
+    linkUndoToAct(runtime, principal.memberId, result.body, entry, false);
     sendJson(response, result.status, result.body, cors);
     return;
   }
@@ -313,7 +314,15 @@ async function handleAuthenticated(
     return;
   }
 
-  rememberOutcome(runtime, principal, url.pathname, confirmed, stored.response.body, stored.replayed);
+  const entry = rememberOutcome(
+    runtime,
+    principal,
+    url.pathname,
+    confirmed,
+    stored.response.body,
+    stored.replayed,
+  );
+  linkUndoToAct(runtime, principal.memberId, stored.response.body, entry, stored.replayed);
   sendJson(response, stored.response.status, stored.response.body, {
     ...cors,
     ...(stored.replayed ? { 'idempotency-replayed': 'true' } : {}),
@@ -350,6 +359,7 @@ async function executeConfirmedAct(
     parsed.workspaceId,
     principal.memberId,
     parsed.choiceId,
+    parsed.choices,
   );
 
   if (!claimed.ok) {
@@ -360,7 +370,7 @@ async function executeConfirmedAct(
     if (claimed.reason === 'choice') {
       return refusal(
         'confirmation_required',
-        'Choose one of the matching records, then confirm. Nothing was written.',
+        'Choose a record for each name, then confirm. Nothing was written.',
       );
     }
 
@@ -396,7 +406,11 @@ async function executeConfirmedAct(
     return publicResult;
   }
 
-  return { ...publicResult, undo: { id: ticket.id, summary: ticket.summary } };
+  return {
+    ...publicResult,
+    undo: { id: ticket.id, summary: ticket.summary },
+    undos: publicUndos(runtime, principal.memberId, parsed.workspaceId),
+  };
 }
 
 async function executeConfirmedUndo(
@@ -433,6 +447,13 @@ async function executeConfirmedUndo(
 
     if (begun.reason === 'busy') {
       return refusal('confirmation_required', 'Undo is already running for this change.');
+    }
+
+    if (begun.reason === 'order') {
+      return refusal(
+        'invalid_request',
+        'Undo the most recent change before an older one. Nothing was reversed.',
+      );
     }
 
     return refusal('not_found', 'There is no matching undo for the last confirmed change.');
@@ -481,14 +502,45 @@ async function executeConfirmedUndo(
     );
   }
 
+  const reversesAuditId = begun.ticket.actAuditId;
   runtime.undos.finish(principal.memberId);
+  const undos = publicUndos(runtime, principal.memberId, parsed.workspaceId);
 
   return {
     ok: true,
     workspaceId: parsed.workspaceId,
     results: [],
     summary: 'Reversed the last confirmed change.',
+    ...(reversesAuditId ? { reversesAuditId } : {}),
+    ...(undos[0] ? { undo: undos[0], undos } : {}),
   };
+}
+
+function publicUndos(
+  runtime: GatewayRuntime,
+  memberId: string,
+  workspaceId: string,
+): Array<{ id: string; summary: string }> {
+  return runtime.undos.list(memberId, workspaceId).map((ticket) => ({
+    id: ticket.id,
+    summary: ticket.summary,
+  }));
+}
+
+function linkUndoToAct(
+  runtime: GatewayRuntime,
+  memberId: string,
+  body: unknown,
+  entry: { id: string; action: string; ok: boolean } | undefined,
+  replayed: boolean,
+): void {
+  if (replayed || !entry || entry.action !== 'act' || !entry.ok || !isRecord(body) || !isRecord(body.undo)) {
+    return;
+  }
+
+  if (typeof body.undo.id === 'string') {
+    runtime.undos.linkAct(body.undo.id, memberId, entry.id);
+  }
 }
 
 function rememberOutcome(
@@ -498,11 +550,11 @@ function rememberOutcome(
   confirmed: boolean,
   body: unknown,
   replayed = false,
-): void {
+): ReturnType<AuditLog['record']> | undefined {
   const action = actionForPath(path);
 
   if (!isRecord(body)) {
-    remember(runtime, {
+    return remember(runtime, {
       memberId: principal.memberId,
       actor: principal.actor,
       action,
@@ -513,7 +565,6 @@ function rememberOutcome(
       confirmed,
       replayed,
     });
-    return;
   }
 
   const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId : undefined;
@@ -529,7 +580,9 @@ function rememberOutcome(
     (typeof body.message === 'string' ? body.message : undefined) ??
     (ok ? `${action} completed` : 'Request failed');
 
-  remember(runtime, {
+  const reverses = typeof body.reversesAuditId === 'string' ? body.reversesAuditId : undefined;
+
+  return remember(runtime, {
     memberId: principal.memberId,
     actor: principal.actor,
     action,
@@ -541,6 +594,7 @@ function rememberOutcome(
     confirmed: action === 'act' ? confirmed : undefined,
     reason,
     replayed,
+    ...(reverses ? { reverses } : {}),
   });
 }
 
@@ -595,8 +649,8 @@ function collectRecordIds(body: Record<string, unknown>): string[] {
 function remember(
   runtime: GatewayRuntime,
   entry: Omit<AuditEntry, 'id' | 'at'>,
-): void {
-  runtime.audit.record(entry);
+): AuditEntry {
+  return runtime.audit.record(entry);
 }
 
 function actionForPath(pathname: string): AuditAction {

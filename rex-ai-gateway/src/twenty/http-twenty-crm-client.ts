@@ -11,6 +11,7 @@ import {
   TWENTY_CREATE_TARGET,
   TWENTY_OBJECT_PATH,
   conditionalUpdateFilter,
+  deleteManyName,
   graphqlSearchFilter,
   RECORD_GRAPHQL_FIELDS,
   restSearchFilter,
@@ -21,7 +22,9 @@ import {
   toUpdatePayload,
   updateManyName,
 } from './map-to-twenty-payload';
+import { FIELD_METADATA_NAMES } from './field-permission-names';
 import { crmRecordFromTwenty, labelFromProperties, projectField, readEtag } from './record-fields';
+import { UPDATABLE_FIELDS, isUpdatableObjectName } from '../act/writable-fields';
 import {
   type CreateCompanyInput,
   type CreateNoteInput,
@@ -38,6 +41,7 @@ import {
   type TwentyCrmClient,
   type TwentyObjectName,
   type ClearRecordFieldInput,
+  type FieldCapability,
   type MemberCapabilities,
   type ObjectCapabilityName,
   type UpdateRecordInput,
@@ -438,8 +442,8 @@ export function createHttpTwentyCrmClient(
         method: 'POST',
         body: {
           query: `query RexAiCapabilities {
-            objects(paging: { first: 200 }) { edges { node { id nameSingular } } }
-            currentUser { currentUserWorkspace { objectPermissions { objectMetadataId canReadObjectRecords canUpdateObjectRecords canSoftDeleteObjectRecords } } }
+            objects(paging: { first: 200 }) { edges { node { id nameSingular fieldsList { id name } } } }
+            currentUser { currentUserWorkspace { objectPermissions { objectMetadataId canReadObjectRecords canUpdateObjectRecords canSoftDeleteObjectRecords restrictedFields } } }
           }`,
         },
       });
@@ -592,7 +596,45 @@ export function createHttpTwentyCrmClient(
         );
       }
 
-      await deleteById(input.objectName, recordPathId(input.id));
+      const target = TWENTY_OBJECT_PATH[input.objectName];
+      const manyName = deleteManyName(input.objectName);
+      let filter: string;
+
+      try {
+        filter = conditionalUpdateFilter(input.id, input.ifMatch);
+      } catch {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} cannot be compared for ${input.objectName} ${input.id}.`,
+          current.etag,
+        );
+      }
+
+      // Twenty ignores If-Match. Soft-delete many with updatedAt[eq] so a stale row matches nothing.
+      const result =
+        style === 'rest'
+          ? await requestJson(
+              `${target.restPath}?filter=${encodeURIComponent(filter)}&soft_delete=true`,
+              { method: 'DELETE' },
+            )
+          : await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query: `mutation Delete($filter: ${target.filterInputType}!) { ${manyName}(filter: $filter) { id } }`,
+                variables: {
+                  filter: {
+                    and: [{ id: { eq: input.id } }, { updatedAt: { eq: input.ifMatch } }],
+                  },
+                },
+              },
+            });
+      const deleted = readUpdatedList(result.body, manyName);
+
+      if (deleted.length !== 1) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} did not match the current ${input.objectName} row. Nothing was archived.`,
+          current.etag,
+        );
+      }
 
       return current;
     },
@@ -727,13 +769,14 @@ function readCapabilities(body: unknown): MemberCapabilities {
   }
 
   const names = new Map<string, ObjectCapabilityName>();
+  const fieldsByObject = new Map<string, Map<string, string>>();
 
   for (const edge of objectsConnection.edges) {
     if (!isRecord(edge) || !isRecord(edge.node)) {
       continue;
     }
 
-    const { id, nameSingular } = edge.node;
+    const { id, nameSingular, fieldsList } = edge.node;
 
     if (
       typeof id === 'string' &&
@@ -741,6 +784,11 @@ function readCapabilities(body: unknown): MemberCapabilities {
       CAPABILITY_NAMES.has(nameSingular as ObjectCapabilityName)
     ) {
       names.set(id, nameSingular as ObjectCapabilityName);
+      const metadataIds = metadataIdsByName(fieldsList);
+
+      if (metadataIds) {
+        fieldsByObject.set(id, metadataIds);
+      }
     }
   }
 
@@ -763,9 +811,73 @@ function readCapabilities(body: unknown): MemberCapabilities {
       canUpdate: permission.canUpdateObjectRecords === true,
       canCreate: permission.canUpdateObjectRecords === true,
       canSoftDelete: permission.canSoftDeleteObjectRecords === true,
+      ...fieldPermissionsFor(objectName, fieldsByObject.get(permission.objectMetadataId), permission.restrictedFields),
     });
   }
 
   return { objects };
+}
+
+function metadataIdsByName(fieldsList: unknown): Map<string, string> | undefined {
+  if (!Array.isArray(fieldsList)) {
+    return undefined;
+  }
+
+  const names = new Map<string, string>();
+
+  for (const field of fieldsList) {
+    if (!isRecord(field) || typeof field.id !== 'string' || typeof field.name !== 'string') {
+      continue;
+    }
+
+    names.set(field.name, field.id);
+  }
+
+  return names;
+}
+
+function fieldPermissionsFor(
+  objectName: ObjectCapabilityName,
+  metadataIds: Map<string, string> | undefined,
+  restrictedFields: unknown,
+): { fieldPermissions: 'unavailable' | FieldCapability[] } {
+  if (!isUpdatableObjectName(objectName)) {
+    return { fieldPermissions: [] };
+  }
+
+  if (!metadataIds || !isRecord(restrictedFields)) {
+    return { fieldPermissions: 'unavailable' };
+  }
+
+  const fields: FieldCapability[] = [];
+
+  for (const fieldName of UPDATABLE_FIELDS[objectName]) {
+    const metadataNames = FIELD_METADATA_NAMES[objectName][fieldName] ?? [fieldName];
+    let canUpdate = true;
+    let unreadable = false;
+
+    for (const metadataName of metadataNames) {
+      const fieldId = metadataIds.get(metadataName);
+
+      if (!fieldId) {
+        unreadable = true;
+        break;
+      }
+
+      const permission = restrictedFields[fieldId];
+
+      if (!isRecord(permission)) {
+        continue;
+      }
+
+      if (permission.canUpdate === false || permission.canRead === false) {
+        canUpdate = false;
+      }
+    }
+
+    fields.push(unreadable ? { name: fieldName, canUpdate: false, unreadable: true } : { name: fieldName, canUpdate });
+  }
+
+  return { fieldPermissions: fields };
 }
 
