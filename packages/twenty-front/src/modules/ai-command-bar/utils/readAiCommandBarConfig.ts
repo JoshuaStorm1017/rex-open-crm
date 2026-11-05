@@ -31,21 +31,61 @@ const defaultGatewayUrl = (): string => {
 };
 
 const readGatewayUrl = (value: string | undefined): string => {
-  const candidate = (value || defaultGatewayUrl()).replace(/\/+$/, '');
+  const fallback = defaultGatewayUrl();
+  const candidate = (value || fallback).replace(/\/+$/, '');
 
   try {
     const parsed = new URL(candidate);
 
-    if (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      !parsed.username &&
-      !parsed.password
-    ) {
-      return candidate;
+    if (!isCredentialSafeGatewayUrl(parsed)) {
+      return fallback;
     }
+
+    return parsed.origin;
   } catch {
-    return defaultGatewayUrl();
+    return fallback;
+  }
+};
+
+const isCredentialSafeGatewayUrl = (parsed: URL): boolean => {
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== '/'
+  ) {
+    return false;
   }
 
-  return defaultGatewayUrl();
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false;
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const loopback = isLoopbackHostname(hostname);
+
+  if (parsed.protocol === 'http:' && !loopback) {
+    return false;
+  }
+
+  if (typeof window === 'undefined') {
+    return loopback;
+  }
+
+  const pageHost = window.location.hostname
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase();
+
+  if (loopback) {
+    return isLoopbackHostname(pageHost);
+  }
+
+  return parsed.protocol === 'https:' && hostname === pageHost;
+};
+
+const isLoopbackHostname = (hostname: string): boolean => {
+  return (
+    hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
+  );
 };

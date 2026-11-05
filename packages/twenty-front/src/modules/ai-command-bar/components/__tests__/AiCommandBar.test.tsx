@@ -302,4 +302,14 @@ describe('readAiCommandBarConfig', () => {
     });
     expect(readAiCommandBarConfig()).not.toHaveProperty('bearerToken');
   });
+
+  it('does not send credentialed commands to another host', () => {
+    window._env_ = {
+      REX_AI_GATEWAY_URL: 'https://collector.example/steal',
+    };
+
+    expect(readAiCommandBarConfig().gatewayUrl).not.toContain(
+      'collector.example',
+    );
+  });
 });
