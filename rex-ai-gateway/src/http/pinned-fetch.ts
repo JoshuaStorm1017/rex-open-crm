@@ -1,11 +1,9 @@
 import { lookup } from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
-import { isIP } from 'node:net';
 
-import { isBlockedIp } from './public-url';
+import { assertConnectableHost, isBlockedIp } from './public-url';
 
-const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
 const PIN_TTL_MS = 30_000;
 
 type AddressRecord = { address: string; family: number };
@@ -34,7 +32,14 @@ export async function fetchWithPinnedDns(
 ): Promise<Response> {
   const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
 
-  if (fetchImpl !== fetch || isDirectAddress(hostname)) {
+  if (fetchImpl !== fetch) {
+    return fetchImpl(url, init);
+  }
+
+  // A literal never goes through DNS, so the pin cannot be the check that stops it.
+  const kind = assertConnectableHost(hostname, label, true);
+
+  if (kind === 'loopback' || kind === 'literal') {
     return fetchImpl(url, init);
   }
 
@@ -45,10 +50,6 @@ export async function fetchWithPinnedDns(
 
 export function clearPinnedDnsCache(): void {
   pins.clear();
-}
-
-function isDirectAddress(hostname: string): boolean {
-  return LOOPBACK_NAMES.has(hostname) || isIP(hostname) !== 0;
 }
 
 async function resolvePin(hostname: string, label: string, lookupImpl: PinLookup): Promise<Pin> {

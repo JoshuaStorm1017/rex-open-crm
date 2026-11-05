@@ -446,10 +446,24 @@ async function executeConfirmedUndo(
     return refusal('not_found', 'There is no matching undo for the last confirmed change.');
   }
 
-  const remaining = await compensate(runtime.client, parsed.workspaceId, taken.ticket.effects);
+  const failures = await compensate(runtime.client, parsed.workspaceId, taken.ticket.effects);
 
-  if (remaining.length > 0) {
-    return partialFailure('Undo could not reverse every change.', remaining);
+  if (failures.length > 0) {
+    const leftEveryChange =
+      failures.length === taken.ticket.effects.length &&
+      failures.every((failure) => failure.reason === 'conflict');
+
+    if (leftEveryChange) {
+      return refusal(
+        'precondition_failed',
+        'The record changed after that action, so nothing was reversed.',
+      );
+    }
+
+    return partialFailure(
+      'Undo could not reverse every change.',
+      failures.map((failure) => failure.id),
+    );
   }
 
   return {

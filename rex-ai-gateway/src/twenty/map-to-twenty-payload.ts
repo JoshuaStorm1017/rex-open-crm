@@ -82,7 +82,14 @@ export function restSearchFilter(objectName: TwentyObjectName, query: string): s
   const quoted = quoteFilterValue(`%${query}%`);
 
   if (objectName === 'person') {
-    return `or(name.firstName[ilike]:${quoted},name.lastName[ilike]:${quoted},emails.primaryEmail[ilike]:${quoted})`;
+    const clauses = [
+      `name.firstName[ilike]:${quoted}`,
+      `name.lastName[ilike]:${quoted}`,
+      `emails.primaryEmail[ilike]:${quoted}`,
+      ...personNameClauses(query),
+    ];
+
+    return `or(${clauses.join(',')})`;
   }
 
   return `name[ilike]:${quoted}`;
@@ -100,11 +107,44 @@ export function graphqlSearchFilter(
         { name: { firstName: { ilike } } },
         { name: { lastName: { ilike } } },
         { emails: { primaryEmail: { ilike } } },
+        ...personNameGraphql(query),
       ],
     };
   }
 
   return { name: { ilike } };
+}
+
+// Twenty compares the whole string to one field. "Ada Lovelace" matches neither
+// firstName nor lastName unless the two tokens are combined.
+function personNameClauses(query: string): string[] {
+  const parts = query.trim().split(/\s+/).filter((part) => part.length > 0);
+
+  if (parts.length < 2) {
+    return [];
+  }
+
+  const first = quoteFilterValue(`%${parts[0]}%`);
+  const last = quoteFilterValue(`%${parts.slice(1).join(' ')}%`);
+
+  return [`and(name.firstName[ilike]:${first},name.lastName[ilike]:${last})`];
+}
+
+function personNameGraphql(query: string): Record<string, unknown>[] {
+  const parts = query.trim().split(/\s+/).filter((part) => part.length > 0);
+
+  if (parts.length < 2) {
+    return [];
+  }
+
+  return [
+    {
+      and: [
+        { name: { firstName: { ilike: `%${parts[0]}%` } } },
+        { name: { lastName: { ilike: `%${parts.slice(1).join(' ')}%` } } },
+      ],
+    },
+  ];
 }
 
 const SAFE_FILTER_TOKEN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;

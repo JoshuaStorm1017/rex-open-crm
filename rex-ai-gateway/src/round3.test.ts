@@ -6,8 +6,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { executeAct } from './act/execute-act';
 import { proposeAct } from './act/propose-act';
-import { toClearPayload } from './twenty/map-to-twenty-payload';
+import { restSearchFilter, toClearPayload } from './twenty/map-to-twenty-payload';
 import { clearPinnedDnsCache, fetchWithPinnedDns } from './http/pinned-fetch';
+import { isBlockedIp } from './http/public-url';
 import { createOpenAiLlmProvider } from './llm/openai-llm-provider';
 import { createMockLlmProvider } from './llm/mock-llm-provider';
 import { isRecord } from './is-record';
@@ -242,6 +243,82 @@ describe('open record', () => {
     expect(executed.ok).toBe(true);
     expect(client.created[0]?.properties.stage).toBe('PROPOSAL');
   });
+
+  it('keeps the page record when the model also sends an id', async () => {
+    const client = createMockTwentyCrmClient();
+    const deal = await client.createOpportunity({
+      workspaceId: 'ws_demo',
+      name: 'Analytical Engines',
+      stage: 'NEW',
+    });
+    let systemPrompt = '';
+    const provider = createOpenAiLlmProvider(
+      {
+        provider: 'openai',
+        baseUrl: 'https://llm.example/v1',
+        apiKey: 'test-llm-key',
+        model: 'mock-model',
+      },
+      async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as {
+          messages?: Array<{ content?: string }>;
+        };
+        systemPrompt = body.messages?.[0]?.content ?? '';
+
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({ id: 'opportunity_attacker', recordRef: 'open' }),
+                  tool_calls: [
+                    {
+                      function: {
+                        name: 'update_record',
+                        arguments: JSON.stringify({
+                          object: 'opportunity',
+                          id: 'opportunity_attacker',
+                          query: 'Other Deal',
+                          field: 'stage',
+                          value: 'PROPOSAL',
+                          recordRef: 'open',
+                        }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      },
+    );
+    const planned = await proposeAct(
+      {
+        workspaceId: 'ws_demo',
+        intent: "update this deal's stage to Proposal",
+        context: { objectName: 'opportunity', recordId: deal.id },
+      },
+      client,
+      provider,
+    );
+
+    expect(systemPrompt).not.toContain(deal.id);
+    expect(planned).toMatchObject({
+      ok: true,
+      proposal: {
+        tools: [
+          {
+            name: 'update_record',
+            args: { id: deal.id, field: 'stage', value: 'PROPOSAL', ifMatch: deal.etag },
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(planned)).not.toContain('opportunity_attacker');
+    expect(JSON.stringify(planned)).not.toContain('Other Deal');
+  });
 });
 
 describe('multi-match create', () => {
@@ -383,6 +460,62 @@ describe('undo', () => {
     });
   });
 
+  it('does not restore a field that changed after the confirmed write', async () => {
+    const client = createMockTwentyCrmClient();
+    const company = await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme' });
+    const gateway = await openGateway(client);
+    const planned = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'update_record',
+          args: {
+            object: 'company',
+            id: company.id,
+            field: 'domain',
+            value: 'acme.example',
+            ifMatch: company.etag,
+          },
+        },
+      ],
+    });
+    const acted = await postJson(gateway, '/v1/ai/act', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      proposalId: proposalId(planned.payload),
+    });
+    const undoId =
+      isRecord(acted.payload) && isRecord(acted.payload.undo) && typeof acted.payload.undo.id === 'string'
+        ? acted.payload.undo.id
+        : '';
+    const current = client.created[0];
+
+    if (!current) {
+      throw new Error('Expected the company to exist.');
+    }
+
+    await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: current.id,
+      field: 'domain',
+      value: 'later.example',
+      ifMatch: current.etag,
+    });
+    const undone = await postJson(gateway, '/v1/ai/undo', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      undoId,
+    });
+
+    expect(undone.response.status).toBe(412);
+    expect(undone.payload).toMatchObject({
+      refused: true,
+      reason: 'precondition_failed',
+    });
+    expect(client.created[0]?.properties.domain).toBe('later.example');
+  });
+
   it('keeps the last undo ticket in sqlite', () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'rex-ai-undo-'));
     const filename = path.join(directory, 'state.sqlite');
@@ -466,6 +599,40 @@ describe('pinned public hosts', () => {
     ).catch(() => undefined);
 
     expect(lookedUp).toBe(false);
+  });
+
+  it('rejects a private address literal before opening a socket', async () => {
+    let lookedUp = false;
+
+    await expect(
+      fetchWithPinnedDns(
+        'https://10.1.2.3/latest',
+        { method: 'GET' },
+        fetch,
+        'TWENTY_API_URL',
+        async () => {
+          lookedUp = true;
+          return [{ address: '1.1.1.1', family: 4 }];
+        },
+      ),
+    ).rejects.toThrow(/non-public/);
+    await expect(
+      fetchWithPinnedDns('https://[::ffff:a9fe:a9fe]/', { method: 'GET' }, fetch, 'REX_AI_BASE_URL'),
+    ).rejects.toThrow(/non-public/);
+    expect(lookedUp).toBe(false);
+    expect(isBlockedIp('::ffff:169.254.169.254')).toBe(true);
+    expect(isBlockedIp('2002:a9fe:a9fe::')).toBe(true);
+    expect(isBlockedIp('::10.0.0.1')).toBe(true);
+    expect(isBlockedIp('8.8.8.8')).toBe(false);
+    expect(isBlockedIp('2606:4700:4700::1111')).toBe(false);
+  });
+});
+
+describe('person search', () => {
+  it('matches a first and last name that live in different fields', () => {
+    expect(restSearchFilter('person', 'Casey North')).toContain(
+      'and(name.firstName[ilike]:"%Casey%",name.lastName[ilike]:"%North%")',
+    );
   });
 });
 

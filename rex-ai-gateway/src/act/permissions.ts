@@ -119,14 +119,15 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
   }
 
   for (const effect of effects) {
-    if (
-      effect.kind === 'created' &&
-      (effect.objectName === 'noteTarget' || !load.audience.canSoftDelete.has(effect.objectName))
-    ) {
-      return refusal(
-        'forbidden',
-        `You cannot delete ${effect.objectName} records, so this create cannot be undone.`,
-      );
+    if (effect.kind === 'created') {
+      const permissionObject = effect.objectName === 'noteTarget' ? 'note' : effect.objectName;
+
+      if (!load.audience.canSoftDelete.has(permissionObject)) {
+        return refusal(
+          'forbidden',
+          `You cannot delete ${effect.objectName} records, so this create cannot be undone.`,
+        );
+      }
     }
 
     if (

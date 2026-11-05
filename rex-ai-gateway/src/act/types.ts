@@ -82,6 +82,7 @@ export type ActEffect =
       kind: 'created';
       objectName: 'person' | 'company' | 'opportunity' | 'note' | 'noteTarget';
       id: string;
+      etag?: string;
     }
   | {
       kind: 'updated';

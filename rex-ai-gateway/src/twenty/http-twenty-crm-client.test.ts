@@ -56,6 +56,10 @@ describe('readTwentyApiOrigin', () => {
     expect(() => readTwentyApiOrigin('http://127.0.0.1:3000/rest')).toThrow(/path/);
     expect(() => readTwentyApiOrigin('http://user:pass@127.0.0.1:3000')).toThrow(/credentials/);
     expect(() => readTwentyApiOrigin('file:///tmp/twenty')).toThrow(/http/);
+    expect(() => readTwentyApiOrigin('https://10.0.0.1')).toThrow(/non-public/);
+    expect(() => readTwentyApiOrigin('https://169.254.169.254')).toThrow(/non-public/);
+    expect(() => readTwentyApiOrigin('https://metadata.google.internal')).toThrow(/metadata|local/);
+    expect(() => readTwentyApiOrigin('https://[::ffff:a9fe:a9fe]')).toThrow(/non-public/);
   });
 });
 
@@ -462,6 +466,47 @@ describe('createHttpTwentyCrmClient', () => {
         additionalEmails: ['ada.archive@analytical.example'],
       },
     });
+  });
+
+  it('deletes the note link before the note', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET') {
+        sendJson(response, 200, {
+          data: { noteTargets: [{ id: 'noteTarget_row' }] },
+        });
+        return;
+      }
+
+      sendJson(response, 200, { data: { deleteNoteTarget: { id: 'noteTarget_row' } } });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: 'note_row' });
+
+    expect(twenty.captured.map((request) => request.url)).toEqual([
+      '/rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
+      '/rest/noteTargets/noteTarget_row',
+      '/rest/notes/note_row',
+    ]);
+  });
+
+  it('still deletes the note when the link query is rejected', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET') {
+        sendJson(response, 400, { error: 'bad filter' });
+        return;
+      }
+
+      sendJson(response, 200, { data: { deleteNote: { id: 'note_row' } } });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: 'note_row' });
+
+    expect(twenty.captured.map((request) => `${request.method} ${request.url}`)).toEqual([
+      'GET /rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
+      'DELETE /rest/notes/note_row',
+    ]);
   });
 });
 

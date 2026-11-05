@@ -1,5 +1,6 @@
 import { currentTwentyCredential, twentyAuthHeaders } from '../auth/call-context';
 import { fetchWithPinnedDns } from '../http/pinned-fetch';
+import { assertConnectableHost } from '../http/public-url';
 import { isRecord } from '../is-record';
 import {
   CrmNotFoundError,
@@ -86,6 +87,8 @@ export function readTwentyApiOrigin(apiUrl: string): string {
   if (parsed.protocol === 'http:' && !LOOPBACK_HOSTS.has(hostname)) {
     throw new Error('TWENTY_API_URL may use http only for a loopback host.');
   }
+
+  assertConnectableHost(hostname, 'TWENTY_API_URL', true);
 
   return parsed.origin;
 }
@@ -305,6 +308,56 @@ export function createHttpTwentyCrmClient(
     };
   };
 
+  const deleteById = async (objectName: DeletableObjectName, id: string): Promise<void> => {
+    const target = deleteTarget(objectName);
+
+    if (style === 'rest') {
+      await requestJson(`${target.restPath}/${id}`, { method: 'DELETE' });
+      return;
+    }
+
+    await requestJson('/graphql', {
+      method: 'POST',
+      body: {
+        query: `mutation Delete($id: UUID!) { ${target.mutationName}(id: $id) { id } }`,
+        variables: { id },
+      },
+    });
+  };
+
+  const deleteNoteTargets = async (noteId: string): Promise<void> => {
+    let listed: unknown;
+
+    try {
+      const result =
+        style === 'rest'
+          ? await requestJson(
+              `/rest/noteTargets?filter=${encodeURIComponent(`noteId[eq]:"${noteId}"`)}&limit=50`,
+              { method: 'GET' },
+            )
+          : await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query:
+                  'query Targets($filter: NoteTargetFilterInput) { noteTargets(filter: $filter, first: 50) { edges { node { id } } } }',
+                variables: { filter: { noteId: { eq: noteId } } },
+              },
+            });
+      listed = result.body;
+    } catch {
+      // Undo still deletes the note when Twenty rejects the link query.
+      return;
+    }
+
+    for (const target of readList(listed, 'noteTargets')) {
+      if (!isRecord(target) || typeof target.id !== 'string') {
+        continue;
+      }
+
+      await deleteById('noteTarget', recordPathId(target.id));
+    }
+  };
+
   return {
     createPerson: (input: CreatePersonInput) =>
       create('person', toPersonPayload(input), personProperties(input), input.workspaceId),
@@ -476,21 +529,13 @@ export function createHttpTwentyCrmClient(
       };
     },
     async deleteRecord(input: DeleteRecordInput) {
-      const target = deleteTarget(input.objectName);
       const id = recordPathId(input.id);
 
-      if (style === 'rest') {
-        await requestJson(`${target.restPath}/${id}`, { method: 'DELETE' });
-        return;
+      if (input.objectName === 'note') {
+        await deleteNoteTargets(id);
       }
 
-      await requestJson('/graphql', {
-        method: 'POST',
-        body: {
-          query: `mutation Delete($id: UUID!) { ${target.mutationName}(id: $id) { id } }`,
-          variables: { id },
-        },
-      });
+      await deleteById(input.objectName, id);
     },
   };
 }

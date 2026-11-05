@@ -118,7 +118,10 @@ export async function executeAct(
       if ('refused' in resolved) {
         const remaining = await compensate(client, parsed.workspaceId, effects);
         if (remaining.length > 0) {
-          return partialFailure(resolved.message, remaining);
+          return partialFailure(
+            resolved.message,
+            remaining.map((failure) => failure.id),
+          );
         }
         return refusal(resolved.reason, withRollback(resolved.message, effects.length), {
           toolName: resolved.toolName,
@@ -138,7 +141,7 @@ export async function executeAct(
       error instanceof CrmPartialWriteError ? error.remainingRecordIds : [];
     const remaining = [
       ...orphans,
-      ...(await compensate(client, parsed.workspaceId, effects)),
+      ...(await compensate(client, parsed.workspaceId, effects)).map((failure) => failure.id),
     ];
     const message = errorMessage(error);
 
@@ -366,7 +369,14 @@ function effectsFor(
   snapshot: CreatedRecord | undefined,
 ): ActEffect[] {
   if (result.status === 'created') {
-    return [{ kind: 'created', objectName: result.record.objectName, id: result.record.id }];
+    return [
+      {
+        kind: 'created',
+        objectName: result.record.objectName,
+        id: result.record.id,
+        etag: result.record.etag,
+      },
+    ];
   }
 
   if (result.status === 'updated' && tool.name === 'update_record' && tool.input.id) {
