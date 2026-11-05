@@ -11,9 +11,7 @@ const DEFAULT_ACTOR = 'workspace-member';
 
 export const readAiCommandBarConfig = (): AiCommandBarConfig => {
   const env = typeof window === 'undefined' ? undefined : window._env_;
-  const gatewayUrl = trimTrailingSlash(
-    env?.REX_AI_GATEWAY_URL || DEFAULT_GATEWAY_URL,
-  );
+  const gatewayUrl = readGatewayUrl(env?.REX_AI_GATEWAY_URL);
   const workspaceId = env?.REX_AI_WORKSPACE_ID || DEFAULT_WORKSPACE_ID;
   const bearerToken = env?.REX_AI_GATEWAY_TOKEN || undefined;
 
@@ -55,4 +53,22 @@ const readActor = (): string => {
   return DEFAULT_ACTOR;
 };
 
-const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, '');
+const readGatewayUrl = (value: string | undefined): string => {
+  const candidate = (value || DEFAULT_GATEWAY_URL).replace(/\/+$/, '');
+
+  try {
+    const parsed = new URL(candidate);
+
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      !parsed.username &&
+      !parsed.password
+    ) {
+      return candidate;
+    }
+  } catch {
+    return DEFAULT_GATEWAY_URL;
+  }
+
+  return DEFAULT_GATEWAY_URL;
+};

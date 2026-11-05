@@ -44,11 +44,17 @@ export const AiCommandBar = ({
 }: AiCommandBarProps) => {
   const { t } = useLingui();
   const titleId = useId();
+  const hintId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const launcherRef = useRef<HTMLButtonElement>(null);
+  const [wasOpen, setWasOpen] = useState(initialOpen);
   const resolvedConfig = config ?? readAiCommandBarConfig();
   const [open, setOpen] = useState(initialOpen);
   const [phase, setPhase] = useState<Phase>({ name: 'compose', draft: '' });
-  const busy = phase.name === 'planning' || phase.name === 'executing';
+  const executing = phase.name === 'executing';
+  const busy = phase.name === 'planning' || executing;
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -68,13 +74,100 @@ export const AiCommandBar = ({
   useEffect(() => {
     if (!open) {
       setPhase({ name: 'compose', draft: '' });
+
+      if (wasOpen) {
+        launcherRef.current?.focus();
+      }
+
       return;
     }
 
+    setWasOpen(true);
     inputRef.current?.focus();
-  }, [open]);
+  }, [open, wasOpen]);
 
-  const close = () => setOpen(false);
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !executing) {
+        event.preventDefault();
+        invalidatePreview();
+        setOpen(false);
+        return;
+      }
+
+      if (event.key !== 'Tab') {
+        return;
+      }
+
+      const dialog = dialogRef.current;
+
+      if (dialog === null) {
+        return;
+      }
+
+      const focusable = [
+        ...dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), a[href]',
+        ),
+      ];
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      if (first === undefined || last === undefined) {
+        return;
+      }
+
+      const active = document.activeElement;
+
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+        return;
+      }
+
+      if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [executing, open]);
+
+  useEffect(() => {
+    if (phase.name === 'preview') {
+      confirmRef.current?.focus();
+    }
+  }, [phase.name]);
+
+  const readGeneration = () => inputRef.current?.dataset.generation ?? '0';
+
+  const invalidatePreview = () => {
+    const input = inputRef.current;
+
+    if (input === null) {
+      return;
+    }
+
+    input.dataset.generation = String(
+      Number(input.dataset.generation ?? '0') + 1,
+    );
+  };
+
+  const close = () => {
+    if (executing) {
+      return;
+    }
+
+    invalidatePreview();
+    setOpen(false);
+  };
 
   const propose = async (draft: string) => {
     const intent = draft.trim();
@@ -83,9 +176,20 @@ export const AiCommandBar = ({
       return;
     }
 
+    const generation = String(Number(readGeneration()) + 1);
+    const input = inputRef.current;
+
+    if (input !== null) {
+      input.dataset.generation = generation;
+    }
+
     setPhase({ name: 'planning', draft });
 
     const outcome = await proposeAiCommand(resolvedConfig, intent, fetchImpl);
+
+    if (generation !== readGeneration()) {
+      return;
+    }
 
     if (outcome.kind === 'message') {
       setPhase({ name: 'refused', draft, message: outcome.message });
@@ -105,14 +209,20 @@ export const AiCommandBar = ({
     idempotencyKey: string,
     draft: string,
   ) => {
+    const generation = readGeneration();
+
     setPhase({ name: 'executing', draft, proposal });
 
     const outcome = await executeAiCommand(
       resolvedConfig,
-      proposal.tools,
+      proposal.id,
       idempotencyKey,
       fetchImpl,
     );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
 
     if (outcome.kind === 'message') {
       setPhase({ name: 'refused', draft, message: outcome.message });
@@ -133,7 +243,13 @@ export const AiCommandBar = ({
   return (
     <>
       {!open && (
-        <StyledLauncher type="button" onClick={() => setOpen(true)}>
+        <StyledLauncher
+          ref={launcherRef}
+          type="button"
+          aria-haspopup="dialog"
+          aria-keyshortcuts="Control+Shift+K Meta+Shift+K"
+          onClick={() => setOpen(true)}
+        >
           {t`AI command`}
           <StyledShortcut>{t`Ctrl+Shift+K`}</StyledShortcut>
         </StyledLauncher>
@@ -147,13 +263,17 @@ export const AiCommandBar = ({
           }}
         >
           <StyledDialog
+            ref={dialogRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby={titleId}
+            aria-describedby={hintId}
             aria-busy={busy}
           >
             <StyledTitle id={titleId}>{t`AI command`}</StyledTitle>
-            <StyledHint>{t`Ctrl+Shift+K. Writes wait for confirmation.`}</StyledHint>
+            <StyledHint
+              id={hintId}
+            >{t`Ctrl+Shift+K or ⌘⇧K. Writes wait for confirmation.`}</StyledHint>
             {phase.name !== 'done' && (
               <form
                 onSubmit={(event) => {
@@ -176,7 +296,7 @@ export const AiCommandBar = ({
                     }
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === 'Escape' && !busy) {
+                    if (event.key === 'Escape' && !executing) {
                       event.preventDefault();
                       close();
                     }
@@ -198,17 +318,17 @@ export const AiCommandBar = ({
               <StyledNotice role="status">{phase.notice}</StyledNotice>
             )}
             {phase.name === 'planning' && (
-              <StyledNotice>{t`Proposing actions…`}</StyledNotice>
+              <StyledNotice role="status">{t`Proposing actions…`}</StyledNotice>
             )}
             {phase.name === 'executing' && (
-              <StyledNotice>{t`Working…`}</StyledNotice>
+              <StyledNotice role="status">{t`Working…`}</StyledNotice>
             )}
             {(phase.name === 'preview' || phase.name === 'executing') && (
               <>
                 <StyledSummary>{phase.proposal.summary}</StyledSummary>
                 <StyledList>
-                  {phase.proposal.lines.map((line) => (
-                    <li key={`${line.tool}-${line.summary}`}>{line.summary}</li>
+                  {phase.proposal.lines.map((line, index) => (
+                    <li key={`${index}-${line.tool}`}>{line.summary}</li>
                   ))}
                 </StyledList>
               </>
@@ -216,6 +336,7 @@ export const AiCommandBar = ({
             {phase.name === 'preview' && (
               <StyledActions>
                 <StyledPrimary
+                  ref={confirmRef}
                   type="button"
                   onClick={() =>
                     void confirm(
@@ -257,13 +378,19 @@ export const AiCommandBar = ({
                   <StyledNotice>{t`No matching records.`}</StyledNotice>
                 ) : (
                   <StyledList>
-                    {phase.links.map((link) => (
-                      <li key={`${link.objectName}-${link.id}`}>
-                        <Link to={recordShowPath(link.objectName, link.id)}>
-                          {link.label}
-                        </Link>
-                      </li>
-                    ))}
+                    {phase.links.map((link) => {
+                      const path = recordShowPath(link.objectName, link.id);
+
+                      return (
+                        <li key={`${link.objectName}-${link.id}`}>
+                          {path ? (
+                            <Link to={path}>{link.label}</Link>
+                          ) : (
+                            link.label
+                          )}
+                        </li>
+                      );
+                    })}
                   </StyledList>
                 )}
                 <StyledActions>

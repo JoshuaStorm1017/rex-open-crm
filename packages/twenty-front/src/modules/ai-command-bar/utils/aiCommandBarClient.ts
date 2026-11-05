@@ -8,6 +8,7 @@ export type AiProposalLine = {
 };
 
 export type AiProposal = {
+  id: string;
   summary: string;
   tools: unknown[];
   lines: AiProposalLine[];
@@ -55,14 +56,14 @@ export const proposeAiCommand = async (
 
 export const executeAiCommand = async (
   config: AiCommandBarConfig,
-  tools: unknown[],
+  proposalId: string,
   idempotencyKey: string,
   fetchImpl: FetchImpl,
 ): Promise<AiCommandOutcome<AiRecordLink[]>> => {
   const payload = await postAiCommand(
     config,
     '/v1/ai/act',
-    { workspaceId: config.workspaceId, confirmed: true, tools },
+    { workspaceId: config.workspaceId, confirmed: true, proposalId },
     fetchImpl,
     idempotencyKey,
   );
@@ -135,9 +136,11 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     return undefined;
   }
 
-  const { summary, tools, lines } = payload.proposal;
+  const { id, summary, tools, lines } = payload.proposal;
 
   if (
+    typeof id !== 'string' ||
+    !/^proposal_[0-9a-f-]{36}$/.test(id) ||
     typeof summary !== 'string' ||
     !Array.isArray(tools) ||
     !Array.isArray(lines)
@@ -163,7 +166,7 @@ const readProposal = (payload: unknown): AiProposal | undefined => {
     parsedLines.push({ tool: line.tool, summary: line.summary });
   }
 
-  return { summary, tools, lines: parsedLines };
+  return { id, summary, tools, lines: parsedLines };
 };
 
 const readRecordLinks = (payload: unknown): AiRecordLink[] => {

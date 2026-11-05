@@ -23,6 +23,7 @@ const proposal = {
   ok: true,
   workspaceId: 'ws_demo',
   proposal: {
+    id: 'proposal_11111111-1111-4111-8111-111111111111',
     summary: 'Create Acme Corp, Jane Doe, and a $50,000 opportunity.',
     tools: [
       { name: 'create_company', args: { name: 'Acme Corp' } },
@@ -112,7 +113,7 @@ describe('AiCommandBar', () => {
   it('proposes a command, confirms it, and links to the created records', async () => {
     const user = userEvent.setup();
     const fetchImpl = jest.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
         const url = String(input);
 
         if (url.endsWith('/v1/ai/plan')) {
@@ -155,9 +156,10 @@ describe('AiCommandBar', () => {
     const actInit = actCall?.[1];
     const headers = actInit?.headers as Record<string, string>;
 
-    expect(JSON.parse(String(actInit?.body))).toMatchObject({
+    expect(JSON.parse(String(actInit?.body))).toEqual({
       workspaceId: 'ws_demo',
       confirmed: true,
+      proposalId: 'proposal_11111111-1111-4111-8111-111111111111',
     });
     expect(headers['idempotency-key']).toEqual(expect.any(String));
     expect(headers['x-rex-actor']).toBe('ada@analytical.example');
@@ -209,6 +211,18 @@ describe('AiCommandBar', () => {
     expect(
       screen.getByRole('dialog', { name: 'AI command' }),
     ).toBeInTheDocument();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('closes from escape without calling the gateway', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn();
+
+    renderBar(fetchImpl, true);
+
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
