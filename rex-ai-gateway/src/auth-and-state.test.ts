@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createTwentyAuthenticator } from './auth/authenticate';
+import { readSessionCookie } from './auth/read-session-cookie';
 import { openGatewayState } from './state/sqlite-state';
 
 const directories: string[] = [];
@@ -101,6 +103,80 @@ describe('signed-in member auth', () => {
       token: 'member-access-token-value',
     });
   });
+
+  it('rejects a session token presented as the service bearer', async () => {
+    const authenticator = createTwentyAuthenticator('http://twenty.test', async () => {
+      throw new Error('Twenty should not be called');
+    });
+    const principal = await authenticator.authenticate(
+      {
+        headers: {
+          authorization: 'Bearer gateway-token',
+          'x-twenty-authorization': 'Bearer SESS_member_token_value',
+        },
+      } as never,
+      { bearerToken: 'gateway-token', allowedOrigins: new Set() },
+    );
+
+    expect(principal).toBeUndefined();
+  });
+
+  it('rejects a whoami payload that is not a member identity', async () => {
+    const authenticator = createTwentyAuthenticator('http://twenty.test', async () => {
+      return new Response(
+        JSON.stringify({
+          data: {
+            currentUser: {
+              id: 'user_1',
+              email: 'ada@analytical.example\ncc:evil@example',
+              workspaceMember: { id: 'not-a-uuid' },
+            },
+            currentWorkspace: { id: 'workspace_1' },
+          },
+        }),
+      );
+    });
+    const principal = await authenticator.authenticate(
+      {
+        headers: {
+          cookie: 'twenty-session=sess_member_token',
+          origin: 'http://localhost:3001',
+        },
+      } as never,
+      { allowedOrigins: new Set(['http://localhost:3001']) },
+    );
+
+    expect(principal).toBeUndefined();
+  });
+});
+
+describe('session cookie', () => {
+  it('forwards one raw token and rejects tossed or encoded cookies', () => {
+    expect(
+      readSessionCookie('twenty-session=sess_member_token', 'http://localhost:3001'),
+    ).toEqual({
+      cookieName: 'twenty-session',
+      sessionToken: 'sess_member_token',
+    });
+    expect(
+      readSessionCookie(
+        'twenty-session=sess_attacker_token; twenty-session=sess_member_token',
+        'http://localhost:3001',
+      ),
+    ).toBeUndefined();
+    expect(
+      readSessionCookie('twenty-session=sess_member%0d%0aX-Injected:%20yes', 'http://localhost:3001'),
+    ).toBeUndefined();
+    expect(
+      readSessionCookie('twenty-session=sess_member_token', 'https://crm.example'),
+    ).toBeUndefined();
+    expect(
+      readSessionCookie('__Host-twenty-session=sess_member_token', 'https://crm.example'),
+    ).toEqual({
+      cookieName: '__Host-twenty-session',
+      sessionToken: 'sess_member_token',
+    });
+  });
 });
 
 describe('gateway state', () => {
@@ -144,6 +220,36 @@ describe('gateway state', () => {
     ]);
     expect(replay).toMatchObject({ replayed: true, response: { status: 200 } });
     expect(writes).toBe(1);
+    expect(statSync(filename).mode & 0o777).toBe(0o600);
+    second.close();
+  });
+
+  it('drops a preview whose stored tools are not JSON', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'rex-ai-state-'));
+    directories.push(directory);
+    const filename = path.join(directory, 'gateway-state.sqlite');
+    const first = openGatewayState(filename);
+    const proposal = first.proposals.save('member_ada', 'ws_demo', [
+      { name: 'create_company', args: { name: 'Analytical Engines' } },
+    ]);
+    first.close();
+
+    const proposalId = proposal?.id;
+
+    if (!proposalId) {
+      throw new Error('Expected a stored preview id.');
+    }
+
+    const raw = new DatabaseSync(filename);
+    raw.prepare('UPDATE proposals SET tools_json = ? WHERE id = ?').run('{', proposalId);
+    raw.close();
+
+    const second = openGatewayState(filename);
+
+    expect(second.proposals.claim(proposalId, 'ws_demo', 'member_ada')).toEqual({
+      ok: false,
+      reason: 'missing',
+    });
     second.close();
   });
 });

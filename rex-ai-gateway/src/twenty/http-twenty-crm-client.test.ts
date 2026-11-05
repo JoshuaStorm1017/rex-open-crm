@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { withMemberCredential } from '../auth/call-context';
 import { isRecord } from '../is-record';
-import { CrmPreconditionError } from './crm-errors';
-import { createHttpTwentyCrmClient } from './http-twenty-crm-client';
+import { CrmPartialWriteError, CrmPreconditionError } from './crm-errors';
+import { createHttpTwentyCrmClient, readTwentyApiOrigin } from './http-twenty-crm-client';
 import { startGateway } from '../server';
 
 type CapturedRequest = {
@@ -47,6 +47,17 @@ function createClient(
     },
   });
 }
+
+describe('readTwentyApiOrigin', () => {
+  it('accepts a loopback http origin and rejects anything else on http', () => {
+    expect(readTwentyApiOrigin('http://127.0.0.1:3000')).toBe('http://127.0.0.1:3000');
+    expect(readTwentyApiOrigin('https://crm.example')).toBe('https://crm.example');
+    expect(() => readTwentyApiOrigin('http://crm.example')).toThrow(/loopback/);
+    expect(() => readTwentyApiOrigin('http://127.0.0.1:3000/rest')).toThrow(/path/);
+    expect(() => readTwentyApiOrigin('http://user:pass@127.0.0.1:3000')).toThrow(/credentials/);
+    expect(() => readTwentyApiOrigin('file:///tmp/twenty')).toThrow(/http/);
+  });
+});
 
 describe('createHttpTwentyCrmClient', () => {
   it('posts allowlisted creates to Twenty REST', async () => {
@@ -349,6 +360,37 @@ describe('createHttpTwentyCrmClient', () => {
       },
     });
     expect(JSON.stringify(patch?.body)).not.toContain('ws_demo');
+  });
+
+  it('does not request a traversed record id and reports a note delete that failed', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'POST' && captured.url === '/rest/notes') {
+        sendJson(response, 201, { data: { createNote: { id: 'note_orphan', updatedAt: 'v1' } } });
+        return;
+      }
+
+      sendJson(response, 500, { data: {} });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: '../metadata' }),
+    ).rejects.toThrow(/unsafe record id/);
+    expect(twenty.captured).toHaveLength(0);
+
+    await expect(
+      client.createNote({
+        workspaceId: 'ws_demo',
+        body: 'A fictional note.',
+        targetObject: 'company',
+        targetId: 'company_row',
+      }),
+    ).rejects.toBeInstanceOf(CrmPartialWriteError);
+    expect(twenty.captured.map((request) => request.url)).toEqual([
+      '/rest/notes',
+      '/rest/noteTargets',
+      '/rest/notes/note_orphan',
+    ]);
   });
 
   it('keeps additional emails when the primary email changes and writes nothing on a lost race', async () => {

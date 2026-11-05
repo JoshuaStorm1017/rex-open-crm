@@ -130,7 +130,7 @@ function sessionCredential(
   context: AuthenticateContext,
 ): TwentyCredential | undefined {
   const origin = allowedRequestOrigin(headerValue(request.headers.origin), context.allowedOrigins);
-  const session = readSessionCookie(headerValue(request.headers.cookie));
+  const session = readSessionCookie(headerValue(request.headers.cookie), origin);
 
   if (!origin || !session) {
     return undefined;
@@ -148,7 +148,13 @@ function readTwentyBearer(header: string | undefined): TwentyCredential | undefi
   const match = /^Bearer (\S+)$/.exec(header?.trim() ?? '');
   const token = match?.[1];
 
-  if (!token || token.startsWith('sess_') || token.length < 20 || token.length > 4000) {
+  if (
+    !token ||
+    /^sess_/i.test(token) ||
+    token.length < 20 ||
+    token.length > 4000 ||
+    !/^[\x21-\x7E]+$/.test(token)
+  ) {
     return undefined;
   }
 

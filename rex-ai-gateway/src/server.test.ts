@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { isRecord } from './is-record';
 import { IdempotencyStore } from './http/idempotency-store';
+import { CrmPartialWriteError } from './twenty/crm-errors';
 import { createMockTwentyCrmClient } from './twenty/mock-twenty-crm-client';
 import { startGateway, type RunningGateway } from './server';
 
@@ -480,6 +481,33 @@ describe('POST /v1/ai/act', () => {
     expect(response.status).toBe(409);
     expect(payload).toMatchObject({ reason: 'partial_failure' });
     expect(client.created).toHaveLength(1);
+  });
+
+  it('names a note that could not be deleted after a failed link', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createNote = async () => {
+      throw new CrmPartialWriteError('Linking the note failed. The note could not be deleted.', [
+        'note_orphan',
+      ]);
+    };
+    const gateway = await openGateway(client);
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        {
+          name: 'create_note',
+          args: { body: 'A fictional note.', targetObject: 'company', targetId: '$0' },
+        },
+      ],
+    });
+
+    expect(response.status).toBe(409);
+    expect(payload).toMatchObject({
+      reason: 'partial_failure',
+      remainingRecordIds: ['note_orphan'],
+    });
+    expect(client.created).toHaveLength(0);
   });
 
   it('refuses an unknown opportunity stage and an unsafe search query', async () => {

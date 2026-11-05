@@ -7,6 +7,11 @@ const WHOAMI_QUERY = `query RexAiWhoami {
   currentWorkspace { id }
 }`;
 
+const MEMBER_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const ACTOR_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export async function verifyMemberCredential(
   apiUrl: string,
   credential: TwentyCredential,
@@ -61,15 +66,21 @@ export async function verifyMemberCredential(
   const twentyWorkspaceId =
     typeof currentWorkspace.id === 'string' ? currentWorkspace.id : '';
 
-  if (!email || !userId || !memberId || !twentyWorkspaceId) {
+  if (
+    !ACTOR_EMAIL_PATTERN.test(email) ||
+    email.length > 254 ||
+    !SAFE_ID_PATTERN.test(userId) ||
+    !MEMBER_ID_PATTERN.test(memberId) ||
+    !SAFE_ID_PATTERN.test(twentyWorkspaceId)
+  ) {
     return undefined;
   }
 
   return {
     memberId,
     userId,
-    email: email.slice(0, 80),
+    email,
     twentyWorkspaceId,
-    actor: email.slice(0, 80),
+    actor: email,
   };
 }

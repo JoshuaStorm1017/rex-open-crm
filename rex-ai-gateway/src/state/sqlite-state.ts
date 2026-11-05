@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -15,12 +15,15 @@ export type GatewayState = {
   close: () => void;
 };
 
+const MAX_AUDIT_ROWS = 500;
+
 export function openGatewayState(filename: string): GatewayState {
   if (filename !== ':memory:') {
     mkdirSync(path.dirname(filename), { recursive: true });
   }
 
   const database = new DatabaseSync(filename);
+  restrictStateFiles(filename);
   database.exec('PRAGMA journal_mode = WAL;');
   database.exec(`
     CREATE TABLE IF NOT EXISTS proposals (
@@ -57,15 +60,21 @@ export function openGatewayState(filename: string): GatewayState {
   `);
 
   return {
-    proposals: new SqliteProposalStore(database),
-    idempotency: new SqliteIdempotencyStore(database),
-    audit: new SqliteAuditLog(database),
-    close: () => database.close(),
+    proposals: new SqliteProposalStore(database, () => restrictStateFiles(filename)),
+    idempotency: new SqliteIdempotencyStore(database, () => restrictStateFiles(filename)),
+    audit: new SqliteAuditLog(database, () => restrictStateFiles(filename)),
+    close: () => {
+      database.close();
+      restrictStateFiles(filename);
+    },
   };
 }
 
 class SqliteProposalStore extends ProposalStore {
-  constructor(private readonly database: DatabaseSync) {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly restrict: () => void,
+  ) {
     super();
   }
 
@@ -101,6 +110,7 @@ class SqliteProposalStore extends ProposalStore {
         proposal.pendingChoice ? JSON.stringify(proposal.pendingChoice) : null,
         proposal.expiresAt,
       );
+    this.restrict();
 
     return proposal;
   }
@@ -140,7 +150,15 @@ class SqliteProposalStore extends ProposalStore {
       return { ok: false, reason: 'workspace' };
     }
 
-    const proposal = this.proposalFromRow(id, row);
+    let proposal: StoredProposal;
+
+    try {
+      proposal = this.proposalFromRow(id, row);
+    } catch {
+      this.database.prepare('DELETE FROM proposals WHERE id = ?').run(id);
+      return { ok: false, reason: 'missing' };
+    }
+
     const claimed = this.claimStored(proposal, choiceId);
 
     if (!claimed.ok && claimed.reason === 'choice') {
@@ -161,21 +179,33 @@ class SqliteProposalStore extends ProposalStore {
       expires_at: number;
     },
   ): StoredProposal {
+    const tools = JSON.parse(row.tools_json) as unknown;
+
+    if (!Array.isArray(tools)) {
+      throw new Error('Stored preview tools are not an array.');
+    }
+
+    const pendingChoice = row.pending_choice_json
+      ? (JSON.parse(row.pending_choice_json) as PendingChoice)
+      : undefined;
+
     return {
       id,
       memberId: row.member_id,
       workspaceId: row.workspace_id,
-      tools: JSON.parse(row.tools_json) as ToolCall[],
-      ...(row.pending_choice_json
-        ? { pendingChoice: JSON.parse(row.pending_choice_json) as PendingChoice }
-        : {}),
+      tools: tools as ToolCall[],
+      ...(pendingChoice ? { pendingChoice } : {}),
       expiresAt: row.expires_at,
     };
   }
 }
 
 class SqliteIdempotencyStore extends IdempotencyStore {
-  constructor(database: DatabaseSync, capacity = 500) {
+  constructor(
+    database: DatabaseSync,
+    private readonly restrict: () => void,
+    capacity = 500,
+  ) {
     super(capacity);
     this.database = database;
   }
@@ -222,11 +252,15 @@ class SqliteIdempotencyStore extends IdempotencyStore {
          VALUES (?, ?, ?, ?, ?)`,
       )
       .run(memberId, key, hash, response.status, JSON.stringify(response.body));
+    this.restrict();
   }
 }
 
 class SqliteAuditLog extends AuditLog {
-  constructor(private readonly database: DatabaseSync) {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly restrict: () => void,
+  ) {
     super();
   }
 
@@ -254,6 +288,14 @@ class SqliteAuditLog extends AuditLog {
         stored.reason ?? null,
         stored.replayed ? 1 : 0,
       );
+    this.database
+      .prepare(
+        `DELETE FROM audit_log WHERE id NOT IN (
+           SELECT id FROM audit_log ORDER BY at DESC LIMIT ?
+         )`,
+      )
+      .run(MAX_AUDIT_ROWS);
+    this.restrict();
 
     return stored;
   }
@@ -271,6 +313,30 @@ class SqliteAuditLog extends AuditLog {
   }
 }
 
+function restrictStateFiles(filename: string): void {
+  if (filename === ':memory:') {
+    return;
+  }
+
+  for (const candidate of [filename, `${filename}-wal`, `${filename}-shm`]) {
+    if (existsSync(candidate)) {
+      chmodSync(candidate, 0o600);
+    }
+  }
+}
+
+function readJsonStringArray(value: unknown): string[] {
+  try {
+    const parsed: unknown = JSON.parse(String(value));
+
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function readAuditRow(row: Record<string, unknown>): AuditEntry {
   return {
     id: String(row.id),
@@ -280,8 +346,8 @@ function readAuditRow(row: Record<string, unknown>): AuditEntry {
     ...(typeof row.workspace_id === 'string' ? { workspaceId: row.workspace_id } : {}),
     action: row.action as AuditEntry['action'],
     summary: String(row.summary),
-    tools: JSON.parse(String(row.tools_json)) as string[],
-    recordIds: JSON.parse(String(row.record_ids_json)) as string[],
+    tools: readJsonStringArray(row.tools_json),
+    recordIds: readJsonStringArray(row.record_ids_json),
     ok: row.ok === 1,
     ...(row.confirmed === null || row.confirmed === undefined
       ? {}

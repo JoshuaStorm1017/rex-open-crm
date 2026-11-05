@@ -1,6 +1,10 @@
 import { currentTwentyCredential, twentyAuthHeaders } from '../auth/call-context';
 import { isRecord } from '../is-record';
-import { CrmNotFoundError, CrmPreconditionError } from './crm-errors';
+import {
+  CrmNotFoundError,
+  CrmPartialWriteError,
+  CrmPreconditionError,
+} from './crm-errors';
 import {
   TWENTY_CREATE_TARGET,
   TWENTY_OBJECT_PATH,
@@ -20,6 +24,7 @@ import {
   type CreateOpportunityInput,
   type CreatePersonInput,
   type CreatedRecord,
+  type DeletableObjectName,
   type DeleteRecordInput,
   type GetRecordInput,
   type SearchRecordsInput,
@@ -38,6 +43,47 @@ export type TwentyHttpClientConfig = {
   style?: TwentyApiStyle;
   fetchImpl?: typeof fetch;
 };
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+const RECORD_PATH_ID = /^[A-Za-z0-9_-]{1,80}$/;
+
+const DELETE_TARGET: Record<DeletableObjectName, { restPath: string; mutationName: string }> = {
+  person: { restPath: '/rest/people', mutationName: 'deletePerson' },
+  company: { restPath: '/rest/companies', mutationName: 'deleteCompany' },
+  opportunity: { restPath: '/rest/opportunities', mutationName: 'deleteOpportunity' },
+  note: { restPath: '/rest/notes', mutationName: 'deleteNote' },
+  noteTarget: { restPath: '/rest/noteTargets', mutationName: 'deleteNoteTarget' },
+};
+
+export function readTwentyApiOrigin(apiUrl: string): string {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(apiUrl);
+  } catch {
+    throw new Error('TWENTY_API_URL must be an http(s) origin.');
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('TWENTY_API_URL must not include credentials.');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('TWENTY_API_URL must be an http(s) origin.');
+  }
+
+  if (parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error('TWENTY_API_URL must be an origin without a path, query, or hash.');
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+
+  if (parsed.protocol === 'http:' && !LOOPBACK_HOSTS.has(hostname)) {
+    throw new Error('TWENTY_API_URL may use http only for a loopback host.');
+  }
+
+  return parsed.origin;
+}
 
 type JsonResult = {
   status: number;
@@ -65,7 +111,7 @@ export function readHttpClientConfigFromEnv(
     throw new Error('TWENTY_API_STYLE must be "rest" or "graphql".');
   }
 
-  return { apiUrl, style };
+  return { apiUrl: readTwentyApiOrigin(apiUrl), style };
 }
 
 export function createHttpTwentyCrmClient(
@@ -73,7 +119,7 @@ export function createHttpTwentyCrmClient(
 ): TwentyCrmClient {
   const style = config.style ?? 'rest';
   const fetchImpl = config.fetchImpl ?? fetch;
-  const apiUrl = config.apiUrl.replace(/\/+$/, '');
+  const apiUrl = readTwentyApiOrigin(config.apiUrl);
 
   const requestJson = async (
     path: string,
@@ -157,7 +203,9 @@ export function createHttpTwentyCrmClient(
     const target = TWENTY_OBJECT_PATH[input.objectName];
     const result =
       style === 'rest'
-        ? await requestJson(`${target.restPath}/${input.id}?depth=1`, { method: 'GET' })
+        ? await requestJson(`${target.restPath}/${recordPathId(input.id)}?depth=1`, {
+            method: 'GET',
+          })
         : await requestJson('/graphql', {
             method: 'POST',
             body: {
@@ -343,18 +391,32 @@ export function createHttpTwentyCrmClient(
           });
         }
       } catch (error) {
-        await requestJson(
-          style === 'rest' ? `/rest/notes/${noteId}` : '/graphql',
-          style === 'rest'
-            ? { method: 'DELETE' }
-            : {
-                method: 'POST',
-                body: {
-                  query: 'mutation Delete($id: UUID!) { deleteNote(id: $id) { id } }',
-                  variables: { id: noteId },
-                },
+        const message = error instanceof Error ? error.message : 'Linking the note failed.';
+        const safeNoteId = RECORD_PATH_ID.test(noteId) ? noteId : undefined;
+
+        try {
+          if (!safeNoteId) {
+            throw new Error('Refusing to place an unsafe note id in a Twenty URL.');
+          }
+
+          if (style === 'rest') {
+            await requestJson(`/rest/notes/${safeNoteId}`, { method: 'DELETE' });
+          } else {
+            await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query: 'mutation Delete($id: UUID!) { deleteNote(id: $id) { id } }',
+                variables: { id: safeNoteId },
               },
-        ).catch(() => undefined);
+            });
+          }
+        } catch {
+          throw new CrmPartialWriteError(
+            `${message} The note could not be deleted.`,
+            safeNoteId ? [safeNoteId] : [],
+          );
+        }
+
         throw error;
       }
 
@@ -373,32 +435,39 @@ export function createHttpTwentyCrmClient(
       };
     },
     async deleteRecord(input: DeleteRecordInput) {
-      const restPath =
-        input.objectName === 'person'
-          ? '/rest/people'
-          : input.objectName === 'company'
-            ? '/rest/companies'
-            : input.objectName === 'opportunity'
-              ? '/rest/opportunities'
-              : input.objectName === 'note'
-                ? '/rest/notes'
-                : '/rest/noteTargets';
-      const mutationName = `delete${input.objectName.charAt(0).toUpperCase()}${input.objectName.slice(1)}`;
+      const target = deleteTarget(input.objectName);
+      const id = recordPathId(input.id);
 
       if (style === 'rest') {
-        await requestJson(`${restPath}/${input.id}`, { method: 'DELETE' });
+        await requestJson(`${target.restPath}/${id}`, { method: 'DELETE' });
         return;
       }
 
       await requestJson('/graphql', {
         method: 'POST',
         body: {
-          query: `mutation Delete($id: UUID!) { ${mutationName}(id: $id) { id } }`,
-          variables: { id: input.id },
+          query: `mutation Delete($id: UUID!) { ${target.mutationName}(id: $id) { id } }`,
+          variables: { id },
         },
       });
     },
   };
+}
+
+function recordPathId(id: string): string {
+  if (!RECORD_PATH_ID.test(id)) {
+    throw new Error('Refusing to place an unsafe record id in a Twenty URL.');
+  }
+
+  return id;
+}
+
+function deleteTarget(objectName: string): { restPath: string; mutationName: string } {
+  if (!Object.prototype.hasOwnProperty.call(DELETE_TARGET, objectName)) {
+    throw new Error('Refusing to delete an unknown Twenty object.');
+  }
+
+  return DELETE_TARGET[objectName as DeletableObjectName];
 }
 
 function readMutationRecord(body: unknown, mutationName: string): Record<string, unknown> {

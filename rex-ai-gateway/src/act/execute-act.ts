@@ -1,4 +1,8 @@
-import { CrmNotFoundError, CrmPreconditionError } from '../twenty/crm-errors';
+import {
+  CrmNotFoundError,
+  CrmPartialWriteError,
+  CrmPreconditionError,
+} from '../twenty/crm-errors';
 import { UnsafeSearchQueryError } from '../twenty/safe-search';
 import type { CreatedRecord, DeletableObjectName, TwentyCrmClient } from '../twenty/twenty-crm-client';
 import { mapIntentToTool } from './map-intent';
@@ -95,10 +99,15 @@ export async function executeAct(
       effects.push(...effectsFor(resolved, result, snapshot));
     }
   } catch (error) {
-    const remaining = await compensate(client, parsed.workspaceId, effects);
+    const orphans =
+      error instanceof CrmPartialWriteError ? error.remainingRecordIds : [];
+    const remaining = [
+      ...orphans,
+      ...(await compensate(client, parsed.workspaceId, effects)),
+    ];
     const message = errorMessage(error);
 
-    if (remaining.length > 0) {
+    if (remaining.length > 0 || error instanceof CrmPartialWriteError) {
       return partialFailure(message, remaining);
     }
 
