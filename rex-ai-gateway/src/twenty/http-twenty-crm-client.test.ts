@@ -3,12 +3,15 @@ import { createServer, type ServerResponse } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { isRecord } from '../is-record';
+import { CrmPreconditionError } from './crm-errors';
 import { createHttpTwentyCrmClient } from './http-twenty-crm-client';
 import { startGateway } from '../server';
 
 type CapturedRequest = {
+  method: string | undefined;
   url: string | undefined;
   authorization: string | undefined;
+  ifMatch: string | undefined;
   body: unknown;
 };
 
@@ -182,6 +185,108 @@ describe('createHttpTwentyCrmClient', () => {
     });
     expect(twenty.captured[0]?.url).toBe('/rest/people');
   });
+
+  it('searches companies and patches only when If-Match matches', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      const url = captured.url ?? '';
+
+      if (captured.method === 'GET' && url.startsWith('/rest/companies?')) {
+        sendJson(response, 200, {
+          data: {
+            companies: [
+              {
+                id: 'company_row',
+                name: 'Analytical Engines',
+                updatedAt: '2026-01-01T00:00:00.000Z',
+                domainName: { primaryLinkUrl: 'https://analytical.example' },
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (captured.method === 'GET' && url.startsWith('/rest/companies/company_row')) {
+        sendJson(response, 200, {
+          data: {
+            company: {
+              id: 'company_row',
+              name: 'Analytical Engines',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              domainName: { primaryLinkUrl: 'https://analytical.example' },
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        data: {
+          updateCompany: {
+            id: 'company_row',
+            updatedAt: '2026-01-02T00:00:00.000Z',
+          },
+        },
+      });
+    });
+    const client = createHttpTwentyCrmClient({
+      apiUrl: twenty.url,
+      apiKey: 'test-workspace-key',
+      style: 'rest',
+    });
+
+    const found = await client.searchRecords({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      query: 'Analytical',
+      limit: 10,
+    });
+
+    expect(found).toMatchObject([
+      {
+        id: 'company_row',
+        etag: '2026-01-01T00:00:00.000Z',
+        properties: { name: 'Analytical Engines' },
+      },
+    ]);
+    expect(decodeURIComponent(twenty.captured[0]?.url ?? '')).toContain(
+      'name[ilike]:"%Analytical%"',
+    );
+
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'domain',
+        value: 'engines.example',
+        ifMatch: 'stale-etag',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    expect(twenty.captured.filter((request) => request.method === 'PATCH')).toHaveLength(0);
+
+    const updated = await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+      field: 'domain',
+      value: 'engines.example',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+    const patch = twenty.captured.find((request) => request.method === 'PATCH');
+
+    expect(updated.etag).toBe('2026-01-02T00:00:00.000Z');
+    expect(updated.properties.domain).toBe('engines.example');
+    expect(patch?.ifMatch).toBe('2026-01-01T00:00:00.000Z');
+    expect(patch?.body).toEqual({
+      domainName: {
+        primaryLinkUrl: 'https://engines.example',
+        primaryLinkLabel: '',
+        secondaryLinks: [],
+      },
+    });
+    expect(JSON.stringify(patch?.body)).not.toContain('ws_demo');
+  });
 });
 
 async function startFakeTwenty(
@@ -197,8 +302,12 @@ async function startFakeTwenty(
 
     const text = Buffer.concat(chunks).toString('utf8');
     const entry: CapturedRequest = {
+      method: request.method,
       url: request.url,
       authorization: request.headers.authorization,
+      ifMatch: Array.isArray(request.headers['if-match'])
+        ? request.headers['if-match'][0]
+        : request.headers['if-match'],
       body: text.length === 0 ? undefined : JSON.parse(text),
     };
     captured.push(entry);

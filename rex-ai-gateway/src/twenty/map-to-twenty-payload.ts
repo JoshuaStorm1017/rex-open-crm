@@ -5,6 +5,51 @@ import type {
   TwentyObjectName,
 } from './twenty-crm-client';
 
+export const TWENTY_OBJECT_PATH = {
+  person: {
+    restPath: '/rest/people',
+    singular: 'person',
+    plural: 'people',
+    mutationName: 'createPerson',
+    updateMutationName: 'updatePerson',
+    inputType: 'PersonCreateInput',
+    updateInputType: 'PersonUpdateInput',
+    filterInputType: 'PersonFilterInput',
+  },
+  company: {
+    restPath: '/rest/companies',
+    singular: 'company',
+    plural: 'companies',
+    mutationName: 'createCompany',
+    updateMutationName: 'updateCompany',
+    inputType: 'CompanyCreateInput',
+    updateInputType: 'CompanyUpdateInput',
+    filterInputType: 'CompanyFilterInput',
+  },
+  opportunity: {
+    restPath: '/rest/opportunities',
+    singular: 'opportunity',
+    plural: 'opportunities',
+    mutationName: 'createOpportunity',
+    updateMutationName: 'updateOpportunity',
+    inputType: 'OpportunityCreateInput',
+    updateInputType: 'OpportunityUpdateInput',
+    filterInputType: 'OpportunityFilterInput',
+  },
+} as const satisfies Record<
+  TwentyObjectName,
+  {
+    restPath: string;
+    singular: string;
+    plural: string;
+    mutationName: string;
+    updateMutationName: string;
+    inputType: string;
+    updateInputType: string;
+    filterInputType: string;
+  }
+>;
+
 export type TwentyCreateTarget = {
   restPath: string;
   mutationName: string;
@@ -14,21 +59,97 @@ export type TwentyCreateTarget = {
 export const TWENTY_CREATE_TARGET: Record<TwentyObjectName, TwentyCreateTarget> =
   {
     person: {
-      restPath: '/rest/people',
-      mutationName: 'createPerson',
-      inputType: 'PersonCreateInput',
+      restPath: TWENTY_OBJECT_PATH.person.restPath,
+      mutationName: TWENTY_OBJECT_PATH.person.mutationName,
+      inputType: TWENTY_OBJECT_PATH.person.inputType,
     },
     company: {
-      restPath: '/rest/companies',
-      mutationName: 'createCompany',
-      inputType: 'CompanyCreateInput',
+      restPath: TWENTY_OBJECT_PATH.company.restPath,
+      mutationName: TWENTY_OBJECT_PATH.company.mutationName,
+      inputType: TWENTY_OBJECT_PATH.company.inputType,
     },
     opportunity: {
-      restPath: '/rest/opportunities',
-      mutationName: 'createOpportunity',
-      inputType: 'OpportunityCreateInput',
+      restPath: TWENTY_OBJECT_PATH.opportunity.restPath,
+      mutationName: TWENTY_OBJECT_PATH.opportunity.mutationName,
+      inputType: TWENTY_OBJECT_PATH.opportunity.inputType,
     },
   };
+
+export function restSearchFilter(objectName: TwentyObjectName, query: string): string {
+  const quoted = `%${query}%`;
+
+  if (objectName === 'person') {
+    return `or(name.firstName[ilike]:"${quoted}",name.lastName[ilike]:"${quoted}",emails.primaryEmail[ilike]:"${quoted}")`;
+  }
+
+  return `name[ilike]:"${quoted}"`;
+}
+
+export function graphqlSearchFilter(
+  objectName: TwentyObjectName,
+  query: string,
+): Record<string, unknown> {
+  const ilike = `%${query}%`;
+
+  if (objectName === 'person') {
+    return {
+      or: [
+        { name: { firstName: { ilike } } },
+        { name: { lastName: { ilike } } },
+        { emails: { primaryEmail: { ilike } } },
+      ],
+    };
+  }
+
+  return { name: { ilike } };
+}
+
+export function toUpdatePayload(
+  objectName: TwentyObjectName,
+  field: string,
+  value: string | number,
+  current: Record<string, string | number>,
+): Record<string, unknown> {
+  if (objectName === 'person' && (field === 'firstName' || field === 'lastName')) {
+    return {
+      name: {
+        firstName: field === 'firstName' ? value : (current.firstName ?? ''),
+        lastName: field === 'lastName' ? value : (current.lastName ?? ''),
+      },
+    };
+  }
+
+  if (objectName === 'person' && field === 'email') {
+    return {
+      emails: {
+        primaryEmail: value,
+        additionalEmails: [],
+      },
+    };
+  }
+
+  if (objectName === 'company' && field === 'domain' && typeof value === 'string') {
+    return {
+      domainName: {
+        primaryLinkUrl: toCompanyLinkUrl(value),
+        primaryLinkLabel: '',
+        secondaryLinks: [],
+      },
+    };
+  }
+
+  if (objectName === 'opportunity' && field === 'amount' && typeof value === 'number') {
+    return {
+      amount: {
+        amountMicros: toAmountMicros(value),
+        currencyCode:
+          typeof current.currencyCode === 'string' ? current.currencyCode : 'USD',
+      },
+    };
+  }
+
+  return { [field]: value };
+}
 
 export function toPersonPayload(
   input: CreatePersonInput,

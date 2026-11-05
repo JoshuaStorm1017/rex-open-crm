@@ -1,19 +1,26 @@
 import { createHttpTwentyCrmClient, readHttpClientConfigFromEnv } from './twenty/http-twenty-crm-client';
 import { createMockTwentyCrmClient } from './twenty/mock-twenty-crm-client';
 import { WORKSPACE_ID_PATTERN } from './act/find-foreign-workspace-id';
+import { createLlmProvider } from './llm/create-llm-provider';
+import { readLlmConfigFromEnv } from './llm/read-llm-config';
 import { startGateway } from './server';
 
 let httpConfig: ReturnType<typeof readHttpClientConfigFromEnv>;
+let llmConfig: ReturnType<typeof readLlmConfigFromEnv>;
 
 try {
   httpConfig = readHttpClientConfigFromEnv(process.env);
+  llmConfig = readLlmConfigFromEnv(process.env);
 } catch (error) {
-  console.error(error instanceof Error ? error.message : 'Invalid Twenty client config.');
+  console.error(error instanceof Error ? error.message : 'Invalid gateway config.');
   process.exit(1);
 }
+
 const client = httpConfig
   ? createHttpTwentyCrmClient(httpConfig)
   : createMockTwentyCrmClient();
+const llm = createLlmProvider(llmConfig);
+const bearerToken = process.env.REX_AI_GATEWAY_TOKEN?.trim() || undefined;
 
 const boundWorkspaceId = process.env.TWENTY_WORKSPACE_ID?.trim() || undefined;
 
@@ -32,9 +39,11 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
 
 const gateway = await startGateway({
   client,
+  llm,
   port,
   host,
   boundWorkspaceId,
+  bearerToken,
 });
 
 console.log(`rex-ai-gateway listening on ${gateway.url}`);
@@ -42,4 +51,14 @@ console.log(
   httpConfig
     ? `twenty client: http (${httpConfig.style ?? 'rest'})`
     : 'twenty client: mock (in-memory, fictional records only)',
+);
+console.log(
+  llmConfig.provider === 'openai'
+    ? `llm: openai (${llmConfig.model})`
+    : 'llm: mock (deterministic, no network)',
+);
+console.log(
+  bearerToken
+    ? 'auth: bearer token required'
+    : 'auth: open on this process (set REX_AI_GATEWAY_TOKEN to require a bearer token)',
 );

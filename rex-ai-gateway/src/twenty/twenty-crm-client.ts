@@ -31,12 +31,39 @@ export type CreatedRecord = {
   objectName: TwentyObjectName;
   workspaceId: string;
   properties: Record<string, string | number>;
+  etag: string;
+  label: string;
+};
+
+export type SearchRecordsInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  query: string;
+  limit: number;
+};
+
+export type GetRecordInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+};
+
+export type UpdateRecordInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+  field: string;
+  value: string | number;
+  ifMatch: string;
 };
 
 export type TwentyCrmClient = {
   createPerson: (input: CreatePersonInput) => Promise<CreatedRecord>;
   createCompany: (input: CreateCompanyInput) => Promise<CreatedRecord>;
   createOpportunity: (input: CreateOpportunityInput) => Promise<CreatedRecord>;
+  searchRecords: (input: SearchRecordsInput) => Promise<CreatedRecord[]>;
+  getRecord: (input: GetRecordInput) => Promise<CreatedRecord>;
+  updateRecord: (input: UpdateRecordInput) => Promise<CreatedRecord>;
 };
 
 function withDefinedStrings(
