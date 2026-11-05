@@ -389,26 +389,25 @@ describe('card photo', () => {
     });
 
     expect(planned.payload).toMatchObject({
-      proposal: {
-        tools: [
-          { name: 'create_company', args: { name: 'Analytical Engines' } },
-          {
-            name: 'create_person',
-            args: {
-              firstName: 'Ada',
-              lastName: 'Lovelace',
-              email: 'ada@analytical.example',
-            },
-          },
-        ],
+      captureReview: {
+        text: expect.stringContaining('Name: Ada Lovelace'),
+        cardCount: 1,
       },
     });
+    expect(planned.payload).not.toHaveProperty('proposal');
     expect(client.created).toHaveLength(0);
 
+    const reviewed = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      capture: {
+        source: 'card',
+        text: 'Name: Ada Lovelace\nCompany: Analytical Engines\nEmail: ada@analytical.example',
+      },
+    });
     const acted = await postJson(gateway, '/v1/ai/act', {
       workspaceId: 'ws_demo',
       confirmed: true,
-      proposalId: proposalId(planned.payload),
+      proposalId: proposalId(reviewed.payload),
     });
 
     expect(acted.payload).toMatchObject({ ok: true });
@@ -556,12 +555,12 @@ describe('card photo', () => {
     }
 
     expect(planned.payload).toMatchObject({
-      proposal: {
-        tools: [{ name: 'create_person', args: { firstName: 'Ada' } }],
-      },
+      captureReview: { text: expect.stringContaining('Name: Ada Lovelace') },
     });
-    expect(JSON.stringify(planned.payload)).not.toContain('archive_record');
-    expect(JSON.stringify(planned.payload)).not.toContain('person_victim');
+    expect(planned.payload).not.toHaveProperty('proposal');
+    expect(JSON.stringify(planned.payload)).not.toContain(
+      '"tool":"archive_record"',
+    );
     expect(client.created).toHaveLength(0);
     expect(sawToolCall).toBe(false);
     expect(text).toContain('Name: Grace Hopper');
@@ -953,9 +952,11 @@ describe('review polish', () => {
       client.created.find((record) => record.id === person.id)?.properties
         .jobTitle,
     ).toBe('Analyst');
-    expect(failures.some((failure) => failure.reason === 'conflict')).toBe(
-      true,
-    );
+    expect(failures).toEqual([]);
+    expect(
+      client.created.find((record) => record.id === company.id)?.properties
+        .city,
+    ).toBe('Lisbon');
     expect(secondReversalRejected).toBe(true);
     winnerStore.undos.release(memberId);
   });

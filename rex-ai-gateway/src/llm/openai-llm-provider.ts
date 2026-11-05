@@ -348,7 +348,7 @@ async function readCardImage(
           {
             role: 'system',
             content:
-              'Read the business card. Reply with labelled lines only: Name, Title, Company, Email, Phone, LinkedIn, Domain, Address, City. Omit a line you cannot read. Do not invent fields and do not call tools.',
+              'Read the business card. Reply with labelled lines only: Name, Title, Company, Email, Phone, LinkedIn, Domain, Address, City. Omit a line you cannot read. If the photo shows more than one card, repeat those lines for each card and put a line containing only --- between cards. Do not invent fields and do not call tools.',
           },
           {
             role: 'user',

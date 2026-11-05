@@ -81,13 +81,85 @@ async function duplicateDomainWarnings(
     }
 
     seen.add(key);
+    const link = companyLinkOffer(slots, key, duplicate);
     warnings.push({
       code: 'duplicate_domain',
       message: `Another company already uses ${target.domain} (${duplicate.label}). This preview still proposes that domain.`,
+      ...(link ? { link } : {}),
     });
   }
 
   return warnings;
+}
+
+function companyLinkOffer(
+  slots: PreviewSlot[],
+  host: string,
+  duplicate: CreatedRecord,
+): { companyId: string; label: string } | undefined {
+  const removed = new Set<number>();
+
+  slots.forEach((slot, index) => {
+    if (slot.type !== 'ready' || slot.tool.name !== 'create_company') {
+      return;
+    }
+
+    if (
+      slot.tool.input.domain &&
+      domainHostKey(slot.tool.input.domain) === host
+    ) {
+      removed.add(index);
+    }
+  });
+
+  if (removed.size === 0) {
+    return undefined;
+  }
+
+  let person = false;
+
+  for (const slot of slots) {
+    if (slot.type !== 'ready') {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(
+      slot.tool.input as Record<string, unknown>,
+    )) {
+      if (typeof value !== 'string' || !/^\$\d+$/.test(value)) {
+        continue;
+      }
+
+      if (!removed.has(Number(value.slice(1)))) {
+        continue;
+      }
+
+      if (key !== 'companyId') {
+        return undefined;
+      }
+    }
+
+    if (slot.tool.name !== 'create_person') {
+      continue;
+    }
+
+    const companyId = slot.tool.input.companyId;
+
+    if (!companyId) {
+      person = true;
+    } else if (
+      /^\$\d+$/.test(companyId) &&
+      removed.has(Number(companyId.slice(1)))
+    ) {
+      person = true;
+    }
+  }
+
+  if (!person) {
+    return undefined;
+  }
+
+  return { companyId: duplicate.id, label: duplicate.label };
 }
 
 function domainTarget(

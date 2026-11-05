@@ -41,12 +41,22 @@ export type AiProposalChange = {
 export type AiProposalWarning = {
   code: string;
   message: string;
+  link?: {
+    companyId: string;
+    label: string;
+  };
+};
+
+export type AiProposalCreateCell = {
+  field: 'name' | 'email' | 'domain' | 'amount' | 'stage';
+  value: string;
 };
 
 export type AiProposalCreate = {
-  objectName: 'person' | 'company';
+  objectName: 'person' | 'company' | 'opportunity';
   label: string;
   summary: string;
+  cells?: AiProposalCreateCell[];
 };
 
 export type AiProposal = {
@@ -67,20 +77,51 @@ export type AiAnswerRecord = {
   detail?: string;
 };
 
+export type AiFailedRead = {
+  tool: string;
+  message: string;
+  retry: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
+
 export type AiAnswer = {
   summary: string;
   records: AiAnswerRecord[];
+  failedReads?: AiFailedRead[];
 };
+
+export type AiSkillParameterControl =
+  | 'text'
+  | 'amount'
+  | 'stage'
+  | 'company'
+  | 'date'
+  | 'owner';
 
 export type AiSkillParameter = {
   name: string;
   label: string;
+  control?: AiSkillParameterControl;
+  options?: string[];
+};
+
+export type AiCaptureReview = {
+  text: string;
+  cardCount: number;
 };
 
 export type AiPlanView = {
   proposal?: AiProposal;
   answer?: AiAnswer;
   parameters?: AiSkillParameter[];
+  captureReview?: AiCaptureReview;
+};
+
+export type AiReadUpdate = {
+  records: AiAnswerRecord[];
+  failure?: AiFailedRead;
 };
 
 export type AiRecordLink = {
@@ -138,7 +179,7 @@ export const proposeAiCommand = async (
   fetchImpl: FetchImpl,
   openRecord?: AiOpenRecord,
   onPartial?: (lines: AiProposalLine[]) => void,
-  onRead?: (records: AiAnswerRecord[]) => void,
+  onRead?: (update: AiReadUpdate) => void,
 ): Promise<AiCommandOutcome<AiPlanView>> => {
   const payload = await postAiCommand(
     config,
@@ -261,6 +302,106 @@ export const proposeAiCapture = async (
   );
 
   return readPlanOutcome(payload);
+};
+
+export const linkAiCompany = async (
+  config: AiCommandBarConfig,
+  proposalId: string,
+  companyId: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiPlanView>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/plan',
+    {
+      workspaceId: config.workspaceId,
+      proposalId,
+      linkCompanyId: companyId,
+    },
+    fetchImpl,
+  );
+
+  return readPlanOutcome(payload);
+};
+
+export const searchAiCompanies = async (
+  config: AiCommandBarConfig,
+  query: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiAnswerRecord[]>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/plan',
+    {
+      workspaceId: config.workspaceId,
+      tools: [
+        {
+          name: 'search_records',
+          args: { object: 'company', query, limit: 8 },
+        },
+      ],
+    },
+    fetchImpl,
+  );
+
+  if (payload.kind !== 'data') {
+    return payload.kind === 'message'
+      ? payload
+      : { kind: 'message', message: payload.message };
+  }
+
+  const view = readPlan(payload.data);
+
+  return {
+    kind: 'data',
+    data: view?.answer?.records ?? [],
+  };
+};
+
+const READ_TOOL_NAMES = new Set([
+  'search_records',
+  'search_notes',
+  'search_tasks',
+  'search_activities',
+]);
+
+export const retryAiRead = async (
+  config: AiCommandBarConfig,
+  retry: AiFailedRead['retry'],
+  fetchImpl: FetchImpl,
+  openRecord?: AiOpenRecord,
+): Promise<AiCommandOutcome<AiAnswer>> => {
+  if (!READ_TOOL_NAMES.has(retry.name)) {
+    return { kind: 'message', message: 'That search cannot be retried.' };
+  }
+
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/plan',
+    {
+      workspaceId: config.workspaceId,
+      tools: [retry],
+      ...(openRecord ? { context: openRecord } : {}),
+    },
+    fetchImpl,
+  );
+
+  if (payload.kind !== 'data') {
+    return payload.kind === 'message'
+      ? payload
+      : { kind: 'message', message: payload.message };
+  }
+
+  const view = readPlan(payload.data);
+
+  if (!view?.answer) {
+    return {
+      kind: 'message',
+      message: 'The search did not return records.',
+    };
+  }
+
+  return { kind: 'data', data: view.answer };
 };
 
 export const proposeAiSkill = async (
@@ -433,7 +574,7 @@ const postAiCommand = async (
   idempotencyKey?: string,
   onPartial?: (lines: AiProposalLine[]) => void,
   onProgress?: (message: string) => void,
-  onRead?: (records: AiAnswerRecord[]) => void,
+  onRead?: (update: AiReadUpdate) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -504,7 +645,7 @@ const postAiCommand = async (
 const readPlanStream = async (
   response: Response,
   onPartial?: (lines: AiProposalLine[]) => void,
-  onRead?: (records: AiAnswerRecord[]) => void,
+  onRead?: (update: AiReadUpdate) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const body = response.body;
 
@@ -550,10 +691,10 @@ const readPlanStream = async (
       }
 
       if (event.name === 'read') {
-        const records = readReadRecords(event.data);
+        const update = readReadUpdate(event.data);
 
-        if (records && onRead) {
-          onRead(records);
+        if (update && onRead) {
+          onRead(update);
         }
 
         continue;
@@ -736,6 +877,10 @@ const readPlan = (payload: unknown): AiPlanView | undefined => {
     payload.parameters === undefined
       ? undefined
       : readParameters(payload.parameters);
+  const captureReview =
+    payload.captureReview === undefined
+      ? undefined
+      : readCaptureReview(payload.captureReview);
 
   if (payload.proposal !== undefined && !proposal) {
     return undefined;
@@ -749,7 +894,11 @@ const readPlan = (payload: unknown): AiPlanView | undefined => {
     return undefined;
   }
 
-  if (!proposal && !answer && !parameters) {
+  if (payload.captureReview !== undefined && !captureReview) {
+    return undefined;
+  }
+
+  if (!proposal && !answer && !parameters && !captureReview) {
     return undefined;
   }
 
@@ -757,6 +906,7 @@ const readPlan = (payload: unknown): AiPlanView | undefined => {
     ...(proposal ? { proposal } : {}),
     ...(answer ? { answer } : {}),
     ...(parameters ? { parameters } : {}),
+    ...(captureReview ? { captureReview } : {}),
   };
 };
 
@@ -776,13 +926,50 @@ const readParameters = (value: unknown): AiSkillParameter[] | undefined => {
       return undefined;
     }
 
-    parameters.push({ name: item.name, label: item.label });
+    parameters.push({
+      name: item.name,
+      label: item.label,
+      ...(isParameterControl(item.control) ? { control: item.control } : {}),
+      ...(Array.isArray(item.options)
+        ? {
+            options: item.options.filter(
+              (option): option is string => typeof option === 'string',
+            ),
+          }
+        : {}),
+    });
   }
 
   return parameters;
 };
 
-const readReadRecords = (payload: unknown): AiAnswerRecord[] | undefined => {
+const PARAMETER_CONTROLS = [
+  'text',
+  'amount',
+  'stage',
+  'company',
+  'date',
+  'owner',
+] as const;
+
+const isParameterControl = (value: unknown): value is AiSkillParameterControl =>
+  typeof value === 'string' &&
+  (PARAMETER_CONTROLS as readonly string[]).includes(value);
+
+const readCaptureReview = (value: unknown): AiCaptureReview | undefined => {
+  if (
+    !isPlainObject(value) ||
+    typeof value.text !== 'string' ||
+    value.text.length === 0 ||
+    typeof value.cardCount !== 'number'
+  ) {
+    return undefined;
+  }
+
+  return { text: value.text, cardCount: value.cardCount };
+};
+
+const readReadUpdate = (payload: unknown): AiReadUpdate | undefined => {
   if (!isPlainObject(payload) || !Array.isArray(payload.records)) {
     return undefined;
   }
@@ -792,7 +979,45 @@ const readReadRecords = (payload: unknown): AiAnswerRecord[] | undefined => {
     records: payload.records,
   });
 
-  return answer?.records;
+  if (!answer) {
+    return undefined;
+  }
+
+  if (payload.failed !== true) {
+    return { records: answer.records };
+  }
+
+  const retry = readRetry(payload.retry);
+  const tool = typeof payload.tool === 'string' ? payload.tool : retry?.name;
+
+  if (!retry || !tool) {
+    return { records: answer.records };
+  }
+
+  return {
+    records: answer.records,
+    failure: {
+      tool,
+      message:
+        typeof payload.message === 'string' && payload.message.length > 0
+          ? payload.message
+          : 'That search failed.',
+      retry,
+    },
+  };
+};
+
+const readRetry = (value: unknown): AiFailedRead['retry'] | undefined => {
+  if (
+    !isPlainObject(value) ||
+    typeof value.name !== 'string' ||
+    !READ_TOOL_NAMES.has(value.name) ||
+    !isPlainObject(value.args)
+  ) {
+    return undefined;
+  }
+
+  return { name: value.name, args: value.args };
 };
 
 const readAnswer = (value: unknown): AiAnswer | undefined => {
@@ -826,7 +1051,37 @@ const readAnswer = (value: unknown): AiAnswer | undefined => {
     });
   }
 
-  return { summary: value.summary, records };
+  return {
+    summary: value.summary,
+    records,
+    ...(Array.isArray(value.failedReads)
+      ? { failedReads: readFailedReads(value.failedReads) }
+      : {}),
+  };
+};
+
+const readFailedReads = (value: unknown[]): AiFailedRead[] => {
+  const failed: AiFailedRead[] = [];
+
+  for (const item of value) {
+    if (
+      !isPlainObject(item) ||
+      typeof item.tool !== 'string' ||
+      typeof item.message !== 'string'
+    ) {
+      continue;
+    }
+
+    const retry = readRetry(item.retry);
+
+    if (!retry) {
+      continue;
+    }
+
+    failed.push({ tool: item.tool, message: item.message, retry });
+  }
+
+  return failed;
 };
 
 const readProposal = (payload: unknown): AiProposal | undefined => {
@@ -908,7 +1163,9 @@ const readCreates = (value: unknown): AiProposalCreate[] | undefined => {
   for (const create of value) {
     if (
       !isPlainObject(create) ||
-      (create.objectName !== 'person' && create.objectName !== 'company') ||
+      (create.objectName !== 'person' &&
+        create.objectName !== 'company' &&
+        create.objectName !== 'opportunity') ||
       typeof create.label !== 'string' ||
       typeof create.summary !== 'string'
     ) {
@@ -919,10 +1176,65 @@ const readCreates = (value: unknown): AiProposalCreate[] | undefined => {
       objectName: create.objectName,
       label: create.label,
       summary: create.summary,
+      cells: readCreateCells(create.cells, create.label),
     });
   }
 
   return creates;
+};
+
+const CREATE_CELL_FIELDS = [
+  'name',
+  'email',
+  'domain',
+  'amount',
+  'stage',
+] as const;
+
+const readCreateCells = (
+  value: unknown,
+  label: string,
+): AiProposalCreateCell[] => {
+  const cells: AiProposalCreateCell[] = [];
+
+  if (Array.isArray(value)) {
+    for (const cell of value) {
+      if (
+        !isPlainObject(cell) ||
+        typeof cell.field !== 'string' ||
+        typeof cell.value !== 'string' ||
+        !(CREATE_CELL_FIELDS as readonly string[]).includes(cell.field)
+      ) {
+        continue;
+      }
+
+      cells.push({
+        field: cell.field as AiProposalCreateCell['field'],
+        value: cell.value,
+      });
+    }
+  }
+
+  if (cells.length === 0) {
+    return [{ field: 'name', value: label }];
+  }
+
+  return cells;
+};
+
+const readCompanyLink = (
+  value: unknown,
+): AiProposalWarning['link'] | undefined => {
+  if (
+    !isPlainObject(value) ||
+    typeof value.companyId !== 'string' ||
+    typeof value.label !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,80}$/.test(value.companyId)
+  ) {
+    return undefined;
+  }
+
+  return { companyId: value.companyId, label: value.label };
 };
 
 const readChanges = (value: unknown): AiProposalChange[] | undefined => {
@@ -981,7 +1293,13 @@ const readWarnings = (value: unknown): AiProposalWarning[] | undefined => {
       return undefined;
     }
 
-    warnings.push({ code: warning.code, message: warning.message });
+    const link = readCompanyLink(warning.link);
+
+    warnings.push({
+      code: warning.code,
+      message: warning.message,
+      ...(link ? { link } : {}),
+    });
   }
 
   return warnings;

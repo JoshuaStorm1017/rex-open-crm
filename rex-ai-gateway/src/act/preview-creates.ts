@@ -1,4 +1,4 @@
-import type { ProposalCreate } from './types';
+import type { ProposalCreate, ProposalCreateCell } from './types';
 import type { ValidatedTool } from './validate-tool';
 
 type PreviewSlot = { type: 'ready'; tool: ValidatedTool } | { type: 'choice' };
@@ -12,14 +12,19 @@ export function createsFromSlots(slots: PreviewSlot[]): ProposalCreate[] {
     }
 
     if (slot.tool.name === 'create_person') {
+      const name = `${slot.tool.input.firstName} ${slot.tool.input.lastName}`;
       const detail = [slot.tool.input.email, slot.tool.input.jobTitle].filter(
         (part): part is string => typeof part === 'string' && part.length > 0,
       );
 
       creates.push({
         objectName: 'person',
-        label: `${slot.tool.input.firstName} ${slot.tool.input.lastName}`,
+        label: name,
         summary: detail.join(' · '),
+        cells: cellsFor([
+          ['name', name],
+          ['email', slot.tool.input.email],
+        ]),
       });
     }
 
@@ -32,9 +37,42 @@ export function createsFromSlots(slots: PreviewSlot[]): ProposalCreate[] {
         objectName: 'company',
         label: slot.tool.input.name,
         summary: detail.join(' · '),
+        cells: cellsFor([
+          ['name', slot.tool.input.name],
+          ['domain', slot.tool.input.domain],
+        ]),
+      });
+    }
+
+    if (slot.tool.name === 'create_opportunity') {
+      const amount =
+        slot.tool.input.amount === undefined
+          ? undefined
+          : String(slot.tool.input.amount);
+      const detail = [amount, slot.tool.input.stage].filter(
+        (part): part is string => typeof part === 'string' && part.length > 0,
+      );
+
+      creates.push({
+        objectName: 'opportunity',
+        label: slot.tool.input.name,
+        summary: detail.join(' · '),
+        cells: cellsFor([
+          ['name', slot.tool.input.name],
+          ['amount', amount],
+          ['stage', slot.tool.input.stage],
+        ]),
       });
     }
   }
 
   return creates;
+}
+
+function cellsFor(
+  pairs: Array<[ProposalCreateCell['field'], string | undefined]>,
+): ProposalCreateCell[] {
+  return pairs.flatMap(([field, value]) =>
+    value && value.length > 0 ? [{ field, value }] : [],
+  );
 }

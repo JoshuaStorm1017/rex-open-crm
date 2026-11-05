@@ -1652,6 +1652,579 @@ describe('round 9 command bar', () => {
   });
 });
 
+describe('round 10 command bar', () => {
+  it('draws name, email, and domain in the table columns, including an opportunity', () => {
+    getDefaultStore().set(aiCommandBarCreatePreviewState.atom, [
+      {
+        objectName: 'person',
+        label: 'Ada Lovelace',
+        summary: 'ada@analytical.example',
+        cells: [
+          { field: 'name', value: 'Ada Lovelace' },
+          { field: 'email', value: 'ada@analytical.example' },
+        ],
+      },
+      {
+        objectName: 'company',
+        label: 'Analytical Engines',
+        summary: 'analytical.example',
+        cells: [
+          { field: 'name', value: 'Analytical Engines' },
+          { field: 'domain', value: 'analytical.example' },
+        ],
+      },
+      {
+        objectName: 'opportunity',
+        label: 'Difference Engine',
+        summary: '50000 · MEETING',
+        cells: [
+          { field: 'name', value: 'Difference Engine' },
+          { field: 'amount', value: '50000' },
+          { field: 'stage', value: 'MEETING' },
+        ],
+      },
+    ]);
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <AiRecordTableGhostRows
+          objectName="person"
+          columns={[
+            { fieldName: 'name', index: 0 },
+            { fieldName: 'emails', index: 1 },
+            { fieldName: 'jobTitle', index: 2 },
+          ]}
+          showDrag
+          showCheckbox
+        />
+        <AiRecordTableGhostRows
+          objectName="company"
+          columns={[
+            { fieldName: 'name', index: 0 },
+            { fieldName: 'domainName', index: 1 },
+          ]}
+        />
+        <AiRecordTableGhostRows
+          objectName="opportunity"
+          columns={[
+            { fieldName: 'name', index: 0 },
+            { fieldName: 'amount', index: 1 },
+            { fieldName: 'stage', index: 2 },
+          ]}
+        />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getByRole('cell', { name: 'name: Ada Lovelace' }),
+    ).toHaveClass('record-table-column-field-0');
+    expect(
+      screen.getByRole('cell', { name: 'emails: ada@analytical.example' }),
+    ).toHaveClass('record-table-column-field-1');
+    expect(screen.getByRole('cell', { name: 'jobTitle' })).toHaveClass(
+      'record-table-column-field-2',
+    );
+    expect(
+      screen.getByRole('cell', { name: 'domainName: analytical.example' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('row', {
+        name: /Proposed opportunity Difference Engine/,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: 'amount: 50000' })).toHaveClass(
+      'record-table-column-field-1',
+    );
+    expect(
+      document.querySelector('.record-table-column-drag-and-drop'),
+    ).not.toBeNull();
+    expect(document.body.textContent).not.toContain('person_victim');
+  });
+
+  it('keeps streamed timeline rows and retries the search that failed', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        bodies.push(body);
+
+        if (Array.isArray(body.tools)) {
+          return jsonResponse({
+            ok: true,
+            workspaceId: 'ws_demo',
+            summary: 'Read tasks on the open record. 1 match.',
+            answer: {
+              summary: 'Read tasks on the open record. 1 match.',
+              records: [
+                { id: 'task_1', objectName: 'task', label: 'Send proposal' },
+              ],
+            },
+          });
+        }
+
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `event: read\ndata: ${JSON.stringify({
+                  tool: 'search_notes',
+                  summary: 'Read notes',
+                  records: [
+                    {
+                      id: 'note_1',
+                      objectName: 'note',
+                      label: 'Buyer call',
+                    },
+                  ],
+                })}\n\n`,
+              ),
+            );
+          },
+        });
+
+        return {
+          headers: { get: () => 'text/event-stream' },
+          body: stream,
+        } as unknown as Response;
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'what happened with this deal',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    expect(await screen.findByText(/Buyer call/)).toBeInTheDocument();
+
+    streamController?.enqueue(
+      encoder.encode(
+        `event: read\ndata: ${JSON.stringify({
+          tool: 'search_tasks',
+          summary: 'Read tasks',
+          records: [],
+          failed: true,
+          message: 'Tasks search failed.',
+          retry: {
+            name: 'search_tasks',
+            args: { query: 'record', recordRef: 'open', limit: 8 },
+          },
+        })}\n\n`,
+      ),
+    );
+    streamController?.enqueue(
+      encoder.encode(
+        `event: proposal\ndata: ${JSON.stringify({
+          ok: true,
+          workspaceId: 'ws_demo',
+          summary: 'Read notes. 1 match.',
+          answer: {
+            summary: 'Read notes. 1 match.',
+            records: [
+              { id: 'note_1', objectName: 'note', label: 'Buyer call' },
+            ],
+            failedReads: [
+              {
+                tool: 'search_tasks',
+                message: 'Tasks search failed.',
+                retry: {
+                  name: 'search_tasks',
+                  args: { query: 'record', recordRef: 'open', limit: 8 },
+                },
+              },
+            ],
+          },
+        })}\n\n`,
+      ),
+    );
+    streamController?.close();
+
+    expect(await screen.findByText(/Buyer call/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(
+      await screen.findByRole('button', { name: 'Retry tasks' }),
+    );
+    expect(await screen.findByText('Send proposal')).toBeInTheDocument();
+    expect(screen.getByText(/Buyer call/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Retry tasks' }),
+    ).not.toBeInTheDocument();
+    expect(
+      bodies.some(
+        (body) =>
+          Array.isArray(body.tools) &&
+          (body.tools[0] as { name?: string }).name === 'search_tasks',
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps streamed rows when the timeline ends in an error', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const fetchImpl = jest.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: read\ndata: ${JSON.stringify({
+                tool: 'search_notes',
+                summary: 'Read notes',
+                records: [
+                  { id: 'note_1', objectName: 'note', label: 'Buyer call' },
+                ],
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+
+      return {
+        headers: { get: () => 'text/event-stream' },
+        body: stream,
+      } as unknown as Response;
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'what happened with this deal',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    expect(await screen.findByText(/Buyer call/)).toBeInTheDocument();
+    streamController?.enqueue(
+      encoder.encode(
+        `event: error\ndata: ${JSON.stringify({
+          ok: false,
+          message: 'Tasks search failed.',
+        })}\n\n`,
+      ),
+    );
+    streamController?.close();
+
+    expect(await screen.findByText(/Tasks search failed/)).toBeInTheDocument();
+    expect(screen.getByText(/Buyer call/)).toBeInTheDocument();
+  });
+
+  it('uses a stage control and a company picker before confirm', async () => {
+    const user = userEvent.setup();
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        bodies.push(body);
+
+        if (url.includes('/v1/ai/skills')) {
+          return jsonResponse({
+            ok: true,
+            skills: [
+              {
+                id: 'skill_44444444-4444-4444-8444-444444444444',
+                name: 'Staff a deal',
+                tools: ['update_record', 'create_person'],
+                parameters: ['stage', 'company'],
+              },
+            ],
+          });
+        }
+
+        if (
+          Array.isArray(body.tools) &&
+          (body.tools[0] as { name?: string }).name === 'search_records'
+        ) {
+          return jsonResponse({
+            ok: true,
+            workspaceId: 'ws_demo',
+            answer: {
+              summary: '1 match.',
+              records: [
+                {
+                  id: 'company_acme',
+                  objectName: 'company',
+                  label: 'Analytical Engines',
+                },
+              ],
+            },
+          });
+        }
+
+        if (body.parameterValues) {
+          return jsonResponse({
+            ...proposal,
+            proposal: {
+              ...proposal.proposal,
+              summary: 'Create person Ada Lovelace at Analytical Engines.',
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          results: [],
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.click(screen.getByRole('button', { name: 'Saved skills' }));
+    await user.click(await screen.findByRole('button', { name: 'Run' }));
+    await user.selectOptions(
+      await screen.findByRole('combobox', { name: 'Stage' }),
+      'PROPOSAL',
+    );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Company search' }),
+      'Analytical',
+    );
+    await user.click(screen.getByRole('button', { name: 'Find company' }));
+    await user.click(
+      await screen.findByRole('button', { name: 'Use Analytical Engines' }),
+    );
+    expect(screen.getByText(/Selected company/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeEnabled();
+    const filled = bodies.find((body) => isPlainParameter(body));
+    expect(filled?.parameterValues).toEqual({
+      stage: 'PROPOSAL',
+      company: 'company_acme',
+    });
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+  });
+
+  it('links the new person only after the member picks the company on file', async () => {
+    const user = userEvent.setup();
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = jest.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        bodies.push(body);
+
+        if (body.linkCompanyId) {
+          return jsonResponse({
+            ok: true,
+            workspaceId: 'ws_demo',
+            proposal: {
+              id: 'proposal_22222222-2222-4222-8222-222222222222',
+              summary: 'Create person Ada Lovelace.',
+              tools: [
+                {
+                  name: 'create_person',
+                  args: {
+                    firstName: 'Ada',
+                    lastName: 'Lovelace',
+                    companyId: 'company_existing',
+                  },
+                },
+              ],
+              lines: [
+                {
+                  tool: 'create_person',
+                  summary: 'Create person Ada Lovelace.',
+                },
+              ],
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          proposal: {
+            id: 'proposal_11111111-1111-4111-8111-111111111111',
+            summary: 'Create company Northwind. Create person Ada Lovelace.',
+            tools: [
+              {
+                name: 'create_company',
+                args: { name: 'Northwind', domain: 'analytical.example' },
+              },
+              {
+                name: 'create_person',
+                args: {
+                  firstName: 'Ada',
+                  lastName: 'Lovelace',
+                  companyId: '$0',
+                },
+              },
+            ],
+            lines: [
+              {
+                tool: 'create_company',
+                summary: 'Create company Northwind.',
+              },
+              {
+                tool: 'create_person',
+                summary: 'Create person Ada Lovelace.',
+              },
+            ],
+            warnings: [
+              {
+                code: 'duplicate_domain',
+                message:
+                  'Another company already uses analytical.example (Analytical Engines). This preview still proposes that domain.',
+                link: {
+                  companyId: 'company_existing',
+                  label: 'Analytical Engines',
+                },
+              },
+            ],
+          },
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'create person Ada Lovelace at Northwind',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    expect(
+      await screen.findByText('Create company Northwind.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/This preview still proposes that domain/),
+    ).toBeInTheDocument();
+    expect(bodies.some((body) => body.linkCompanyId)).toBe(false);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: 'Link the new person to Analytical Engines',
+      }),
+    );
+    expect(
+      await screen.findAllByText('Create person Ada Lovelace.'),
+    ).not.toHaveLength(0);
+    expect(
+      screen.queryByText('Create company Northwind.'),
+    ).not.toBeInTheDocument();
+    expect(
+      bodies.some(
+        (body) =>
+          body.linkCompanyId === 'company_existing' &&
+          body.proposalId === 'proposal_11111111-1111-4111-8111-111111111111',
+      ),
+    ).toBe(true);
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+    const confirmed = bodies.find((body) => body.confirmed === true);
+    expect(confirmed?.proposalId).toBe(
+      'proposal_22222222-2222-4222-8222-222222222222',
+    );
+  });
+
+  it('shows extracted card lines for edit and creates only after confirm', async () => {
+    const user = userEvent.setup();
+    const bodies: Array<Record<string, unknown>> = [];
+    class FakeFileReader {
+      result: string | null = null;
+      onload: null | (() => void) = null;
+
+      readAsDataURL() {
+        this.result = 'data:image/png;base64,aaaa';
+        this.onload?.();
+      }
+    }
+    const originalReader = global.FileReader;
+    global.FileReader = FakeFileReader as unknown as typeof FileReader;
+    const fetchImpl = jest.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        bodies.push(body);
+        const capture = body.capture as
+          | { image?: unknown; text?: string }
+          | undefined;
+
+        if (capture?.image) {
+          return jsonResponse({
+            ok: true,
+            workspaceId: 'ws_demo',
+            summary: 'Read 2 cards.',
+            captureReview: {
+              cardCount: 2,
+              text: 'Name: Ada Lovelace\n---\nName: Grace Hopper',
+            },
+          });
+        }
+
+        if (capture?.text) {
+          return jsonResponse({
+            ...proposal,
+            proposal: {
+              ...proposal.proposal,
+              summary:
+                'Create person Ada Lovelace. Create person Grace Hopper.',
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          results: [],
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.click(screen.getByRole('button', { name: 'Card or voice' }));
+    const file = new File([new Uint8Array([1, 2, 3])], 'cards.png', {
+      type: 'image/png',
+    });
+    await user.upload(screen.getByLabelText('Card file'), file);
+    await user.click(screen.getByRole('button', { name: 'Preview capture' }));
+    expect(await screen.findByText(/2 cards were read/)).toBeInTheDocument();
+    const card = screen.getByRole('textbox', { name: 'Card or dictation' });
+    expect(card).toHaveValue('Name: Ada Lovelace\n---\nName: Grace Hopper');
+    await user.clear(card);
+    await user.type(
+      card,
+      'Name: Ada Lovelace{enter}Email: ada@analytical.example',
+    );
+    await user.click(screen.getByRole('button', { name: 'Preview capture' }));
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeEnabled();
+    const reviewed = bodies.find((body) => {
+      const capture = body.capture as
+        | { text?: string; image?: unknown }
+        | undefined;
+
+      return typeof capture?.text === 'string' && capture.image === undefined;
+    });
+    expect(
+      (reviewed?.capture as { text?: string } | undefined)?.text,
+    ).toContain('ada@analytical.example');
+    expect(bodies[0]?.capture).toMatchObject({
+      image: { mediaType: 'image/png', data: 'aaaa' },
+    });
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+    global.FileReader = originalReader;
+  });
+});
+
 const isPlainParameter = (body: Record<string, unknown>): boolean =>
   typeof body.parameterValues === 'object' && body.parameterValues !== null;
 
