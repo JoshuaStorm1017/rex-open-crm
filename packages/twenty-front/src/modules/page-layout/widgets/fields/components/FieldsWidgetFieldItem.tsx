@@ -8,6 +8,7 @@ import {
 } from '@/object-record/record-field/ui/contexts/FieldContext';
 import { RecordFieldComponentInstanceContext } from '@/object-record/record-field/ui/states/contexts/RecordFieldComponentInstanceContext';
 import { isJunctionRelationForbidden } from '@/object-record/record-field/ui/utils/junction/isJunctionRelationForbidden';
+import { AiRecordFieldPreview } from '@/ai-command-bar/components/AiRecordFieldPreview';
 import { RecordInlineCell } from '@/object-record/record-inline-cell/components/RecordInlineCell';
 import { getRecordFieldInputInstanceId } from '@/object-record/utils/getRecordFieldInputId';
 import { type ObjectPermissions } from 'twenty-shared/types';
@@ -101,6 +102,10 @@ export const FieldsWidgetFieldItem = ({
         }}
       >
         <RecordInlineCell loading={recordLoading} />
+        <AiRecordFieldPreview
+          recordId={recordId}
+          fieldName={fieldMetadataItem.name}
+        />
       </RecordFieldComponentInstanceContext.Provider>
     </FieldContext.Provider>
   );

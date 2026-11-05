@@ -6,7 +6,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { executeAct } from './act/execute-act';
 import { proposeAct } from './act/propose-act';
-import { restSearchFilter, toClearPayload } from './twenty/map-to-twenty-payload';
+import {
+  restSearchFilter,
+  toClearPayload,
+} from './twenty/map-to-twenty-payload';
 import { clearPinnedDnsCache, fetchWithPinnedDns } from './http/pinned-fetch';
 import { isBlockedIp } from './http/public-url';
 import { createOpenAiLlmProvider } from './llm/openai-llm-provider';
@@ -40,11 +43,15 @@ describe('openai tool calls', () => {
       async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as {
           tool_choice?: string;
-          tools?: Array<{ function?: { parameters?: { additionalProperties?: boolean } } }>;
+          tools?: Array<{
+            function?: { parameters?: { additionalProperties?: boolean } };
+          }>;
         };
 
         expect(body.tool_choice).toBe('auto');
-        expect(body.tools?.[0]?.function?.parameters?.additionalProperties).toBe(false);
+        expect(
+          body.tools?.[0]?.function?.parameters?.additionalProperties,
+        ).toBe(false);
 
         return new Response(
           JSON.stringify({
@@ -52,13 +59,18 @@ describe('openai tool calls', () => {
               {
                 message: {
                   content: JSON.stringify({
-                    tools: [{ name: 'create_company', args: { name: 'Injected' } }],
+                    tools: [
+                      { name: 'create_company', args: { name: 'Injected' } },
+                    ],
                   }),
                   tool_calls: [
                     {
                       function: {
                         name: 'create_company',
-                        arguments: JSON.stringify({ name: 'Acme Corp', dropTable: 'people' }),
+                        arguments: JSON.stringify({
+                          name: 'Acme Corp',
+                          dropTable: 'people',
+                        }),
                       },
                     },
                   ],
@@ -157,7 +169,11 @@ describe('openai tool calls', () => {
       allowed,
     );
 
-    expect(refused).toMatchObject({ refused: true, reason: 'unknown_tool', toolName: 'delete_workspace' });
+    expect(refused).toMatchObject({
+      refused: true,
+      reason: 'unknown_tool',
+      toolName: 'delete_workspace',
+    });
     expect(planned).toMatchObject({
       ok: true,
       proposal: {
@@ -231,12 +247,16 @@ describe('open record', () => {
     });
     expect(client.created).toHaveLength(1);
 
-    if (!planned.ok) {
+    if (!planned.ok || !planned.proposal) {
       return;
     }
 
     const executed = await executeAct(
-      { workspaceId: 'ws_demo', confirmed: true, tools: planned.proposal.tools },
+      {
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        tools: planned.proposal.tools,
+      },
       client,
     );
 
@@ -270,7 +290,10 @@ describe('open record', () => {
             choices: [
               {
                 message: {
-                  content: JSON.stringify({ id: 'opportunity_attacker', recordRef: 'open' }),
+                  content: JSON.stringify({
+                    id: 'opportunity_attacker',
+                    recordRef: 'open',
+                  }),
                   tool_calls: [
                     {
                       function: {
@@ -311,7 +334,12 @@ describe('open record', () => {
         tools: [
           {
             name: 'update_record',
-            args: { id: deal.id, field: 'stage', value: 'PROPOSAL', ifMatch: deal.etag },
+            args: {
+              id: deal.id,
+              field: 'stage',
+              value: 'PROPOSAL',
+              ifMatch: deal.etag,
+            },
           },
         ],
       },
@@ -375,11 +403,18 @@ describe('multi-match create', () => {
     });
 
     expect(created.response.status).toBe(200);
-    expect(client.created.filter((record) => record.objectName === 'person')).toHaveLength(3);
-    expect(client.created.some((record) => record.objectName === 'note')).toBe(true);
+    expect(
+      client.created.filter((record) => record.objectName === 'person'),
+    ).toHaveLength(3);
+    expect(client.created.some((record) => record.objectName === 'note')).toBe(
+      true,
+    );
     expect(created.payload).toMatchObject({
       ok: true,
-      undo: { id: expect.stringMatching(/^undo_/), summary: expect.stringContaining('Undo') },
+      undo: {
+        id: expect.stringMatching(/^undo_/),
+        summary: expect.stringContaining('Undo'),
+      },
     });
     expect(JSON.stringify(created.payload)).not.toContain('effects');
   });
@@ -388,7 +423,10 @@ describe('multi-match create', () => {
 describe('undo', () => {
   it('restores a previously empty field and deletes a created record', async () => {
     const client = createMockTwentyCrmClient();
-    const company = await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme' });
+    const company = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme',
+    });
     client.createPerson = async () => {
       throw new Error('person write failed');
     };
@@ -406,7 +444,10 @@ describe('undo', () => {
               ifMatch: company.etag,
             },
           },
-          { name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } },
+          {
+            name: 'create_person',
+            args: { firstName: 'Ada', lastName: 'Lovelace' },
+          },
         ],
       },
       client,
@@ -443,7 +484,9 @@ describe('undo', () => {
       { 'idempotency-key': 'undo-demo-1' },
     );
     const undoId =
-      isRecord(acted.payload) && isRecord(acted.payload.undo) && typeof acted.payload.undo.id === 'string'
+      isRecord(acted.payload) &&
+      isRecord(acted.payload.undo) &&
+      typeof acted.payload.undo.id === 'string'
         ? acted.payload.undo.id
         : '';
     const undone = await postJson(gateway, '/v1/ai/undo', {
@@ -458,19 +501,30 @@ describe('undo', () => {
 
     expect(acted.response.status).toBe(200);
     expect(undone.response.status).toBe(200);
-    expect(client.created.some((record) => record.properties.name === 'Analytical Engines')).toBe(false);
+    expect(
+      client.created.some(
+        (record) => record.properties.name === 'Analytical Engines',
+      ),
+    ).toBe(false);
     expect(client.created[0]?.properties.domain).toBeUndefined();
     expect(auditBody).toMatchObject({
       ok: true,
       entries: expect.arrayContaining([
-        expect.objectContaining({ action: 'undo', ok: true, summary: 'Reversed the last confirmed change.' }),
+        expect.objectContaining({
+          action: 'undo',
+          ok: true,
+          summary: 'Reversed the last confirmed change.',
+        }),
       ]),
     });
   });
 
   it('does not restore a field that changed after the confirmed write', async () => {
     const client = createMockTwentyCrmClient();
-    const company = await client.createCompany({ workspaceId: 'ws_demo', name: 'Acme' });
+    const company = await client.createCompany({
+      workspaceId: 'ws_demo',
+      name: 'Acme',
+    });
     const gateway = await openGateway(client);
     const planned = await postJson(gateway, '/v1/ai/plan', {
       workspaceId: 'ws_demo',
@@ -493,7 +547,9 @@ describe('undo', () => {
       proposalId: proposalId(planned.payload),
     });
     const undoId =
-      isRecord(acted.payload) && isRecord(acted.payload.undo) && typeof acted.payload.undo.id === 'string'
+      isRecord(acted.payload) &&
+      isRecord(acted.payload.undo) &&
+      typeof acted.payload.undo.id === 'string'
         ? acted.payload.undo.id
         : '';
     const current = client.created[0];
@@ -543,7 +599,9 @@ describe('undo', () => {
     first.close();
     const second = openGatewayState(filename);
 
-    expect(second.undos.peek(ticket?.id ?? '', 'member_ada', 'ws_demo').ok).toBe(true);
+    expect(
+      second.undos.peek(ticket?.id ?? '', 'member_ada', 'ws_demo').ok,
+    ).toBe(true);
     second.close();
   });
 });
@@ -553,10 +611,30 @@ describe('permission catalog', () => {
     const client = createMockTwentyCrmClient();
     client.loadCapabilities = async () => ({
       objects: [
-        { objectName: 'person', canRead: true, canUpdate: false, canSoftDelete: false },
-        { objectName: 'company', canRead: true, canUpdate: true, canSoftDelete: true },
-        { objectName: 'opportunity', canRead: false, canUpdate: false, canSoftDelete: false },
-        { objectName: 'note', canRead: true, canUpdate: false, canSoftDelete: false },
+        {
+          objectName: 'person',
+          canRead: true,
+          canUpdate: false,
+          canSoftDelete: false,
+        },
+        {
+          objectName: 'company',
+          canRead: true,
+          canUpdate: true,
+          canSoftDelete: true,
+        },
+        {
+          objectName: 'opportunity',
+          canRead: false,
+          canUpdate: false,
+          canSoftDelete: false,
+        },
+        {
+          objectName: 'note',
+          canRead: true,
+          canUpdate: false,
+          canSoftDelete: false,
+        },
       ],
     });
     const gateway = await openGateway(client);
@@ -566,7 +644,12 @@ describe('permission catalog', () => {
     const catalog: unknown = await tools.json();
     const planned = await postJson(gateway, '/v1/ai/plan', {
       workspaceId: 'ws_demo',
-      tools: [{ name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } }],
+      tools: [
+        {
+          name: 'create_person',
+          args: { firstName: 'Ada', lastName: 'Lovelace' },
+        },
+      ],
     });
 
     expect(tools.status).toBe(200);
@@ -586,12 +669,18 @@ describe('permission catalog', () => {
     ]);
     const update =
       isRecord(catalog) && Array.isArray(catalog.tools)
-        ? catalog.tools.find((tool) => isRecord(tool) && tool.name === 'update_record')
+        ? catalog.tools.find(
+            (tool) => isRecord(tool) && tool.name === 'update_record',
+          )
         : undefined;
     expect(update).toMatchObject({
       inputSchema: { properties: { object: { enum: ['company'] } } },
     });
-    expect(planned.payload).toMatchObject({ refused: true, reason: 'forbidden', toolName: 'create_person' });
+    expect(planned.payload).toMatchObject({
+      refused: true,
+      reason: 'forbidden',
+      toolName: 'create_person',
+    });
     expect(client.created).toHaveLength(0);
   });
 });
@@ -644,7 +733,12 @@ describe('pinned public hosts', () => {
       ),
     ).rejects.toThrow(/non-public/);
     await expect(
-      fetchWithPinnedDns('https://[::ffff:a9fe:a9fe]/', { method: 'GET' }, fetch, 'REX_AI_BASE_URL'),
+      fetchWithPinnedDns(
+        'https://[::ffff:a9fe:a9fe]/',
+        { method: 'GET' },
+        fetch,
+        'REX_AI_BASE_URL',
+      ),
     ).rejects.toThrow(/non-public/);
     expect(lookedUp).toBe(false);
     expect(isBlockedIp('::ffff:169.254.169.254')).toBe(true);
@@ -699,7 +793,9 @@ async function postJson(
 }
 
 function proposalId(payload: unknown): string {
-  return isRecord(payload) && isRecord(payload.proposal) && typeof payload.proposal.id === 'string'
+  return isRecord(payload) &&
+    isRecord(payload.proposal) &&
+    typeof payload.proposal.id === 'string'
     ? payload.proposal.id
     : '';
 }

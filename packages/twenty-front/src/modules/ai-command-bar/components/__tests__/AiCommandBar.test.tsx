@@ -2,7 +2,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { createStore, Provider } from 'jotai';
+import { createStore, getDefaultStore, Provider } from 'jotai';
 import { MemoryRouter } from 'react-router-dom';
 import { SidePanelPages } from 'twenty-shared/types';
 
@@ -11,6 +11,8 @@ import { sidePanelNavigationStackState } from '@/side-panel/states/sidePanelNavi
 import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFromPath';
 
 import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
+import { AiRecordFieldPreview } from '@/ai-command-bar/components/AiRecordFieldPreview';
+import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   readAiCommandBarConfig,
   type AiCommandBarConfig,
@@ -836,6 +838,244 @@ describe('side panel and several choices', () => {
     expect(
       screen.queryByText('Planning create_company…'),
     ).not.toBeInTheDocument();
+  });
+});
+
+const CITY_CHANGE = {
+  recordId: 'company_1',
+  objectName: 'company',
+  label: 'Acme',
+  field: 'city',
+  metadataField: 'address',
+  current: 'Lisbon',
+  proposed: 'Faro',
+  summary: 'Current city “Lisbon”. Proposed “Faro”.',
+};
+
+const updateProposal = {
+  ok: true,
+  workspaceId: 'ws_demo',
+  proposal: {
+    id: 'proposal_22222222-2222-4222-8222-222222222222',
+    summary: 'Set company Acme city to “Faro”.',
+    tools: [
+      {
+        name: 'update_record',
+        args: {
+          object: 'company',
+          id: 'company_1',
+          field: 'city',
+          value: 'Faro',
+        },
+      },
+    ],
+    lines: [
+      { tool: 'update_record', summary: 'Set company Acme city to “Faro”.' },
+    ],
+    changes: [CITY_CHANGE],
+    warnings: [
+      {
+        code: 'duplicate_email',
+        message:
+          'Another person already uses ada@analytical.example (Ada Lovelace). This preview still proposes that email.',
+      },
+    ],
+  },
+};
+
+describe('round 7 preview', () => {
+  afterEach(() => {
+    getDefaultStore().set(aiCommandBarFieldPreviewState.atom, []);
+  });
+
+  it('shows current against proposed, a warning, and the same diff beside the field', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async () => jsonResponse(updateProposal));
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <MemoryRouter>
+          <AiCommandBar config={config} fetchImpl={fetchImpl} initialOpen />
+          <AiRecordFieldPreview recordId="company_1" fieldName="address" />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(
+      await screen.findByText('Current city “Lisbon”. Proposed “Faro”.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Proposed change: Current city/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Another person already uses ada@analytical.example/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled();
+  });
+
+  it('blocks confirm when the row moved', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/ai/plan')) {
+        return jsonResponse(updateProposal);
+      }
+
+      return jsonResponse({
+        ok: false,
+        refused: true,
+        reason: 'precondition_failed',
+        message: 'Current city “Porto”. Proposed “Faro”. Confirm is blocked.',
+        stale: [
+          {
+            ...CITY_CHANGE,
+            current: 'Porto',
+            summary: 'Current city “Porto”. Proposed “Faro”.',
+          },
+        ],
+      });
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    expect(
+      await screen.findByText(
+        'Current city “Porto”. Proposed “Faro”. Confirm is blocked.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers a read without a confirm button', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async () =>
+      jsonResponse({
+        ok: true,
+        workspaceId: 'ws_demo',
+        summary: 'Read notes on the open record. 1 match.',
+        answer: {
+          summary: 'Read notes on the open record. 1 match.',
+          records: [
+            {
+              id: 'note_1',
+              objectName: 'note',
+              label: 'Buyer call',
+              detail: 'Talked about the pilot',
+            },
+          ],
+        },
+      }),
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'what happened with this deal',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(await screen.findByText(/Buyer call/)).toBeInTheDocument();
+    expect(screen.getByText('Nothing was changed.')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows each bulk row as it settles', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const bulkProposal = {
+      ...updateProposal,
+      proposal: {
+        ...updateProposal.proposal,
+        tools: [
+          ...updateProposal.proposal.tools,
+          {
+            name: 'update_record',
+            args: {
+              object: 'company',
+              id: 'company_2',
+              field: 'city',
+              value: 'Faro',
+            },
+          },
+        ],
+        warnings: undefined,
+      },
+    };
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith('/v1/ai/plan')) {
+          return jsonResponse(bulkProposal);
+        }
+
+        const headers = new Headers(init?.headers);
+        expect(headers.get('accept')).toBe('text/event-stream');
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `event: progress\ndata: ${JSON.stringify({
+                  index: 1,
+                  total: 2,
+                  label: 'Acme North',
+                  status: 'updated',
+                })}\n\n`,
+              ),
+            );
+          },
+        });
+
+        return {
+          headers: { get: () => 'text/event-stream' },
+          body: stream,
+        } as Response;
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update all companies named Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    expect(
+      await screen.findByText('Updated Acme North (1 of 2).'),
+    ).toBeInTheDocument();
+
+    streamController?.enqueue(
+      encoder.encode(
+        `event: result\ndata: ${JSON.stringify({
+          ...created,
+          undo: {
+            id: 'undo_55555555-5555-4555-8555-555555555555',
+            summary: 'Undo 2 field changes.',
+          },
+        })}\n\n`,
+      ),
+    );
+    streamController?.close();
+
+    expect(await screen.findByText('Acme Corp')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeInTheDocument();
   });
 });
 

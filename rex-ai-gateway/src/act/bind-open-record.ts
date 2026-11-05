@@ -60,6 +60,30 @@ export function bindOpenRecord(
     };
   }
 
+  if (
+    (tool.name === 'search_notes' ||
+      tool.name === 'search_tasks' ||
+      tool.name === 'search_activities') &&
+    tool.input.useOpenRecord
+  ) {
+    if (!openRecord) {
+      return refusal(
+        'ambiguous_intent',
+        'This read refers to the open record, but no record is open.',
+        {
+          toolName: tool.name,
+        },
+      );
+    }
+
+    const { useOpenRecord: _useOpenRecord, ...input } = tool.input;
+
+    return {
+      ...tool,
+      input: { ...input, recordId: openRecord.recordId },
+    };
+  }
+
   if (tool.name === 'create_note' && tool.input.useOpenRecord) {
     if (!openRecord) {
       return refusal(
@@ -81,7 +105,11 @@ export function bindOpenRecord(
 
     return {
       ...tool,
-      input: { ...input, targetId: openRecord.recordId, targetQuery: undefined },
+      input: {
+        ...input,
+        targetId: openRecord.recordId,
+        targetQuery: undefined,
+      },
     };
   }
 

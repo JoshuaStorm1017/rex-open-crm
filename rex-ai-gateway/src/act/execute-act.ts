@@ -4,7 +4,10 @@ import {
   CrmPreconditionError,
 } from '../twenty/crm-errors';
 import { UnsafeSearchQueryError } from '../twenty/safe-search';
-import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client';
+import type {
+  CreatedRecord,
+  TwentyCrmClient,
+} from '../twenty/twenty-crm-client';
 import { compensate, partialFailure } from './compensate';
 import { mapIntentToTool } from './map-intent';
 import { loadAudience, assertToolPermitted } from './permissions';
@@ -19,10 +22,17 @@ import {
   type ToolCall,
   type ToolResult,
 } from './types';
+
+export type SettledToolEvent = {
+  index: number;
+  total: number;
+  result: ToolResult;
+};
 import { validateTool, type ValidatedTool } from './validate-tool';
 
 export type ExecuteActOptions = {
   boundWorkspaceId?: string;
+  onSettled?: (event: SettledToolEvent) => void;
 };
 
 export async function executeAct(
@@ -36,7 +46,10 @@ export async function executeAct(
     return parsed;
   }
 
-  if (options.boundWorkspaceId && parsed.workspaceId !== options.boundWorkspaceId) {
+  if (
+    options.boundWorkspaceId &&
+    parsed.workspaceId !== options.boundWorkspaceId
+  ) {
     return refusal(
       'cross_workspace',
       `Request workspace "${parsed.workspaceId}" does not match the gateway workspace "${options.boundWorkspaceId}".`,
@@ -76,7 +89,10 @@ export async function executeAct(
       );
     }
 
-    if (result.name === 'create_note' && (result.input.useOpenRecord || !result.input.targetId)) {
+    if (
+      result.name === 'create_note' &&
+      (result.input.useOpenRecord || !result.input.targetId)
+    ) {
       return refusal(
         'missing_required_fields',
         'Refusing create_note: missing required fields: targetId.',
@@ -150,10 +166,14 @@ export async function executeAct(
             remaining.map((failure) => failure.id),
           );
         }
-        return refusal(resolved.reason, withRollback(resolved.message, effects.length), {
-          toolName: resolved.toolName,
-          missingFields: resolved.missingFields,
-        });
+        return refusal(
+          resolved.reason,
+          withRollback(resolved.message, effects.length),
+          {
+            toolName: resolved.toolName,
+            missingFields: resolved.missingFields,
+          },
+        );
       }
 
       const fresh = applyPriorEtag(resolved, results);
@@ -166,25 +186,38 @@ export async function executeAct(
             remaining.map((failure) => failure.id),
           );
         }
-        return refusal(fresh.reason, withRollback(fresh.message, effects.length), {
-          toolName: fresh.toolName,
-          missingFields: fresh.missingFields,
-        });
+        return refusal(
+          fresh.reason,
+          withRollback(fresh.message, effects.length),
+          {
+            toolName: fresh.toolName,
+            missingFields: fresh.missingFields,
+          },
+        );
       }
 
       const snapshot = await snapshotUpdate(client, parsed.workspaceId, fresh);
       const result = await dispatch(client, parsed.workspaceId, fresh);
       results.push(result);
       priorIds.push(recordId(result));
-      priorEtags.push(result.status === 'found' ? undefined : result.record.etag);
+      priorEtags.push(
+        result.status === 'found' ? undefined : result.record.etag,
+      );
       effects.push(...effectsFor(fresh, result, snapshot));
+      options.onSettled?.({
+        index: results.length,
+        total: validated.length,
+        result,
+      });
     }
   } catch (error) {
     const orphans =
       error instanceof CrmPartialWriteError ? error.remainingRecordIds : [];
     const remaining = [
       ...orphans,
-      ...(await compensate(client, parsed.workspaceId, effects)).map((failure) => failure.id),
+      ...(await compensate(client, parsed.workspaceId, effects)).map(
+        (failure) => failure.id,
+      ),
     ];
     const message = errorMessage(error);
 
@@ -193,13 +226,19 @@ export async function executeAct(
     }
 
     if (error instanceof CrmNotFoundError) {
-      return refusal('not_found', withRollback(message, effects.length), { toolName: 'update_record' });
+      return refusal('not_found', withRollback(message, effects.length), {
+        toolName: 'update_record',
+      });
     }
 
     if (error instanceof CrmPreconditionError) {
-      return refusal('precondition_failed', withRollback(message, effects.length), {
-        toolName: 'update_record',
-      });
+      return refusal(
+        'precondition_failed',
+        withRollback(message, effects.length),
+        {
+          toolName: 'update_record',
+        },
+      );
     }
 
     if (error instanceof UnsafeSearchQueryError) {
@@ -240,7 +279,10 @@ function resolveTools(request: {
     return [mapped];
   }
 
-  return refusal('invalid_request', 'Provide a tools array or an intent string.');
+  return refusal(
+    'invalid_request',
+    'Provide a tools array or an intent string.',
+  );
 }
 
 function resolveTool(
@@ -254,9 +296,13 @@ function resolveTool(
     if (isRefusal(resolvedId) || !resolvedId) {
       return isRefusal(resolvedId)
         ? resolvedId
-        : refusal('invalid_request', `Refusing update_record: ${tool.input.id} did not resolve to a record id.`, {
-            toolName: 'update_record',
-          });
+        : refusal(
+            'invalid_request',
+            `Refusing update_record: ${tool.input.id} did not resolve to a record id.`,
+            {
+              toolName: 'update_record',
+            },
+          );
     }
 
     const match = /^\$(\d+)$/.exec(tool.input.id);
@@ -274,7 +320,11 @@ function resolveTool(
   }
 
   if (tool.name === 'create_person' && tool.input.companyId) {
-    const companyId = resolveRelationId(tool.input.companyId, priorIds, tool.name);
+    const companyId = resolveRelationId(
+      tool.input.companyId,
+      priorIds,
+      tool.name,
+    );
 
     if (typeof companyId !== 'string' && companyId !== undefined) {
       return companyId;
@@ -287,7 +337,11 @@ function resolveTool(
   }
 
   if (tool.name === 'create_opportunity') {
-    const companyId = resolveRelationId(tool.input.companyId, priorIds, tool.name);
+    const companyId = resolveRelationId(
+      tool.input.companyId,
+      priorIds,
+      tool.name,
+    );
     const pointOfContactId = resolveRelationId(
       tool.input.pointOfContactId,
       priorIds,
@@ -313,7 +367,11 @@ function resolveTool(
   }
 
   if (tool.name === 'create_note' && tool.input.targetId) {
-    const targetId = resolveRelationId(tool.input.targetId, priorIds, tool.name);
+    const targetId = resolveRelationId(
+      tool.input.targetId,
+      priorIds,
+      tool.name,
+    );
 
     if (isRefusal(targetId)) {
       return targetId;
@@ -343,7 +401,10 @@ async function dispatch(
       return { tool: tool.name, status: 'created', record };
     }
     case 'create_opportunity': {
-      const record = await client.createOpportunity({ ...tool.input, workspaceId });
+      const record = await client.createOpportunity({
+        ...tool.input,
+        workspaceId,
+      });
       return { tool: tool.name, status: 'created', record };
     }
     case 'create_note': {
@@ -359,7 +420,10 @@ async function dispatch(
       return { tool: tool.name, status: 'created', record };
     }
     case 'search_records': {
-      const records = await client.searchRecords({ ...tool.input, workspaceId });
+      const records = await client.searchRecords({
+        ...tool.input,
+        workspaceId,
+      });
       return { tool: tool.name, status: 'found', records };
     }
     case 'search_notes': {
@@ -371,11 +435,16 @@ async function dispatch(
       return { tool: tool.name, status: 'found', records };
     }
     case 'search_activities': {
-      const records = await client.searchActivities({ ...tool.input, workspaceId });
+      const records = await client.searchActivities({
+        ...tool.input,
+        workspaceId,
+      });
       return { tool: tool.name, status: 'found', records };
     }
     case 'update_matching_records':
-      throw new Error('update_matching_records must be expanded before confirm.');
+      throw new Error(
+        'update_matching_records must be expanded before confirm.',
+      );
     case 'update_record': {
       const ifMatch = tool.input.ifMatch;
 
@@ -411,7 +480,10 @@ async function dispatch(
   }
 }
 
-function applyPriorEtag(tool: ValidatedTool, results: ToolResult[]): ValidatedTool | ActRefusal {
+function applyPriorEtag(
+  tool: ValidatedTool,
+  results: ToolResult[],
+): ValidatedTool | ActRefusal {
   if (tool.name === 'update_record') {
     return withFreshEtag(tool, results);
   }
@@ -423,10 +495,9 @@ function applyPriorEtag(tool: ValidatedTool, results: ToolResult[]): ValidatedTo
   return tool;
 }
 
-function withFreshEtag<TTool extends ValidatedTool & { name: 'update_record' | 'archive_record' }>(
-  tool: TTool,
-  results: ToolResult[],
-): TTool | ActRefusal {
+function withFreshEtag<
+  TTool extends ValidatedTool & { name: 'update_record' | 'archive_record' },
+>(tool: TTool, results: ToolResult[]): TTool | ActRefusal {
   const prior = priorWrite(tool.input.objectName, tool.input.id, results);
 
   if (prior?.status === 'archived') {
@@ -506,7 +577,10 @@ function effectsFor(
   snapshot: CreatedRecord | undefined,
 ): ActEffect[] {
   if (result.status === 'created') {
-    if (result.record.objectName === 'task' || result.record.objectName === 'timelineActivity') {
+    if (
+      result.record.objectName === 'task' ||
+      result.record.objectName === 'timelineActivity'
+    ) {
       return [];
     }
 
@@ -520,7 +594,11 @@ function effectsFor(
     ];
   }
 
-  if (result.status === 'archived' && tool.name === 'archive_record' && tool.input.id) {
+  if (
+    result.status === 'archived' &&
+    tool.name === 'archive_record' &&
+    tool.input.id
+  ) {
     return [
       {
         kind: 'archived',
@@ -531,10 +609,15 @@ function effectsFor(
     ];
   }
 
-  if (result.status === 'updated' && tool.name === 'update_record' && tool.input.id) {
+  if (
+    result.status === 'updated' &&
+    tool.name === 'update_record' &&
+    tool.input.id
+  ) {
     const field = tool.input.field;
     const previous =
-      snapshot && Object.prototype.hasOwnProperty.call(snapshot.properties, field)
+      snapshot &&
+      Object.prototype.hasOwnProperty.call(snapshot.properties, field)
         ? (snapshot.properties[field] ?? null)
         : null;
 

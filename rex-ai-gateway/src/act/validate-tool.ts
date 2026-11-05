@@ -34,6 +34,8 @@ export type SearchRecordsToolInput = {
 export type SearchTimelineToolInput = {
   query: string;
   limit: number;
+  recordId?: string;
+  useOpenRecord?: boolean;
 };
 
 export type UpdateRecordToolInput = {
@@ -201,9 +203,13 @@ function validateCompany(
   }
 
   if (domain && website && domain !== website) {
-    return refusal('invalid_request', 'create_company domain and website must be the same link.', {
-      toolName: 'create_company',
-    });
+    return refusal(
+      'invalid_request',
+      'create_company domain and website must be the same link.',
+      {
+        toolName: 'create_company',
+      },
+    );
   }
 
   const linkedin = optionalLinkedin(args, 'create_company');
@@ -248,7 +254,11 @@ function validateOpportunity(
     return stage;
   }
 
-  const currencyCode = optionalString(args, 'create_opportunity', 'currencyCode');
+  const currencyCode = optionalString(
+    args,
+    'create_opportunity',
+    'currencyCode',
+  );
   if (isRefusal(currencyCode)) {
     return currencyCode;
   }
@@ -315,7 +325,9 @@ const MEMBER_ID_PATTERN =
 const MAX_SHORT_TEXT = 200;
 const MAX_NOTE_BODY = 4000;
 
-function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+function validateSearch(
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
   const objectName = requireObjectName(args, 'search_records');
 
   if (typeof objectName !== 'string') {
@@ -331,7 +343,7 @@ function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefus
   if (!isSafeSearchQuery(query)) {
     return refusal(
       'invalid_request',
-      'search_records query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      "search_records query must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.",
       { toolName: 'search_records' },
     );
   }
@@ -376,23 +388,36 @@ function validateTimelineSearch(
     return limit;
   }
 
+  const useOpenRecord = readOpenRecordFlag(args, toolName);
+
+  if (typeof useOpenRecord !== 'boolean') {
+    return useOpenRecord;
+  }
+
   return {
     name: toolName,
     input: {
       query,
       limit: limit ?? 10,
+      ...(useOpenRecord ? { useOpenRecord: true } : {}),
     },
   };
 }
 
-function validateBulkUpdate(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+function validateBulkUpdate(
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
   const update = validateUpdate({ ...args, id: 'bulk' });
 
   if (isRefusal(update)) {
-    return refusal(update.reason, update.message.replaceAll('update_record', 'update_matching_records'), {
-      toolName: 'update_matching_records',
-      missingFields: update.missingFields,
-    });
+    return refusal(
+      update.reason,
+      update.message.replaceAll('update_record', 'update_matching_records'),
+      {
+        toolName: 'update_matching_records',
+        missingFields: update.missingFields,
+      },
+    );
   }
 
   if (update.name !== 'update_record') {
@@ -416,7 +441,7 @@ function validateBulkUpdate(args: Record<string, unknown>): ValidatedTool | ActR
   if (!isSafeSearchQuery(query)) {
     return refusal(
       'invalid_request',
-      'update_matching_records query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      "update_matching_records query must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.",
       { toolName: 'update_matching_records' },
     );
   }
@@ -432,7 +457,9 @@ function validateBulkUpdate(args: Record<string, unknown>): ValidatedTool | ActR
   };
 }
 
-function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+function validateUpdate(
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
   const objectName = requireObjectName(args, 'update_record');
 
   if (typeof objectName !== 'string') {
@@ -489,7 +516,7 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
   if (query && !isSafeSearchQuery(query)) {
     return refusal(
       'invalid_request',
-      'update_record query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      "update_record query must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.",
       { toolName: 'update_record' },
     );
   }
@@ -500,7 +527,10 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
     return rawField;
   }
 
-  const field = objectName === 'company' && rawField === 'owner' ? 'accountOwner' : rawField;
+  const field =
+    objectName === 'company' && rawField === 'owner'
+      ? 'accountOwner'
+      : rawField;
 
   if (!isUpdatableField(objectName, field)) {
     return refusal(
@@ -540,7 +570,9 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
   };
 }
 
-function validateArchive(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+function validateArchive(
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
   const objectName = requireObjectName(args, 'archive_record');
 
   if (typeof objectName !== 'string') {
@@ -580,7 +612,7 @@ function validateArchive(args: Record<string, unknown>): ValidatedTool | ActRefu
   if (query && !isSafeSearchQuery(query)) {
     return refusal(
       'invalid_request',
-      'archive_record query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      "archive_record query must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.",
       { toolName: 'archive_record' },
     );
   }
@@ -681,7 +713,11 @@ function isCalendarDate(value: string): boolean {
   const day = Number(value.slice(8, 10));
   const date = new Date(Date.UTC(year, month - 1, day));
 
-  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
 }
 
 function optionalPhone(
@@ -705,7 +741,9 @@ function optionalPhone(
   return phone;
 }
 
-function validateNote(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+function validateNote(
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
   const body = requireNoteBody(args);
 
   if (typeof body !== 'string') {
@@ -753,7 +791,7 @@ function validateNote(args: Record<string, unknown>): ValidatedTool | ActRefusal
   if (targetQuery && !isSafeSearchQuery(targetQuery)) {
     return refusal(
       'invalid_request',
-      'create_note targetQuery must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      "create_note targetQuery must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.",
       { toolName: 'create_note' },
     );
   }
@@ -841,13 +879,21 @@ function optionalLimit(
   args: Record<string, unknown>,
   toolName: AllowedToolName = 'search_records',
 ): number | undefined | ActRefusal {
-  if (!Object.prototype.hasOwnProperty.call(args, 'limit') || args.limit == null) {
+  if (
+    !Object.prototype.hasOwnProperty.call(args, 'limit') ||
+    args.limit == null
+  ) {
     return undefined;
   }
 
   const limit = args.limit;
 
-  if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 20) {
+  if (
+    typeof limit !== 'number' ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 20
+  ) {
     return refusal(
       'invalid_request',
       `${toolName} limit must be an integer from 1 to 20.`,
@@ -863,7 +909,10 @@ function readUpdateValue(
   objectName: UpdatableObjectName,
   field: string,
 ): string | number | ActRefusal {
-  if (!Object.prototype.hasOwnProperty.call(args, 'value') || args.value == null) {
+  if (
+    !Object.prototype.hasOwnProperty.call(args, 'value') ||
+    args.value == null
+  ) {
     return refusal(
       'missing_required_fields',
       'Refusing update_record: missing required fields: value.',
@@ -935,7 +984,13 @@ function readUpdateValue(
     );
   }
 
-  if ((field === 'address' || field === 'city' || field === 'website' || field === 'domain') && /[\u0000-\u001f]/.test(value)) {
+  if (
+    (field === 'address' ||
+      field === 'city' ||
+      field === 'website' ||
+      field === 'domain') &&
+    /[\u0000-\u001f]/.test(value)
+  ) {
     return invalidField('update_record', 'value');
   }
 
@@ -951,7 +1006,10 @@ function readUpdateValue(
     return value;
   }
 
-  if ((field === 'owner' || field === 'accountOwner') && !MEMBER_ID_PATTERN.test(value)) {
+  if (
+    (field === 'owner' || field === 'accountOwner') &&
+    !MEMBER_ID_PATTERN.test(value)
+  ) {
     return refusal(
       'invalid_request',
       'update_record owner must be "me" or a workspace member id.',
@@ -1001,7 +1059,10 @@ function optionalString(
 function optionalAmount(
   args: Record<string, unknown>,
 ): number | undefined | ActRefusal {
-  if (!Object.prototype.hasOwnProperty.call(args, 'amount') || args.amount == null) {
+  if (
+    !Object.prototype.hasOwnProperty.call(args, 'amount') ||
+    args.amount == null
+  ) {
     return undefined;
   }
 
@@ -1031,7 +1092,12 @@ function readNonNegativeAmount(value: unknown): number | undefined {
     numeric = Number(value.trim());
   }
 
-  if (numeric === undefined || !Number.isFinite(numeric) || numeric < 0 || numeric > MAX_MAJOR_AMOUNT) {
+  if (
+    numeric === undefined ||
+    !Number.isFinite(numeric) ||
+    numeric < 0 ||
+    numeric > MAX_MAJOR_AMOUNT
+  ) {
     return undefined;
   }
 
@@ -1064,7 +1130,15 @@ function readString(
 }
 
 const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
-  create_person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone', 'linkedin', 'companyId'],
+  create_person: [
+    'firstName',
+    'lastName',
+    'email',
+    'jobTitle',
+    'phone',
+    'linkedin',
+    'companyId',
+  ],
   create_company: ['name', 'domain', 'website', 'linkedin', 'address', 'city'],
   create_opportunity: [
     'name',
@@ -1075,12 +1149,27 @@ const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
     'pointOfContactId',
     'closeDate',
   ],
-  create_note: ['title', 'body', 'targetObject', 'targetId', 'targetQuery', 'recordRef'],
+  create_note: [
+    'title',
+    'body',
+    'targetObject',
+    'targetId',
+    'targetQuery',
+    'recordRef',
+  ],
   search_records: ['object', 'query', 'limit'],
-  search_notes: ['query', 'limit'],
-  search_tasks: ['query', 'limit'],
-  search_activities: ['query', 'limit'],
-  update_record: ['object', 'id', 'query', 'field', 'value', 'ifMatch', 'recordRef'],
+  search_notes: ['query', 'limit', 'recordRef'],
+  search_tasks: ['query', 'limit', 'recordRef'],
+  search_activities: ['query', 'limit', 'recordRef'],
+  update_record: [
+    'object',
+    'id',
+    'query',
+    'field',
+    'value',
+    'ifMatch',
+    'recordRef',
+  ],
   update_matching_records: ['object', 'query', 'field', 'value'],
   archive_record: ['object', 'id', 'query', 'ifMatch', 'recordRef'],
 };
@@ -1106,7 +1195,10 @@ function readOpenRecordFlag(
   args: Record<string, unknown>,
   toolName: AllowedToolName,
 ): boolean | ActRefusal {
-  if (!Object.prototype.hasOwnProperty.call(args, 'recordRef') || args.recordRef == null) {
+  if (
+    !Object.prototype.hasOwnProperty.call(args, 'recordRef') ||
+    args.recordRef == null
+  ) {
     return false;
   }
 

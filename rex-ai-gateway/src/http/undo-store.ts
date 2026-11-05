@@ -21,7 +21,9 @@ export type TakeUndoResult =
 export function summarizeUndo(effects: ActEffect[]): string {
   const created = effects.filter((effect) => effect.kind === 'created').length;
   const updated = effects.filter((effect) => effect.kind === 'updated').length;
-  const archived = effects.filter((effect) => effect.kind === 'archived').length;
+  const archived = effects.filter(
+    (effect) => effect.kind === 'archived',
+  ).length;
   const parts: string[] = [];
 
   if (created > 0) {
@@ -46,7 +48,11 @@ export class UndoStore {
   private readonly begunGeneration = new Map<string, number>();
   private stamp = 0;
 
-  save(memberId: string, workspaceId: string, effects: ActEffect[]): UndoTicket | undefined {
+  save(
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): UndoTicket | undefined {
     const ticket = this.buildTicket(memberId, workspaceId, effects);
 
     if (!ticket) {
@@ -62,11 +68,15 @@ export class UndoStore {
   }
 
   list(memberId: string, workspaceId: string): UndoTicket[] {
-    return (this.stacks.get(memberId) ?? []).filter((ticket) => ticket.workspaceId === workspaceId);
+    return (this.stacks.get(memberId) ?? []).filter(
+      (ticket) => ticket.workspaceId === workspaceId,
+    );
   }
 
   linkAct(id: string, memberId: string, auditId: string): void {
-    const ticket = (this.stacks.get(memberId) ?? []).find((item) => item.id === id);
+    const ticket = (this.stacks.get(memberId) ?? []).find(
+      (item) => item.id === id,
+    );
 
     if (ticket) {
       ticket.actAuditId = auditId;
@@ -123,7 +133,12 @@ export class UndoStore {
     this.begunGeneration.delete(memberId);
   }
 
-  retain(id: string, memberId: string, workspaceId: string, effects: ActEffect[]): boolean {
+  retain(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+    effects: ActEffect[],
+  ): boolean {
     const current = this.read(id, memberId, workspaceId);
 
     if (!current.ok || effects.length === 0) {
@@ -182,7 +197,19 @@ export class UndoStore {
     this.generation.set(memberId, (this.generation.get(memberId) ?? 0) + 1);
   }
 
-  private read(id: string, memberId: string, workspaceId: string): TakeUndoResult {
+  protected generationAtBegin(memberId: string): number | undefined {
+    return this.begunGeneration.get(memberId);
+  }
+
+  protected setGenerationAtBegin(memberId: string, generation: number): void {
+    this.begunGeneration.set(memberId, generation);
+  }
+
+  private read(
+    id: string,
+    memberId: string,
+    workspaceId: string,
+  ): TakeUndoResult {
     const stack = this.stacks.get(memberId) ?? [];
     const ticket = stack.find((item) => item.id === id);
 

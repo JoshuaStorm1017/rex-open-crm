@@ -60,26 +60,31 @@ export type TwentyCreateTarget = {
   inputType: string;
 };
 
-export const TWENTY_CREATE_TARGET: Record<TwentyObjectName, TwentyCreateTarget> =
-  {
-    person: {
-      restPath: TWENTY_OBJECT_PATH.person.restPath,
-      mutationName: TWENTY_OBJECT_PATH.person.mutationName,
-      inputType: TWENTY_OBJECT_PATH.person.inputType,
-    },
-    company: {
-      restPath: TWENTY_OBJECT_PATH.company.restPath,
-      mutationName: TWENTY_OBJECT_PATH.company.mutationName,
-      inputType: TWENTY_OBJECT_PATH.company.inputType,
-    },
-    opportunity: {
-      restPath: TWENTY_OBJECT_PATH.opportunity.restPath,
-      mutationName: TWENTY_OBJECT_PATH.opportunity.mutationName,
-      inputType: TWENTY_OBJECT_PATH.opportunity.inputType,
-    },
-  };
+export const TWENTY_CREATE_TARGET: Record<
+  TwentyObjectName,
+  TwentyCreateTarget
+> = {
+  person: {
+    restPath: TWENTY_OBJECT_PATH.person.restPath,
+    mutationName: TWENTY_OBJECT_PATH.person.mutationName,
+    inputType: TWENTY_OBJECT_PATH.person.inputType,
+  },
+  company: {
+    restPath: TWENTY_OBJECT_PATH.company.restPath,
+    mutationName: TWENTY_OBJECT_PATH.company.mutationName,
+    inputType: TWENTY_OBJECT_PATH.company.inputType,
+  },
+  opportunity: {
+    restPath: TWENTY_OBJECT_PATH.opportunity.restPath,
+    mutationName: TWENTY_OBJECT_PATH.opportunity.mutationName,
+    inputType: TWENTY_OBJECT_PATH.opportunity.inputType,
+  },
+};
 
-export function restSearchFilter(objectName: TwentyObjectName, query: string): string {
+export function restSearchFilter(
+  objectName: TwentyObjectName,
+  query: string,
+): string {
   const quoted = quoteFilterValue(`%${query}%`);
 
   if (objectName === 'person') {
@@ -147,7 +152,10 @@ export function graphqlSearchFilter(
 // Twenty compares the whole string to one field. "Ada Lovelace" matches neither
 // firstName nor lastName unless the two tokens are combined.
 function personNameClauses(query: string): string[] {
-  const parts = query.trim().split(/\s+/).filter((part) => part.length > 0);
+  const parts = query
+    .trim()
+    .split(/\s+/)
+    .filter((part) => part.length > 0);
 
   if (parts.length < 2) {
     return [];
@@ -160,7 +168,10 @@ function personNameClauses(query: string): string[] {
 }
 
 function personNameGraphql(query: string): Record<string, unknown>[] {
-  const parts = query.trim().split(/\s+/).filter((part) => part.length > 0);
+  const parts = query
+    .trim()
+    .split(/\s+/)
+    .filter((part) => part.length > 0);
 
   if (parts.length < 2) {
     return [];
@@ -180,10 +191,63 @@ const SAFE_FILTER_TOKEN = /^[A-Za-z0-9_.:T+Z-]{1,80}$/;
 
 export function conditionalUpdateFilter(id: string, etag: string): string {
   if (!SAFE_FILTER_TOKEN.test(id) || !SAFE_FILTER_TOKEN.test(etag)) {
-    throw new Error('Refusing to interpolate an unsafe id or etag into a Twenty filter.');
+    throw new Error(
+      'Refusing to interpolate an unsafe id or etag into a Twenty filter.',
+    );
   }
 
   return `and(id[eq]:"${id}",updatedAt[eq]:"${etag}")`;
+}
+
+export function companyIdEqualsFilter(companyId: string): string {
+  assertFilterToken(companyId, 'company id');
+
+  return `companyId[eq]:"${companyId}"`;
+}
+
+export function restTimelineRecordFilter(
+  kind: 'note' | 'task' | 'activity',
+  recordId: string,
+): string {
+  assertFilterToken(recordId, 'record id');
+  const id = JSON.stringify(recordId);
+
+  if (kind === 'activity') {
+    return `linkedRecordId[eq]:${id}`;
+  }
+
+  const prefix = kind === 'note' ? 'noteTargets' : 'taskTargets';
+
+  return `or(${prefix}.targetPersonId[eq]:${id},${prefix}.targetCompanyId[eq]:${id},${prefix}.targetOpportunityId[eq]:${id})`;
+}
+
+export function graphqlTimelineRecordFilter(
+  kind: 'note' | 'task' | 'activity',
+  recordId: string,
+): Record<string, unknown> {
+  assertFilterToken(recordId, 'record id');
+
+  if (kind === 'activity') {
+    return { linkedRecordId: { eq: recordId } };
+  }
+
+  const target = {
+    or: [
+      { targetPersonId: { eq: recordId } },
+      { targetCompanyId: { eq: recordId } },
+      { targetOpportunityId: { eq: recordId } },
+    ],
+  };
+
+  return kind === 'note' ? { noteTargets: target } : { taskTargets: target };
+}
+
+function assertFilterToken(value: string, label: string): void {
+  if (!SAFE_FILTER_TOKEN.test(value)) {
+    throw new Error(
+      `Refusing to interpolate an unsafe ${label} into a Twenty filter.`,
+    );
+  }
 }
 
 export function updateManyName(objectName: TwentyObjectName): string {
@@ -204,7 +268,10 @@ export function toClearPayload(
   current: Record<string, string | number>,
   composites?: RecordComposites,
 ): Record<string, unknown> {
-  if (objectName === 'person' && (field === 'firstName' || field === 'lastName')) {
+  if (
+    objectName === 'person' &&
+    (field === 'firstName' || field === 'lastName')
+  ) {
     return {
       name: {
         firstName: field === 'firstName' ? '' : (current.firstName ?? ''),
@@ -232,7 +299,10 @@ export function toClearPayload(
     };
   }
 
-  if ((objectName === 'person' || objectName === 'company') && field === 'linkedin') {
+  if (
+    (objectName === 'person' || objectName === 'company') &&
+    field === 'linkedin'
+  ) {
     return {
       linkedinLink: {
         primaryLinkUrl: '',
@@ -271,7 +341,10 @@ export function toClearPayload(
     return {
       amount: {
         amountMicros: null,
-        currencyCode: typeof current.currencyCode === 'string' ? current.currencyCode : 'USD',
+        currencyCode:
+          typeof current.currencyCode === 'string'
+            ? current.currencyCode
+            : 'USD',
       },
     };
   }
@@ -286,7 +359,10 @@ export function toUpdatePayload(
   current: Record<string, string | number>,
   composites?: RecordComposites,
 ): Record<string, unknown> {
-  if (objectName === 'person' && (field === 'firstName' || field === 'lastName')) {
+  if (
+    objectName === 'person' &&
+    (field === 'firstName' || field === 'lastName')
+  ) {
     return {
       name: {
         firstName: field === 'firstName' ? value : (current.firstName ?? ''),
@@ -304,7 +380,11 @@ export function toUpdatePayload(
     };
   }
 
-  if (objectName === 'company' && (field === 'domain' || field === 'website') && typeof value === 'string') {
+  if (
+    objectName === 'company' &&
+    (field === 'domain' || field === 'website') &&
+    typeof value === 'string'
+  ) {
     return {
       domainName: {
         primaryLinkUrl: toCompanyLinkUrl(value),
@@ -314,7 +394,11 @@ export function toUpdatePayload(
     };
   }
 
-  if ((objectName === 'person' || objectName === 'company') && field === 'linkedin' && typeof value === 'string') {
+  if (
+    (objectName === 'person' || objectName === 'company') &&
+    field === 'linkedin' &&
+    typeof value === 'string'
+  ) {
     return {
       linkedinLink: {
         primaryLinkUrl: value,
@@ -324,17 +408,27 @@ export function toUpdatePayload(
     };
   }
 
-  if (objectName === 'company' && (field === 'address' || field === 'city') && typeof value === 'string') {
+  if (
+    objectName === 'company' &&
+    (field === 'address' || field === 'city') &&
+    typeof value === 'string'
+  ) {
     return {
       address: addressPayload(composites?.address, field, value),
     };
   }
 
-  if (objectName === 'person' && field === 'phone' && typeof value === 'string') {
+  if (
+    objectName === 'person' &&
+    field === 'phone' &&
+    typeof value === 'string'
+  ) {
     const phone = parsePhone(value);
 
     if (!phone) {
-      throw new Error('Refusing to write a phone number the gateway did not parse.');
+      throw new Error(
+        'Refusing to write a phone number the gateway did not parse.',
+      );
     }
 
     return {
@@ -347,20 +441,34 @@ export function toUpdatePayload(
     };
   }
 
-  if (objectName === 'company' && field === 'accountOwner' && typeof value === 'string') {
+  if (
+    objectName === 'company' &&
+    field === 'accountOwner' &&
+    typeof value === 'string'
+  ) {
     return { accountOwnerId: value };
   }
 
-  if (objectName === 'opportunity' && field === 'owner' && typeof value === 'string') {
+  if (
+    objectName === 'opportunity' &&
+    field === 'owner' &&
+    typeof value === 'string'
+  ) {
     return { ownerId: value };
   }
 
-  if (objectName === 'opportunity' && field === 'amount' && typeof value === 'number') {
+  if (
+    objectName === 'opportunity' &&
+    field === 'amount' &&
+    typeof value === 'number'
+  ) {
     return {
       amount: {
         amountMicros: toAmountMicros(value),
         currencyCode:
-          typeof current.currencyCode === 'string' ? current.currencyCode : 'USD',
+          typeof current.currencyCode === 'string'
+            ? current.currencyCode
+            : 'USD',
       },
     };
   }
@@ -465,7 +573,8 @@ function addressPayload(
   value: string,
 ): AddressFields {
   return {
-    addressStreet1: field === 'address' ? value : (current?.addressStreet1 ?? ''),
+    addressStreet1:
+      field === 'address' ? value : (current?.addressStreet1 ?? ''),
     addressStreet2: current?.addressStreet2 ?? '',
     addressCity: field === 'city' ? value : (current?.addressCity ?? ''),
     addressState: current?.addressState ?? '',

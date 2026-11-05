@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { withMemberCredential } from '../auth/call-context';
 import { isRecord } from '../is-record';
 import { CrmPartialWriteError, CrmPreconditionError } from './crm-errors';
-import { createHttpTwentyCrmClient, readTwentyApiOrigin } from './http-twenty-crm-client';
+import {
+  createHttpTwentyCrmClient,
+  readTwentyApiOrigin,
+} from './http-twenty-crm-client';
 import { startGateway } from '../server';
 
 type CapturedRequest = {
@@ -25,7 +28,10 @@ afterEach(async () => {
   }
 });
 
-const memberCredential = { kind: 'bearer' as const, token: 'member-access-token-value' };
+const memberCredential = {
+  kind: 'bearer' as const,
+  token: 'member-access-token-value',
+};
 
 function createClient(
   config: Parameters<typeof createHttpTwentyCrmClient>[0],
@@ -42,7 +48,10 @@ function createClient(
 
       return (...args: unknown[]) =>
         withMemberCredential(memberCredential, () =>
-          (value as (...inner: unknown[]) => Promise<unknown>).apply(target, args),
+          (value as (...inner: unknown[]) => Promise<unknown>).apply(
+            target,
+            args,
+          ),
         );
     },
   });
@@ -50,16 +59,30 @@ function createClient(
 
 describe('readTwentyApiOrigin', () => {
   it('accepts a loopback http origin and rejects anything else on http', () => {
-    expect(readTwentyApiOrigin('http://127.0.0.1:3000')).toBe('http://127.0.0.1:3000');
-    expect(readTwentyApiOrigin('https://crm.example')).toBe('https://crm.example');
+    expect(readTwentyApiOrigin('http://127.0.0.1:3000')).toBe(
+      'http://127.0.0.1:3000',
+    );
+    expect(readTwentyApiOrigin('https://crm.example')).toBe(
+      'https://crm.example',
+    );
     expect(() => readTwentyApiOrigin('http://crm.example')).toThrow(/loopback/);
-    expect(() => readTwentyApiOrigin('http://127.0.0.1:3000/rest')).toThrow(/path/);
-    expect(() => readTwentyApiOrigin('http://user:pass@127.0.0.1:3000')).toThrow(/credentials/);
+    expect(() => readTwentyApiOrigin('http://127.0.0.1:3000/rest')).toThrow(
+      /path/,
+    );
+    expect(() =>
+      readTwentyApiOrigin('http://user:pass@127.0.0.1:3000'),
+    ).toThrow(/credentials/);
     expect(() => readTwentyApiOrigin('file:///tmp/twenty')).toThrow(/http/);
     expect(() => readTwentyApiOrigin('https://10.0.0.1')).toThrow(/non-public/);
-    expect(() => readTwentyApiOrigin('https://169.254.169.254')).toThrow(/non-public/);
-    expect(() => readTwentyApiOrigin('https://metadata.google.internal')).toThrow(/metadata|local/);
-    expect(() => readTwentyApiOrigin('https://[::ffff:a9fe:a9fe]')).toThrow(/non-public/);
+    expect(() => readTwentyApiOrigin('https://169.254.169.254')).toThrow(
+      /non-public/,
+    );
+    expect(() =>
+      readTwentyApiOrigin('https://metadata.google.internal'),
+    ).toThrow(/metadata|local/);
+    expect(() => readTwentyApiOrigin('https://[::ffff:a9fe:a9fe]')).toThrow(
+      /non-public/,
+    );
   });
 });
 
@@ -116,7 +139,12 @@ describe('createHttpTwentyCrmClient', () => {
       '/rest/companies',
       '/rest/opportunities',
     ]);
-    expect(twenty.captured.every((request) => request.authorization === 'Bearer member-access-token-value')).toBe(true);
+    expect(
+      twenty.captured.every(
+        (request) =>
+          request.authorization === 'Bearer member-access-token-value',
+      ),
+    ).toBe(true);
     expect(twenty.captured[0]?.body).toEqual({
       name: { firstName: 'Ada', lastName: 'Lovelace' },
       emails: {
@@ -138,7 +166,9 @@ describe('createHttpTwentyCrmClient', () => {
       stage: 'NEW',
       amount: { amountMicros: 12_000_000_000, currencyCode: 'USD' },
     });
-    const bodies = JSON.stringify(twenty.captured.map((request) => request.body));
+    const bodies = JSON.stringify(
+      twenty.captured.map((request) => request.body),
+    );
     expect(bodies).not.toContain('ws_demo');
     expect(bodies).not.toContain('test-workspace-key');
   });
@@ -170,7 +200,8 @@ describe('createHttpTwentyCrmClient', () => {
     });
 
     const body = twenty.captured[0]?.body;
-    const query = isRecord(body) && typeof body.query === 'string' ? body.query : '';
+    const query =
+      isRecord(body) && typeof body.query === 'string' ? body.query : '';
     expect(query).toContain('createPerson');
     expect(query).toContain('PersonCreateInput');
   });
@@ -178,7 +209,9 @@ describe('createHttpTwentyCrmClient', () => {
   it('forwards a confirmed gateway act call through the HTTP client', async () => {
     const twenty = await startFakeTwenty((captured, response) => {
       const query =
-        isRecord(captured.body) && typeof captured.body.query === 'string' ? captured.body.query : '';
+        isRecord(captured.body) && typeof captured.body.query === 'string'
+          ? captured.body.query
+          : '';
 
       if (query.includes('RexAiCapabilities')) {
         sendJson(response, 200, {
@@ -257,14 +290,21 @@ describe('createHttpTwentyCrmClient', () => {
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         confirmed: true,
-        tools: [{ name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } }],
+        tools: [
+          {
+            name: 'create_person',
+            args: { firstName: 'Ada', lastName: 'Lovelace' },
+          },
+        ],
       }),
     });
 
     expect(direct.status).toBe(400);
-    expect(twenty.captured.some((entry) => entry.method === 'POST' && entry.url === '/rest/people')).toBe(
-      false,
-    );
+    expect(
+      twenty.captured.some(
+        (entry) => entry.method === 'POST' && entry.url === '/rest/people',
+      ),
+    ).toBe(false);
 
     const response = await fetch(`${gateway.url}/v1/ai/act`, {
       method: 'POST',
@@ -300,7 +340,9 @@ describe('createHttpTwentyCrmClient', () => {
         },
       ],
     });
-    expect(twenty.captured.filter((entry) => entry.url === '/rest/people')).toHaveLength(1);
+    expect(
+      twenty.captured.filter((entry) => entry.url === '/rest/people'),
+    ).toHaveLength(1);
   });
 
   it('searches companies and patches only when If-Match matches', async () => {
@@ -323,7 +365,10 @@ describe('createHttpTwentyCrmClient', () => {
         return;
       }
 
-      if (captured.method === 'GET' && url.startsWith('/rest/companies/company_row')) {
+      if (
+        captured.method === 'GET' &&
+        url.startsWith('/rest/companies/company_row')
+      ) {
         sendJson(response, 200, {
           data: {
             company: {
@@ -381,7 +426,9 @@ describe('createHttpTwentyCrmClient', () => {
         ifMatch: 'stale-etag',
       }),
     ).rejects.toBeInstanceOf(CrmPreconditionError);
-    expect(twenty.captured.filter((request) => request.method === 'PATCH')).toHaveLength(0);
+    expect(
+      twenty.captured.filter((request) => request.method === 'PATCH'),
+    ).toHaveLength(0);
 
     const updated = await client.updateRecord({
       workspaceId: 'ws_demo',
@@ -412,7 +459,9 @@ describe('createHttpTwentyCrmClient', () => {
   it('does not request a traversed record id and reports a note delete that failed', async () => {
     const twenty = await startFakeTwenty((captured, response) => {
       if (captured.method === 'POST' && captured.url === '/rest/notes') {
-        sendJson(response, 201, { data: { createNote: { id: 'note_orphan', updatedAt: 'v1' } } });
+        sendJson(response, 201, {
+          data: { createNote: { id: 'note_orphan', updatedAt: 'v1' } },
+        });
         return;
       }
 
@@ -421,7 +470,11 @@ describe('createHttpTwentyCrmClient', () => {
     const client = createClient({ apiUrl: twenty.url, style: 'rest' });
 
     await expect(
-      client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: '../metadata' }),
+      client.deleteRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'note',
+        id: '../metadata',
+      }),
     ).rejects.toThrow(/unsafe record id/);
     expect(twenty.captured).toHaveLength(0);
 
@@ -496,11 +549,17 @@ describe('createHttpTwentyCrmClient', () => {
         return;
       }
 
-      sendJson(response, 200, { data: { deleteNoteTarget: { id: 'noteTarget_row' } } });
+      sendJson(response, 200, {
+        data: { deleteNoteTarget: { id: 'noteTarget_row' } },
+      });
     });
     const client = createClient({ apiUrl: twenty.url, style: 'rest' });
 
-    await client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: 'note_row' });
+    await client.deleteRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'note',
+      id: 'note_row',
+    });
 
     expect(twenty.captured.map((request) => request.url)).toEqual([
       '/rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
@@ -520,9 +579,15 @@ describe('createHttpTwentyCrmClient', () => {
     });
     const client = createClient({ apiUrl: twenty.url, style: 'rest' });
 
-    await client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: 'note_row' });
+    await client.deleteRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'note',
+      id: 'note_row',
+    });
 
-    expect(twenty.captured.map((request) => `${request.method} ${request.url}`)).toEqual([
+    expect(
+      twenty.captured.map((request) => `${request.method} ${request.url}`),
+    ).toEqual([
       'GET /rest/noteTargets?filter=noteId%5Beq%5D%3A%22note_row%22&limit=50',
       'DELETE /rest/notes/note_row?soft_delete=true',
     ]);
@@ -530,7 +595,10 @@ describe('createHttpTwentyCrmClient', () => {
 
   it('soft-deletes on archive, restores on undo, and writes website, city, and linkedin composites', async () => {
     const twenty = await startFakeTwenty((captured, response) => {
-      if (captured.method === 'GET' && captured.url?.startsWith('/rest/companies/')) {
+      if (
+        captured.method === 'GET' &&
+        captured.url?.startsWith('/rest/companies/')
+      ) {
         sendJson(response, 200, {
           data: {
             company: {
@@ -552,7 +620,11 @@ describe('createHttpTwentyCrmClient', () => {
       }
 
       sendJson(response, 200, {
-        data: { updateCompanies: [{ id: 'company_row', updatedAt: '2026-01-02T00:00:00.000Z' }] },
+        data: {
+          updateCompanies: [
+            { id: 'company_row', updatedAt: '2026-01-02T00:00:00.000Z' },
+          ],
+        },
       });
     });
     const client = createClient({ apiUrl: twenty.url, style: 'rest' });
@@ -579,9 +651,15 @@ describe('createHttpTwentyCrmClient', () => {
       id: 'company_row',
       ifMatch: '2026-01-01T00:00:00.000Z',
     });
-    await client.restoreRecord({ workspaceId: 'ws_demo', objectName: 'company', id: 'company_row' });
+    await client.restoreRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+    });
 
-    const patches = twenty.captured.filter((request) => request.method === 'PATCH');
+    const patches = twenty.captured.filter(
+      (request) => request.method === 'PATCH',
+    );
 
     expect(patches[0]?.body).toEqual({
       address: {
@@ -600,7 +678,9 @@ describe('createHttpTwentyCrmClient', () => {
         secondaryLinks: [],
       },
     });
-    expect(twenty.captured.map((request) => `${request.method} ${request.url}`)).toEqual([
+    expect(
+      twenty.captured.map((request) => `${request.method} ${request.url}`),
+    ).toEqual([
       'GET /rest/companies/company_row?depth=1',
       'PATCH /rest/companies?filter=and(id%5Beq%5D%3A%22company_row%22%2CupdatedAt%5Beq%5D%3A%222026-01-01T00%3A00%3A00.000Z%22)',
       'GET /rest/companies/company_row?depth=1',
@@ -705,9 +785,15 @@ describe('createHttpTwentyCrmClient', () => {
     }
 
     const capabilities = await client.loadCapabilities();
-    const company = capabilities.objects.find((object) => object.objectName === 'company');
-    const opportunity = capabilities.objects.find((object) => object.objectName === 'opportunity');
-    const person = capabilities.objects.find((object) => object.objectName === 'person');
+    const company = capabilities.objects.find(
+      (object) => object.objectName === 'company',
+    );
+    const opportunity = capabilities.objects.find(
+      (object) => object.objectName === 'opportunity',
+    );
+    const person = capabilities.objects.find(
+      (object) => object.objectName === 'person',
+    );
     const companyFields = company?.fieldPermissions;
     const opportunityFields = opportunity?.fieldPermissions;
     const personFields = person?.fieldPermissions;
@@ -721,7 +807,9 @@ describe('createHttpTwentyCrmClient', () => {
       ]),
     );
     expect(companyFields).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ name: 'accountOwner', unreadable: true })]),
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'accountOwner', unreadable: true }),
+      ]),
     );
     expect(opportunityFields).toEqual(
       expect.arrayContaining([
@@ -783,9 +871,10 @@ describe('createHttpTwentyCrmClient', () => {
 
     const capabilities = await client.loadCapabilities();
 
-    expect(capabilities.objects.find((object) => object.objectName === 'company')?.fieldPermissions).toBe(
-      'unavailable',
-    );
+    expect(
+      capabilities.objects.find((object) => object.objectName === 'company')
+        ?.fieldPermissions,
+    ).toBe('unavailable');
   });
 
   it('does not send a chained etag to Twenty', async () => {
@@ -883,18 +972,106 @@ describe('createHttpTwentyCrmClient', () => {
       });
     });
     const client = createClient({ apiUrl: twenty.url, style: 'rest' });
-    const notes = await client.searchNotes({ workspaceId: 'ws_demo', query: 'pilot', limit: 5 });
-    const tasks = await client.searchTasks({ workspaceId: 'ws_demo', query: 'brief', limit: 5 });
-    const activities = await client.searchActivities({ workspaceId: 'ws_demo', query: 'Acme', limit: 5 });
+    const notes = await client.searchNotes({
+      workspaceId: 'ws_demo',
+      query: 'pilot',
+      limit: 5,
+    });
+    const tasks = await client.searchTasks({
+      workspaceId: 'ws_demo',
+      query: 'brief',
+      limit: 5,
+    });
+    const activities = await client.searchActivities({
+      workspaceId: 'ws_demo',
+      query: 'Acme',
+      limit: 5,
+    });
 
-    expect(notes[0]).toMatchObject({ id: 'note_row', label: 'Call', properties: { body: 'Discussed the fictional pilot' } });
+    expect(notes[0]).toMatchObject({
+      id: 'note_row',
+      label: 'Call',
+      properties: { body: 'Discussed the fictional pilot' },
+    });
     expect(tasks[0]?.label).toBe('Follow up');
-    expect(activities[0]).toMatchObject({ objectName: 'timelineActivity', label: 'Acme Corp' });
+    expect(activities[0]).toMatchObject({
+      objectName: 'timelineActivity',
+      label: 'Acme Corp',
+    });
     expect(twenty.captured.map((entry) => entry.url)).toEqual([
       expect.stringContaining('bodyV2.markdown'),
       expect.stringContaining('/rest/tasks'),
       expect.stringContaining('linkedRecordCachedName'),
     ]);
+  });
+
+  it('scopes an open-record read and deletes only when If-Match still matches', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (
+        captured.method === 'GET' &&
+        captured.url?.includes('/rest/notes/note_row')
+      ) {
+        sendJson(response, 200, {
+          data: {
+            note: {
+              id: 'note_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              title: 'Call',
+            },
+          },
+        });
+        return;
+      }
+
+      if (
+        captured.method === 'GET' &&
+        captured.url?.startsWith('/rest/noteTargets')
+      ) {
+        sendJson(response, 200, { data: { noteTargets: [] } });
+        return;
+      }
+
+      if (captured.method === 'DELETE') {
+        sendJson(response, 200, {
+          data: { deleteNotes: [{ id: 'note_row' }] },
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        data: {
+          notes: [
+            {
+              id: 'note_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              title: 'Call',
+            },
+          ],
+        },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+    const recordId = '11111111-1111-4111-8111-111111111111';
+
+    await client.searchNotes({
+      workspaceId: 'ws_demo',
+      query: 'record',
+      limit: 5,
+      recordId,
+    });
+    await client.deleteRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'note',
+      id: 'note_row',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+
+    expect(twenty.captured[0]?.url).toContain(encodeURIComponent(recordId));
+    expect(
+      twenty.captured
+        .map((entry) => entry.url)
+        .some((url) => url?.includes('updatedAt')),
+    ).toBe(true);
   });
 });
 
@@ -946,7 +1123,11 @@ async function startFakeTwenty(
   };
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  response: ServerResponse,
+  status: number,
+  body: unknown,
+): void {
   response.writeHead(status, { 'content-type': 'application/json' });
   response.end(JSON.stringify(body));
 }

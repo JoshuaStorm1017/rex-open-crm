@@ -70,16 +70,44 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
     objectName: CreatedRecord['objectName'],
     query: string,
     limit: number,
+    scope?: { recordId?: string; linkedCompanyId?: string },
   ): CreatedRecord[] => {
     const needle = query.toLowerCase();
 
     return created
       .filter((record) => {
-        if (!visible(record) || record.workspaceId !== workspaceId || record.objectName !== objectName) {
+        if (
+          !visible(record) ||
+          record.workspaceId !== workspaceId ||
+          record.objectName !== objectName
+        ) {
           return false;
         }
 
-        const haystack = [record.label, ...Object.values(record.properties).map(String)].join(' ').toLowerCase();
+        if (
+          scope?.linkedCompanyId &&
+          record.properties.companyId !== scope.linkedCompanyId
+        ) {
+          return false;
+        }
+
+        if (scope?.recordId) {
+          return (
+            record.properties.targetId === scope.recordId ||
+            record.properties.linkedRecordId === scope.recordId
+          );
+        }
+
+        if (scope?.linkedCompanyId) {
+          return true;
+        }
+
+        const haystack = [
+          record.label,
+          ...Object.values(record.properties).map(String),
+        ]
+          .join(' ')
+          .toLowerCase();
 
         return haystack.includes(needle);
       })
@@ -90,10 +118,20 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
   return {
     created,
     async createPerson(input) {
-      return remember('person', input.workspaceId, personProperties(input), 'person');
+      return remember(
+        'person',
+        input.workspaceId,
+        personProperties(input),
+        'person',
+      );
     },
     async createCompany(input) {
-      return remember('company', input.workspaceId, companyProperties(input), 'company');
+      return remember(
+        'company',
+        input.workspaceId,
+        companyProperties(input),
+        'company',
+      );
     },
     async createOpportunity(input) {
       return remember(
@@ -123,16 +161,42 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       return note;
     },
     async searchRecords(input) {
-      return searchStored(input.workspaceId, input.objectName, input.query, input.limit);
+      return searchStored(
+        input.workspaceId,
+        input.objectName,
+        input.query,
+        input.limit,
+        input.linkedCompanyId
+          ? { linkedCompanyId: input.linkedCompanyId }
+          : undefined,
+      );
     },
     async searchNotes(input) {
-      return searchStored(input.workspaceId, 'note', input.query, input.limit);
+      return searchStored(
+        input.workspaceId,
+        'note',
+        input.query,
+        input.limit,
+        input.recordId ? { recordId: input.recordId } : undefined,
+      );
     },
     async searchTasks(input) {
-      return searchStored(input.workspaceId, 'task', input.query, input.limit);
+      return searchStored(
+        input.workspaceId,
+        'task',
+        input.query,
+        input.limit,
+        input.recordId ? { recordId: input.recordId } : undefined,
+      );
     },
     async searchActivities(input) {
-      return searchStored(input.workspaceId, 'timelineActivity', input.query, input.limit);
+      return searchStored(
+        input.workspaceId,
+        'timelineActivity',
+        input.query,
+        input.limit,
+        input.recordId ? { recordId: input.recordId } : undefined,
+      );
     },
     async listRecent(input) {
       return created
@@ -162,7 +226,9 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       return cloneRecord(record);
     },
     async getRecord(input) {
-      return cloneRecord(findStored(input.workspaceId, input.objectName, input.id));
+      return cloneRecord(
+        findStored(input.workspaceId, input.objectName, input.id),
+      );
     },
     async updateRecord(input) {
       const record = findStored(input.workspaceId, input.objectName, input.id);
@@ -208,11 +274,22 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
     },
     async restoreRecord(input) {
       const record = created.find(
-        (candidate) => candidate.workspaceId === input.workspaceId && candidate.id === input.id,
+        (candidate) =>
+          candidate.workspaceId === input.workspaceId &&
+          candidate.id === input.id,
       );
 
       if (!record || !archived.has(record.id)) {
-        throw new CrmNotFoundError(`No ${input.objectName} found with id ${input.id}.`);
+        throw new CrmNotFoundError(
+          `No ${input.objectName} found with id ${input.id}.`,
+        );
+      }
+
+      if (input.ifMatch && record.etag !== input.ifMatch) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${record.etag}. Nothing was restored.`,
+          record.etag,
+        );
       }
 
       archived.delete(record.id);
@@ -220,11 +297,23 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
     },
     async deleteRecord(input) {
       const index = created.findIndex(
-        (record) => record.workspaceId === input.workspaceId && record.id === input.id,
+        (record) =>
+          record.workspaceId === input.workspaceId && record.id === input.id,
       );
 
       if (index < 0) {
-        throw new CrmNotFoundError(`No ${input.objectName} found with id ${input.id}.`);
+        throw new CrmNotFoundError(
+          `No ${input.objectName} found with id ${input.id}.`,
+        );
+      }
+
+      const current = created[index];
+
+      if (current && input.ifMatch && current.etag !== input.ifMatch) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}. Nothing was deleted.`,
+          current.etag,
+        );
       }
 
       const [removed] = created.splice(index, 1);

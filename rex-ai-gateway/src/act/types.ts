@@ -38,6 +38,35 @@ export type RefusalReason =
   | 'idempotency_conflict'
   | 'confirmation_required';
 
+export type ProposalChange = {
+  objectName: 'person' | 'company' | 'opportunity';
+  recordId: string;
+  label: string;
+  field?: string;
+  metadataField?: string;
+  current: string | number | null;
+  proposed: string | number | null;
+  ifMatch: string;
+  summary: string;
+};
+
+export type ProposalWarning = {
+  code: 'duplicate_email' | 'amount_mismatch';
+  message: string;
+};
+
+export type PlanAnswerRecord = {
+  id: string;
+  objectName: string;
+  label: string;
+  detail?: string;
+};
+
+export type PlanAnswer = {
+  summary: string;
+  records: PlanAnswerRecord[];
+};
+
 export type ActRefusal = {
   ok: false;
   refused: true;
@@ -45,6 +74,7 @@ export type ActRefusal = {
   message: string;
   toolName?: string;
   missingFields?: string[];
+  stale?: ProposalChange[];
 };
 
 export type ActUpstreamFailure = {
@@ -63,13 +93,21 @@ export type ActPartialFailure = {
 };
 
 export type CreatedToolResult = {
-  tool: 'create_person' | 'create_company' | 'create_opportunity' | 'create_note';
+  tool:
+    | 'create_person'
+    | 'create_company'
+    | 'create_opportunity'
+    | 'create_note';
   status: 'created';
   record: CreatedRecord;
 };
 
 export type SearchToolResult = {
-  tool: 'search_records' | 'search_notes' | 'search_tasks' | 'search_activities';
+  tool:
+    | 'search_records'
+    | 'search_notes'
+    | 'search_tasks'
+    | 'search_activities';
   status: 'found';
   records: CreatedRecord[];
 };
@@ -86,7 +124,11 @@ export type ArchivedToolResult = {
   record: CreatedRecord;
 };
 
-export type ToolResult = CreatedToolResult | SearchToolResult | UpdatedToolResult | ArchivedToolResult;
+export type ToolResult =
+  | CreatedToolResult
+  | SearchToolResult
+  | UpdatedToolResult
+  | ArchivedToolResult;
 
 export type ActEffect =
   | {
@@ -127,7 +169,11 @@ export type ActSuccess = {
   summary?: string;
 };
 
-export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure | ActPartialFailure;
+export type ActResult =
+  | ActSuccess
+  | ActRefusal
+  | ActUpstreamFailure
+  | ActPartialFailure;
 
 export type ProposalLine = {
   tool: AllowedToolName;
@@ -160,12 +206,16 @@ export type PlanProposal = {
   tools: ToolCall[];
   lines: ProposalLine[];
   choice?: PlanChoice;
+  changes?: ProposalChange[];
+  warnings?: ProposalWarning[];
 };
 
 export type PlanSuccess = {
   ok: true;
   workspaceId: string;
-  proposal: PlanProposal;
+  summary?: string;
+  proposal?: PlanProposal;
+  answer?: PlanAnswer;
 };
 
 export type PlanResult = PlanSuccess | ActRefusal | ActUpstreamFailure;
@@ -173,7 +223,11 @@ export type PlanResult = PlanSuccess | ActRefusal | ActUpstreamFailure;
 export function refusal(
   reason: RefusalReason,
   message: string,
-  extra?: { toolName?: string; missingFields?: string[] },
+  extra?: {
+    toolName?: string;
+    missingFields?: string[];
+    stale?: ProposalChange[];
+  },
 ): ActRefusal {
   return {
     ok: false,
@@ -182,11 +236,16 @@ export function refusal(
     message,
     ...(extra?.toolName ? { toolName: extra.toolName } : {}),
     ...(extra?.missingFields ? { missingFields: extra.missingFields } : {}),
+    ...(extra?.stale && extra.stale.length > 0 ? { stale: extra.stale } : {}),
   };
 }
 
-export function upstreamFailure(error: unknown, completedCount: number): ActUpstreamFailure {
-  const detail = error instanceof Error ? error.message : 'Twenty request failed';
+export function upstreamFailure(
+  error: unknown,
+  completedCount: number,
+): ActUpstreamFailure {
+  const detail =
+    error instanceof Error ? error.message : 'Twenty request failed';
   const message =
     completedCount > 0
       ? `Twenty request failed after ${completedCount} tool(s) succeeded. ${detail}`
