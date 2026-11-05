@@ -6,7 +6,11 @@ export const ALLOWED_TOOL_NAMES = [
   'create_opportunity',
   'create_note',
   'search_records',
+  'search_notes',
+  'search_tasks',
+  'search_activities',
   'update_record',
+  'update_matching_records',
   'archive_record',
 ] as const;
 
@@ -65,7 +69,7 @@ export type CreatedToolResult = {
 };
 
 export type SearchToolResult = {
-  tool: 'search_records';
+  tool: 'search_records' | 'search_notes' | 'search_tasks' | 'search_activities';
   status: 'found';
   records: CreatedRecord[];
 };

@@ -10,6 +10,12 @@ export type LlmProposal = {
 
 export type LlmPlan = LlmProposal | ActRefusal;
 
+export type PartialToolCall = {
+  name: string;
+  args: Record<string, unknown>;
+  complete: boolean;
+};
+
 export type LlmPlanInput = {
   intent: string;
   workspaceId: string;
@@ -29,4 +35,5 @@ export type LlmPlanInput = {
 
 export type LlmProvider = {
   plan: (input: LlmPlanInput) => Promise<LlmPlan>;
+  planStream?: (input: LlmPlanInput, emit: (tools: PartialToolCall[]) => void) => Promise<LlmPlan>;
 };

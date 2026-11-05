@@ -9,6 +9,7 @@ import {
   proposeAiCommand,
   undoAiCommand,
   type AiProposal,
+  type AiProposalLine,
   type AiRecordLink,
   type AiUndo,
 } from '@/ai-command-bar/utils/aiCommandBarClient';
@@ -25,7 +26,7 @@ import { RootStackingContextZIndices } from '@/ui/layout/constants/RootStackingC
 
 type Phase =
   | { name: 'compose'; draft: string; notice?: string }
-  | { name: 'planning'; draft: string }
+  | { name: 'planning'; draft: string; lines: AiProposalLine[] }
   | {
       name: 'preview';
       draft: string;
@@ -202,13 +203,20 @@ export const AiCommandBar = ({
       input.dataset.generation = generation;
     }
 
-    setPhase({ name: 'planning', draft });
+    setPhase({ name: 'planning', draft, lines: [] });
 
     const outcome = await proposeAiCommand(
       resolvedConfig,
       intent,
       fetchImpl,
       openRecord,
+      (lines) => {
+        if (generation !== readGeneration()) {
+          return;
+        }
+
+        setPhase({ name: 'planning', draft, lines });
+      },
     );
 
     if (generation !== readGeneration()) {
@@ -420,7 +428,16 @@ export const AiCommandBar = ({
               <StyledNotice role="status">{phase.notice}</StyledNotice>
             )}
             {phase.name === 'planning' && (
-              <StyledNotice role="status">{t`Proposing actions…`}</StyledNotice>
+              <>
+                <StyledNotice role="status">{t`Proposing actions…`}</StyledNotice>
+                {phase.lines.length > 0 && (
+                  <StyledList>
+                    {phase.lines.map((line, index) => (
+                      <li key={`${index}-${line.tool}`}>{line.summary}</li>
+                    ))}
+                  </StyledList>
+                )}
+              </>
             )}
             {(phase.name === 'executing' || phase.name === 'undoing') && (
               <StyledNotice role="status">

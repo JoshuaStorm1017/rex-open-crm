@@ -446,7 +446,7 @@ describe('create and update gates', () => {
         ? catalog.tools.map((tool) => (isRecord(tool) ? tool.name : undefined))
         : [];
 
-    expect(names).toEqual(['search_records', 'update_record']);
+    expect(names).toEqual(['search_records', 'search_notes', 'update_record', 'update_matching_records']);
     expect(create.payload).toMatchObject({ refused: true, reason: 'forbidden', toolName: 'create_company' });
     expect(update.payload).toMatchObject({ ok: true });
     expect(client.created.filter((record) => record.properties.name === 'Other')).toHaveLength(0);

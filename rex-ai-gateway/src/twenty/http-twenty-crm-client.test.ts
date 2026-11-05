@@ -183,7 +183,23 @@ describe('createHttpTwentyCrmClient', () => {
       if (query.includes('RexAiCapabilities')) {
         sendJson(response, 200, {
           data: {
-            objects: { edges: [{ node: { id: 'obj_person', nameSingular: 'person' } }] },
+            objects: {
+              edges: [
+                {
+                  node: {
+                    id: 'obj_person',
+                    nameSingular: 'person',
+                    fieldsList: [
+                      { id: 'field_name', name: 'name' },
+                      { id: 'field_emails', name: 'emails' },
+                      { id: 'field_job', name: 'jobTitle' },
+                      { id: 'field_phones', name: 'phones' },
+                      { id: 'field_linkedin', name: 'linkedinLink' },
+                    ],
+                  },
+                },
+              ],
+            },
             currentUser: {
               currentUserWorkspace: {
                 objectPermissions: [
@@ -192,6 +208,7 @@ describe('createHttpTwentyCrmClient', () => {
                     canReadObjectRecords: true,
                     canUpdateObjectRecords: true,
                     canSoftDeleteObjectRecords: true,
+                    restrictedFields: {},
                   },
                 ],
               },
@@ -623,6 +640,8 @@ describe('createHttpTwentyCrmClient', () => {
                     { id: 'field_amount', name: 'amount' },
                     { id: 'field_close', name: 'closeDate' },
                     { id: 'field_opp_owner', name: 'owner' },
+                    { id: 'field_opp_company', name: 'company' },
+                    { id: 'field_poc', name: 'pointOfContact' },
                   ],
                 },
               },
@@ -636,6 +655,7 @@ describe('createHttpTwentyCrmClient', () => {
                     { id: 'field_job', name: 'jobTitle' },
                     { id: 'field_phones', name: 'phones' },
                     { id: 'field_person_linkedin', name: 'linkedinLink' },
+                    { id: 'field_company', name: 'company' },
                   ],
                 },
               },
@@ -669,6 +689,7 @@ describe('createHttpTwentyCrmClient', () => {
                   canSoftDeleteObjectRecords: true,
                   restrictedFields: {
                     field_emails: { canRead: false, canUpdate: false },
+                    field_company: { canRead: true, canUpdate: false },
                   },
                 },
               ],
@@ -703,9 +724,18 @@ describe('createHttpTwentyCrmClient', () => {
       expect.arrayContaining([expect.objectContaining({ name: 'accountOwner', unreadable: true })]),
     );
     expect(opportunityFields).toEqual(
-      expect.arrayContaining([{ name: 'owner', canUpdate: false }]),
+      expect.arrayContaining([
+        { name: 'owner', canUpdate: false },
+        { name: 'companyId', canUpdate: true },
+        { name: 'pointOfContactId', canUpdate: true },
+      ]),
     );
-    expect(personFields).toEqual(expect.arrayContaining([{ name: 'email', canUpdate: false }]));
+    expect(personFields).toEqual(
+      expect.arrayContaining([
+        { name: 'email', canUpdate: false },
+        { name: 'companyId', canUpdate: false },
+      ]),
+    );
     expect(personFields).toEqual(
       expect.arrayContaining([{ name: 'jobTitle', canUpdate: true }]),
     );
@@ -756,6 +786,115 @@ describe('createHttpTwentyCrmClient', () => {
     expect(capabilities.objects.find((object) => object.objectName === 'company')?.fieldPermissions).toBe(
       'unavailable',
     );
+  });
+
+  it('does not send a chained etag to Twenty', async () => {
+    const twenty = await startFakeTwenty((_captured, response) => {
+      sendJson(response, 500, { data: {} });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'city',
+        value: 'Lisbon',
+        ifMatch: 'chained',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.archiveRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        ifMatch: 'chained',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'city',
+        value: 'Lisbon',
+        ifMatch: 'created',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    await expect(
+      client.clearRecordField({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'city',
+        ifMatch: 'created',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    expect(twenty.captured).toHaveLength(0);
+  });
+
+  it('searches note bodies, task bodies, and activity names with Twenty filters', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      const url = captured.url ?? '';
+
+      if (url.startsWith('/rest/notes')) {
+        sendJson(response, 200, {
+          data: {
+            notes: [
+              {
+                id: 'note_row',
+                title: 'Call',
+                updatedAt: '2026-01-01T00:00:00.000Z',
+                bodyV2: { markdown: 'Discussed the fictional pilot' },
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (url.startsWith('/rest/tasks')) {
+        sendJson(response, 200, {
+          data: {
+            tasks: [
+              {
+                id: 'task_row',
+                title: 'Follow up',
+                updatedAt: '2026-01-01T00:00:00.000Z',
+                bodyV2: { markdown: 'Send the brief' },
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        data: {
+          timelineActivities: [
+            {
+              id: 'activity_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              linkedRecordCachedName: 'Acme Corp',
+            },
+          ],
+        },
+      });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+    const notes = await client.searchNotes({ workspaceId: 'ws_demo', query: 'pilot', limit: 5 });
+    const tasks = await client.searchTasks({ workspaceId: 'ws_demo', query: 'brief', limit: 5 });
+    const activities = await client.searchActivities({ workspaceId: 'ws_demo', query: 'Acme', limit: 5 });
+
+    expect(notes[0]).toMatchObject({ id: 'note_row', label: 'Call', properties: { body: 'Discussed the fictional pilot' } });
+    expect(tasks[0]?.label).toBe('Follow up');
+    expect(activities[0]).toMatchObject({ objectName: 'timelineActivity', label: 'Acme Corp' });
+    expect(twenty.captured.map((entry) => entry.url)).toEqual([
+      expect.stringContaining('bodyV2.markdown'),
+      expect.stringContaining('/rest/tasks'),
+      expect.stringContaining('linkedRecordCachedName'),
+    ]);
   });
 });
 

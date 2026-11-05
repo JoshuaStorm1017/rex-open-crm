@@ -1,10 +1,13 @@
 import type { CreatedRecord } from '../twenty/twenty-crm-client';
+import { isAllowedToolName } from './allowlist';
 import type { ProposalLine } from './types';
-import type { ValidatedTool } from './validate-tool';
+import { validateTool, type ValidatedTool } from './validate-tool';
+import type { PartialToolCall } from '../llm/llm-provider';
 
 export function describeTool(
   tool: ValidatedTool,
   current?: CreatedRecord,
+  options?: { disambiguate?: boolean },
 ): ProposalLine {
   switch (tool.name) {
     case 'create_person':
@@ -42,23 +45,66 @@ export function describeTool(
         tool: tool.name,
         summary: `Search ${plural(tool.input.objectName)} for “${tool.input.query}”.`,
       };
+    case 'search_notes':
+      return {
+        tool: tool.name,
+        summary: `Search note titles and bodies for “${tool.input.query}”.`,
+      };
+    case 'search_tasks':
+      return {
+        tool: tool.name,
+        summary: `Search task titles and bodies for “${tool.input.query}”.`,
+      };
+    case 'search_activities':
+      return {
+        tool: tool.name,
+        summary: `Search activities linked to “${tool.input.query}”.`,
+      };
     case 'archive_record':
       return {
         tool: tool.name,
         summary: `Archive ${tool.input.objectName} ${current?.label ?? tool.input.id ?? tool.input.query ?? 'record'}. If-Match ${etagLabel(tool.input.ifMatch)}.`,
+      };
+    case 'update_matching_records':
+      return {
+        tool: tool.name,
+        summary: `Set ${tool.input.field} to ${formatValue(tool.input.value)} on every ${tool.input.objectName} matching “${tool.input.query ?? ''}”.`,
       };
     case 'update_record': {
       const previous = current?.properties[tool.input.field];
       const from =
         previous === undefined ? '' : ` from ${formatValue(previous)}`;
       const label = current?.label ?? tool.input.id ?? tool.input.query ?? 'record';
+      const identity = options?.disambiguate && current ? ` (${current.id})` : '';
 
       return {
         tool: tool.name,
-        summary: `Set ${tool.input.objectName} ${label} ${tool.input.field}${from} to ${formatValue(tool.input.value)}. If-Match ${etagLabel(tool.input.ifMatch)}.`,
+        summary: `Set ${tool.input.objectName} ${label}${identity} ${tool.input.field}${from} to ${formatValue(tool.input.value)}. If-Match ${etagLabel(tool.input.ifMatch)}.`,
       };
     }
   }
+}
+
+export function describePartialTools(tools: PartialToolCall[], workspaceId: string): ProposalLine[] {
+  return tools.flatMap((tool) => {
+    const name = isAllowedToolName(tool.name) ? tool.name : undefined;
+
+    if (!name) {
+      return [{ tool: 'search_records' as const, summary: 'Planning the next action…' }];
+    }
+
+    if (!tool.complete) {
+      return [{ tool: name, summary: `Planning ${name}…` }];
+    }
+
+    const validated = validateTool({ name, args: tool.args }, workspaceId);
+
+    if ('refused' in validated) {
+      return [{ tool: name, summary: `Planning ${name}…` }];
+    }
+
+    return [describeTool(validated)];
+  });
 }
 
 export function summarizeLines(lines: ProposalLine[]): string {

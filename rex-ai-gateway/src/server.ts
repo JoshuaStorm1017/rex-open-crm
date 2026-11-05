@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 import { compensate, partialFailure } from './act/compensate';
+import { describePartialTools } from './act/describe-tool';
 import { executeAct, type ExecuteActOptions } from './act/execute-act';
 import { parseGatewayRequest } from './act/parse-request';
 import { assertCanUndo, catalogForAudience, loadAudience } from './act/permissions';
@@ -249,6 +250,11 @@ async function handleAuthenticated(
   const confirmed = isRecord(parsed) && parsed.confirmed === true;
 
   if (url.pathname === PLAN_PATH) {
+    if (wantsEventStream(request)) {
+      await streamPlan(parsed, response, runtime, principal, cors);
+      return;
+    }
+
     const result = await proposeAct(parsed, runtime.client, runtime.llm, {
       boundWorkspaceId: runtime.boundWorkspaceId,
       proposals: runtime.proposals,
@@ -466,13 +472,45 @@ async function executeConfirmedUndo(
     return permission;
   }
 
+  if (runtime.undos.superseded(principal.memberId)) {
+    runtime.undos.release(principal.memberId);
+    return refusal(
+      'precondition_failed',
+      'A newer change landed before this undo wrote anything. Nothing was reversed. Undo the newest change first.',
+    );
+  }
+
   let failures;
 
   try {
-    failures = await compensate(runtime.client, parsed.workspaceId, begun.ticket.effects);
+    failures = await compensate(
+      runtime.client,
+      parsed.workspaceId,
+      begun.ticket.effects,
+      () => !runtime.undos.superseded(principal.memberId),
+    );
   } catch (error) {
     runtime.undos.release(principal.memberId);
     return upstreamFailure(error, 0);
+  }
+
+  if (failures.some((failure) => failure.reason === 'superseded')) {
+    const failedIndexes = new Set(failures.map((failure) => failure.index));
+    const remaining = begun.ticket.effects.filter((_effect, index) => failedIndexes.has(index));
+    const nothingReversed = remaining.length === begun.ticket.effects.length;
+
+    if (!nothingReversed) {
+      runtime.undos.retain(parsed.undoId, principal.memberId, parsed.workspaceId, remaining);
+    }
+
+    runtime.undos.release(principal.memberId);
+
+    return refusal(
+      'precondition_failed',
+      nothingReversed
+        ? 'A newer change landed before this undo wrote anything. Nothing was reversed. Undo the newest change first.'
+        : 'A newer change landed while undo was running. Completed reversals stand. What is left stays available after the newest change is undone.',
+    );
   }
 
   if (failures.length > 0) {
@@ -514,6 +552,53 @@ async function executeConfirmedUndo(
     ...(reversesAuditId ? { reversesAuditId } : {}),
     ...(undos[0] ? { undo: undos[0], undos } : {}),
   };
+}
+
+async function streamPlan(
+  parsed: unknown,
+  response: ServerResponse,
+  runtime: GatewayRuntime,
+  principal: MemberPrincipal,
+  cors: Record<string, string>,
+): Promise<void> {
+  response.writeHead(200, {
+    ...cors,
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+
+  const workspaceId = isRecord(parsed) && typeof parsed.workspaceId === 'string' ? parsed.workspaceId : 'ws_demo';
+
+  const result = await proposeAct(parsed, runtime.client, runtime.llm, {
+    boundWorkspaceId: runtime.boundWorkspaceId,
+    proposals: runtime.proposals,
+    memberId: principal.memberId,
+    actorMemberId: principal.memberId,
+    onPartial: (tools) => {
+      writeEvent(response, 'partial', {
+        partial: true,
+        lines: describePartialTools(tools, workspaceId),
+      });
+    },
+  });
+  rememberOutcome(runtime, principal, PLAN_PATH, false, result);
+
+  if (result.ok) {
+    writeEvent(response, 'proposal', result);
+  } else {
+    writeEvent(response, 'error', result);
+  }
+
+  response.end();
+}
+
+function wantsEventStream(request: IncomingMessage): boolean {
+  return (headerValue(request.headers.accept) ?? '').includes('text/event-stream');
+}
+
+function writeEvent(response: ServerResponse, event: string, data: unknown): void {
+  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function publicUndos(

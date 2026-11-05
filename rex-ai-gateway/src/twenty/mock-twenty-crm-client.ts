@@ -65,6 +65,28 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
 
   const visible = (record: CreatedRecord): boolean => !archived.has(record.id);
 
+  const searchStored = (
+    workspaceId: string,
+    objectName: CreatedRecord['objectName'],
+    query: string,
+    limit: number,
+  ): CreatedRecord[] => {
+    const needle = query.toLowerCase();
+
+    return created
+      .filter((record) => {
+        if (!visible(record) || record.workspaceId !== workspaceId || record.objectName !== objectName) {
+          return false;
+        }
+
+        const haystack = [record.label, ...Object.values(record.properties).map(String)].join(' ').toLowerCase();
+
+        return haystack.includes(needle);
+      })
+      .slice(0, limit)
+      .map(cloneRecord);
+  };
+
   return {
     created,
     async createPerson(input) {
@@ -101,26 +123,16 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
       return note;
     },
     async searchRecords(input) {
-      const needle = input.query.toLowerCase();
-
-      return created
-        .filter((record) => {
-          if (
-            !visible(record) ||
-            record.workspaceId !== input.workspaceId ||
-            record.objectName !== input.objectName
-          ) {
-            return false;
-          }
-
-          const haystack = [record.label, ...Object.values(record.properties).map(String)]
-            .join(' ')
-            .toLowerCase();
-
-          return haystack.includes(needle);
-        })
-        .slice(0, input.limit)
-        .map(cloneRecord);
+      return searchStored(input.workspaceId, input.objectName, input.query, input.limit);
+    },
+    async searchNotes(input) {
+      return searchStored(input.workspaceId, 'note', input.query, input.limit);
+    },
+    async searchTasks(input) {
+      return searchStored(input.workspaceId, 'task', input.query, input.limit);
+    },
+    async searchActivities(input) {
+      return searchStored(input.workspaceId, 'timelineActivity', input.query, input.limit);
     },
     async listRecent(input) {
       return created

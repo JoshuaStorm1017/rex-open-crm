@@ -42,6 +42,8 @@ export function summarizeUndo(effects: ActEffect[]): string {
 export class UndoStore {
   private readonly stacks = new Map<string, UndoTicket[]>();
   private readonly running = new Map<string, string>();
+  private readonly generation = new Map<string, number>();
+  private readonly begunGeneration = new Map<string, number>();
   private stamp = 0;
 
   save(memberId: string, workspaceId: string, effects: ActEffect[]): UndoTicket | undefined {
@@ -51,6 +53,7 @@ export class UndoStore {
       return undefined;
     }
 
+    this.noteSaved(memberId);
     const stack = this.stacks.get(memberId) ?? [];
     stack.unshift(ticket);
     this.stacks.set(memberId, stack.slice(0, UNDO_STACK_LIMIT));
@@ -83,14 +86,26 @@ export class UndoStore {
 
     if (result.ok) {
       this.running.set(memberId, id);
+      this.begunGeneration.set(memberId, this.generation.get(memberId) ?? 0);
     }
 
     return result;
   }
 
+  superseded(memberId: string): boolean {
+    const begun = this.begunGeneration.get(memberId);
+
+    if (begun === undefined) {
+      return false;
+    }
+
+    return begun !== (this.generation.get(memberId) ?? 0);
+  }
+
   finish(memberId: string): void {
     const id = this.running.get(memberId);
     this.running.delete(memberId);
+    this.begunGeneration.delete(memberId);
 
     if (!id) {
       return;
@@ -105,6 +120,7 @@ export class UndoStore {
 
   release(memberId: string): void {
     this.running.delete(memberId);
+    this.begunGeneration.delete(memberId);
   }
 
   retain(id: string, memberId: string, workspaceId: string, effects: ActEffect[]): boolean {
@@ -125,6 +141,7 @@ export class UndoStore {
 
     if (result.ok) {
       this.running.delete(memberId);
+      this.begunGeneration.delete(memberId);
       const stack = this.stacks.get(memberId) ?? [];
       this.stacks.set(
         memberId,
@@ -159,6 +176,10 @@ export class UndoStore {
 
   protected runningUndoId(memberId: string): string | undefined {
     return this.running.get(memberId);
+  }
+
+  protected noteSaved(memberId: string): void {
+    this.generation.set(memberId, (this.generation.get(memberId) ?? 0) + 1);
   }
 
   private read(id: string, memberId: string, workspaceId: string): TakeUndoResult {

@@ -268,6 +268,7 @@ class SqliteUndoStore extends UndoStore {
          )`,
       )
       .run(memberId, memberId, UNDO_STACK_LIMIT);
+    this.noteSaved(memberId);
     this.restrict();
 
     return ticket;

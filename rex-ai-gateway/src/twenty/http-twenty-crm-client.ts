@@ -13,8 +13,10 @@ import {
   conditionalUpdateFilter,
   deleteManyName,
   graphqlSearchFilter,
+  graphqlTimelineSearchFilter,
   RECORD_GRAPHQL_FIELDS,
   restSearchFilter,
+  restTimelineSearchFilter,
   toClearPayload,
   toCompanyPayload,
   toOpportunityPayload,
@@ -22,8 +24,8 @@ import {
   toUpdatePayload,
   updateManyName,
 } from './map-to-twenty-payload';
-import { FIELD_METADATA_NAMES } from './field-permission-names';
-import { crmRecordFromTwenty, labelFromProperties, projectField, readEtag } from './record-fields';
+import { CREATE_RELATION_FIELD_NAMES, FIELD_METADATA_NAMES } from './field-permission-names';
+import { activityRecordFromTwenty, crmRecordFromTwenty, labelFromProperties, projectField, readEtag } from './record-fields';
 import { UPDATABLE_FIELDS, isUpdatableObjectName } from '../act/writable-fields';
 import {
   type CreateCompanyInput,
@@ -38,6 +40,8 @@ import {
   type ListRecentInput,
   type NoteLookupInput,
   type SearchRecordsInput,
+  type SearchTimelineInput,
+  type TimelineObjectName,
   type TwentyCrmClient,
   type TwentyObjectName,
   type ClearRecordFieldInput,
@@ -367,6 +371,34 @@ export function createHttpTwentyCrmClient(
     }
   };
 
+  const searchTimeline = async (
+    objectName: TimelineObjectName,
+    input: SearchTimelineInput,
+  ): Promise<CreatedRecord[]> => {
+    const target = TIMELINE_SEARCH[objectName];
+    const result =
+      style === 'rest'
+        ? await requestJson(
+            `${target.restPath}?filter=${encodeURIComponent(restTimelineSearchFilter(target.kind, input.query))}&limit=${input.limit}`,
+            { method: 'GET' },
+          )
+        : await requestJson('/graphql', {
+            method: 'POST',
+            body: {
+              query: `query Search($filter: ${target.filterType}, $first: Int) { ${target.plural}(filter: $filter, first: $first) { edges { node { ${target.fields} } } } }`,
+              variables: {
+                filter: graphqlTimelineSearchFilter(target.kind, input.query),
+                first: input.limit,
+              },
+            },
+          });
+
+    return readList(result.body, target.plural)
+      .map((item) => activityRecordFromTwenty(objectName, input.workspaceId, item))
+      .filter((record): record is CreatedRecord => record !== undefined)
+      .slice(0, input.limit);
+  };
+
   return {
     createPerson: (input: CreatePersonInput) =>
       create('person', toPersonPayload(input), personProperties(input), input.workspaceId),
@@ -409,7 +441,11 @@ export function createHttpTwentyCrmClient(
         .slice(0, input.limit);
     },
     getRecord: (input: GetRecordInput) => loadRecord(input),
+    searchNotes: (input) => searchTimeline('note', input),
+    searchTasks: (input) => searchTimeline('task', input),
+    searchActivities: (input) => searchTimeline('timelineActivity', input),
     async updateRecord(input: UpdateRecordInput) {
+      rejectEtagSentinel(input.ifMatch, input.objectName);
       const current = await loadRecord(input);
       const nextProperties = projectField(current.properties, input.field, input.value);
 
@@ -427,6 +463,7 @@ export function createHttpTwentyCrmClient(
       );
     },
     async clearRecordField(input: ClearRecordFieldInput) {
+      rejectEtagSentinel(input.ifMatch, input.objectName);
       const current = await loadRecord(input);
       const nextProperties = projectField(current.properties, input.field, null);
 
@@ -587,6 +624,7 @@ export function createHttpTwentyCrmClient(
       };
     },
     async archiveRecord(input: ArchiveRecordInput) {
+      rejectEtagSentinel(input.ifMatch, input.objectName);
       const current = await loadRecord(input);
 
       if (current.etag !== input.ifMatch) {
@@ -748,7 +786,45 @@ const CAPABILITY_NAMES = new Set<ObjectCapabilityName>([
   'company',
   'opportunity',
   'note',
+  'task',
+  'timelineActivity',
 ]);
+
+const TIMELINE_SEARCH = {
+  note: {
+    restPath: '/rest/notes',
+    plural: 'notes',
+    filterType: 'NoteFilterInput',
+    fields: 'id updatedAt title bodyV2 { markdown }',
+    kind: 'note',
+  },
+  task: {
+    restPath: '/rest/tasks',
+    plural: 'tasks',
+    filterType: 'TaskFilterInput',
+    fields: 'id updatedAt title bodyV2 { markdown }',
+    kind: 'task',
+  },
+  timelineActivity: {
+    restPath: '/rest/timelineActivities',
+    plural: 'timelineActivities',
+    filterType: 'TimelineActivityFilterInput',
+    fields: 'id updatedAt linkedRecordCachedName',
+    kind: 'activity',
+  },
+} as const satisfies Record<
+  TimelineObjectName,
+  { restPath: string; plural: string; filterType: string; fields: string; kind: 'note' | 'task' | 'activity' }
+>;
+
+function rejectEtagSentinel(ifMatch: string, objectName: string): void {
+  if (ifMatch === 'chained' || ifMatch === 'created') {
+    throw new CrmPreconditionError(
+      `If-Match ${ifMatch} is not a live ${objectName} etag. Refresh it from the previous write before calling Twenty.`,
+      ifMatch,
+    );
+  }
+}
 
 function readCapabilities(body: unknown): MemberCapabilities {
   if (!isRecord(body) || !isRecord(body.data)) {
@@ -851,7 +927,7 @@ function fieldPermissionsFor(
 
   const fields: FieldCapability[] = [];
 
-  for (const fieldName of UPDATABLE_FIELDS[objectName]) {
+  for (const fieldName of [...UPDATABLE_FIELDS[objectName], ...CREATE_RELATION_FIELD_NAMES[objectName]]) {
     const metadataNames = FIELD_METADATA_NAMES[objectName][fieldName] ?? [fieldName];
     let canUpdate = true;
     let unreadable = false;
