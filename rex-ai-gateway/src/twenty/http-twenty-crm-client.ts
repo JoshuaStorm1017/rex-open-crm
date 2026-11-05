@@ -17,10 +17,12 @@ import {
   conditionalUpdateFilter,
   deleteManyName,
   restoreManyName,
+  graphqlDomainHostFilter,
   graphqlSearchFilter,
   graphqlTimelineRecordFilter,
   graphqlTimelineSearchFilter,
   RECORD_GRAPHQL_FIELDS,
+  restDomainHostFilter,
   restSearchFilter,
   restTimelineRecordFilter,
   restTimelineSearchFilter,
@@ -662,10 +664,14 @@ export function createHttpTwentyCrmClient(
       const target = TWENTY_OBJECT_PATH[input.objectName];
       const restFilter = input.linkedCompanyId
         ? companyIdEqualsFilter(input.linkedCompanyId)
-        : restSearchFilter(input.objectName, input.query);
+        : input.domainHost && input.objectName === 'company'
+          ? restDomainHostFilter(input.domainHost)
+          : restSearchFilter(input.objectName, input.query);
       const graphqlFilter = input.linkedCompanyId
         ? { companyId: { eq: input.linkedCompanyId } }
-        : graphqlSearchFilter(input.objectName, input.query);
+        : input.domainHost && input.objectName === 'company'
+          ? graphqlDomainHostFilter(input.domainHost)
+          : graphqlSearchFilter(input.objectName, input.query);
       const result =
         style === 'rest'
           ? await requestJson(

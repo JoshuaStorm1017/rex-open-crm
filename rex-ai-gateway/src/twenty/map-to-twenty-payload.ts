@@ -1,5 +1,5 @@
 import { parsePhone } from './parse-phone';
-import { quoteFilterValue } from './safe-search';
+import { assertSafeSearchQuery, quoteFilterValue } from './safe-search';
 import type {
   AddressFields,
   CreateCompanyInput,
@@ -197,6 +197,43 @@ export function conditionalUpdateFilter(id: string, etag: string): string {
   }
 
   return `and(id[eq]:"${id}",updatedAt[eq]:"${etag}")`;
+}
+
+export function domainHostKey(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/.*$/, '');
+}
+
+const DOMAIN_HOST_PREFIXES = [
+  'https://',
+  'http://',
+  'https://www.',
+  'http://www.',
+  '',
+] as const;
+
+export function restDomainHostFilter(host: string): string {
+  assertSafeSearchQuery(host);
+  const clauses = DOMAIN_HOST_PREFIXES.map(
+    (prefix) =>
+      `domainName.primaryLinkUrl[eq]:${JSON.stringify(prefix + host)}`,
+  );
+
+  return `or(${clauses.join(',')})`;
+}
+
+export function graphqlDomainHostFilter(host: string): Record<string, unknown> {
+  assertSafeSearchQuery(host);
+
+  return {
+    or: DOMAIN_HOST_PREFIXES.map((prefix) => ({
+      domainName: { primaryLinkUrl: { eq: prefix + host } },
+    })),
+  };
 }
 
 export function companyIdEqualsFilter(companyId: string): string {

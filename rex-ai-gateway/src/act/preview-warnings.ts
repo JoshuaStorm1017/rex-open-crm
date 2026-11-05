@@ -2,6 +2,8 @@ import type {
   CreatedRecord,
   TwentyCrmClient,
 } from '../twenty/twenty-crm-client';
+import { domainHostKey } from '../twenty/map-to-twenty-payload';
+import { isSafeSearchQuery } from '../twenty/safe-search';
 import type { ProposalWarning } from './types';
 import type { ValidatedTool } from './validate-tool';
 
@@ -41,16 +43,23 @@ async function duplicateDomainWarnings(
       continue;
     }
 
-    const key = domainKey(target.domain);
+    const key = domainHostKey(target.domain);
 
     if (seen.has(key)) {
       continue;
     }
 
+    // A host the filter cannot quote must not abort the preview.
+    if (!isSafeSearchQuery(key)) {
+      continue;
+    }
+
+    // The name search cannot see a domain that is not in the company name.
     const matches = await client.searchRecords({
       workspaceId,
       objectName: 'company',
       query: key,
+      domainHost: key,
       limit: 10,
     });
     const duplicate = matches.find((record) => {
@@ -62,8 +71,8 @@ async function duplicateDomainWarnings(
       const website = record.properties.website;
 
       return (
-        (typeof domain === 'string' && domainKey(domain) === key) ||
-        (typeof website === 'string' && domainKey(website) === key)
+        (typeof domain === 'string' && domainHostKey(domain) === key) ||
+        (typeof website === 'string' && domainHostKey(website) === key)
       );
     });
 
@@ -100,15 +109,6 @@ function domainTarget(
   }
 
   return undefined;
-}
-
-function domainKey(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/^www\./, '')
-    .replace(/\/.*$/, '');
 }
 
 async function duplicateEmailWarnings(

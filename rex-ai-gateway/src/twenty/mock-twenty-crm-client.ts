@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { CrmNotFoundError, CrmPreconditionError } from './crm-errors';
+import { domainHostKey } from './map-to-twenty-payload';
 import {
   applyField,
   cloneRecord,
@@ -70,7 +71,11 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
     objectName: CreatedRecord['objectName'],
     query: string,
     limit: number,
-    scope?: { recordId?: string; linkedCompanyId?: string },
+    scope?: {
+      recordId?: string;
+      linkedCompanyId?: string;
+      domainHost?: string;
+    },
   ): CreatedRecord[] => {
     const needle = query.toLowerCase();
 
@@ -95,6 +100,18 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
           return (
             record.properties.targetId === scope.recordId ||
             record.properties.linkedRecordId === scope.recordId
+          );
+        }
+
+        if (scope?.domainHost) {
+          const domain = record.properties.domain;
+          const website = record.properties.website;
+
+          return (
+            (typeof domain === 'string' &&
+              domainHostKey(domain) === scope.domainHost) ||
+            (typeof website === 'string' &&
+              domainHostKey(website) === scope.domainHost)
           );
         }
 
@@ -166,9 +183,14 @@ export function createMockTwentyCrmClient(): MockTwentyCrmClient {
         input.objectName,
         input.query,
         input.limit,
-        input.linkedCompanyId
-          ? { linkedCompanyId: input.linkedCompanyId }
-          : undefined,
+        {
+          ...(input.linkedCompanyId
+            ? { linkedCompanyId: input.linkedCompanyId }
+            : {}),
+          ...(input.domainHost && input.objectName === 'company'
+            ? { domainHost: input.domainHost }
+            : {}),
+        },
       );
     },
     async searchNotes(input) {

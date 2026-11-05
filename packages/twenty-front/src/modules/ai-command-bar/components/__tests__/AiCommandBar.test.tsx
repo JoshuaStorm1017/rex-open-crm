@@ -1592,6 +1592,64 @@ describe('round 9 command bar', () => {
     ).toBeInTheDocument();
     expect(screen.getAllByRole('row')).toHaveLength(2);
   });
+
+  it('does not keep another record id on a ghost row', async () => {
+    getDefaultStore().set(aiCommandBarCreatePreviewState.atom, []);
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(async () =>
+      jsonResponse({
+        ok: true,
+        workspaceId: 'ws_demo',
+        proposal: {
+          id: 'proposal_11111111-1111-4111-8111-111111111111',
+          summary: 'Create person Ada Lovelace.',
+          tools: [
+            {
+              name: 'create_person',
+              args: { firstName: 'Ada', lastName: 'Lovelace' },
+            },
+          ],
+          lines: [
+            {
+              tool: 'create_person',
+              summary: 'Create person Ada Lovelace.',
+            },
+          ],
+          creates: [
+            {
+              objectName: 'person',
+              label: 'Ada Lovelace',
+              summary: 'ada@analytical.example',
+              id: 'person_victim',
+            },
+          ],
+        },
+      }),
+    );
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <MemoryRouter>
+          <AiCommandBar config={config} fetchImpl={fetchImpl} initialOpen />
+          <AiRecordTableGhostRows objectName="person" />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'create person Ada Lovelace',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    const row = await screen.findByRole('row', {
+      name: /Proposed person Ada Lovelace/,
+    });
+
+    expect(row).not.toHaveAttribute('data-selectable-id');
+    expect(row).not.toHaveAttribute('data-record-table-record-id');
+    expect(document.body.textContent).not.toContain('person_victim');
+  });
 });
 
 const isPlainParameter = (body: Record<string, unknown>): boolean =>
