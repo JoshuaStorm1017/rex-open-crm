@@ -347,8 +347,16 @@ describe('multi-match create', () => {
       proposal: {
         choice: {
           candidates: [
-            expect.objectContaining({ label: 'Jane Doe · jane.north@example.test', action: 'use' }),
-            expect.objectContaining({ label: 'Jane Doe · jane.south@example.test', action: 'use' }),
+            expect.objectContaining({
+              label: 'Jane Doe',
+              detail: 'jane.north@example.test',
+              action: 'use',
+            }),
+            expect.objectContaining({
+              label: 'Jane Doe',
+              detail: 'jane.south@example.test',
+              action: 'use',
+            }),
             expect.objectContaining({
               id: 'create_new',
               action: 'create',
@@ -514,6 +522,15 @@ describe('undo', () => {
       reason: 'precondition_failed',
     });
     expect(client.created[0]?.properties.domain).toBe('later.example');
+
+    const retry = await postJson(gateway, '/v1/ai/undo', {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      undoId,
+    });
+
+    expect(retry.response.status).toBe(412);
+    expect(client.created[0]?.properties.domain).toBe('later.example');
   });
 
   it('keeps the last undo ticket in sqlite', () => {
@@ -559,7 +576,7 @@ describe('permission catalog', () => {
         ? catalog.tools.map((tool) => (isRecord(tool) ? tool.name : undefined))
         : [];
 
-    expect(names).toEqual(['create_company', 'search_records', 'update_record']);
+    expect(names).toEqual(['create_company', 'search_records', 'update_record', 'archive_record']);
     const update = isRecord(catalog) && Array.isArray(catalog.tools) ? catalog.tools[2] : undefined;
     expect(update).toMatchObject({
       inputSchema: { properties: { object: { enum: ['company'] } } },

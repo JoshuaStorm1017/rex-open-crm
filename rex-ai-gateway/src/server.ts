@@ -6,7 +6,7 @@ import { parseGatewayRequest } from './act/parse-request';
 import { assertCanUndo, catalogForAudience, loadAudience } from './act/permissions';
 import { proposeAct } from './act/propose-act';
 import { isRecord } from './is-record';
-import { refusal, type ActResult, type PlanResult } from './act/types';
+import { refusal, upstreamFailure, type ActResult, type PlanResult } from './act/types';
 import { createMockAuthenticator, type Authenticator } from './auth/authenticate';
 import { withMemberCredential } from './auth/call-context';
 import type { MemberPrincipal } from './auth/types';
@@ -424,47 +424,64 @@ async function executeConfirmedUndo(
     );
   }
 
-  const peeked = runtime.undos.peek(parsed.undoId, principal.memberId, parsed.workspaceId);
+  const begun = runtime.undos.begin(parsed.undoId, principal.memberId, parsed.workspaceId);
 
-  if (!peeked.ok) {
-    if (peeked.reason === 'workspace') {
+  if (!begun.ok) {
+    if (begun.reason === 'workspace') {
       return refusal('cross_workspace', 'This undo belongs to a different workspace.');
+    }
+
+    if (begun.reason === 'busy') {
+      return refusal('confirmation_required', 'Undo is already running for this change.');
     }
 
     return refusal('not_found', 'There is no matching undo for the last confirmed change.');
   }
 
-  const permission = assertCanUndo(peeked.ticket.effects, await loadAudience(runtime.client));
+  const permission = assertCanUndo(begun.ticket.effects, await loadAudience(runtime.client));
 
   if (permission) {
+    runtime.undos.release(principal.memberId);
     return permission;
   }
 
-  const taken = runtime.undos.take(parsed.undoId, principal.memberId, parsed.workspaceId);
+  let failures;
 
-  if (!taken.ok) {
-    return refusal('not_found', 'There is no matching undo for the last confirmed change.');
+  try {
+    failures = await compensate(runtime.client, parsed.workspaceId, begun.ticket.effects);
+  } catch (error) {
+    runtime.undos.release(principal.memberId);
+    return upstreamFailure(error, 0);
   }
 
-  const failures = await compensate(runtime.client, parsed.workspaceId, taken.ticket.effects);
-
   if (failures.length > 0) {
-    const leftEveryChange =
-      failures.length === taken.ticket.effects.length &&
-      failures.every((failure) => failure.reason === 'conflict');
+    const failedIndexes = new Set(failures.map((failure) => failure.index));
+    const remaining = begun.ticket.effects.filter((_effect, index) => failedIndexes.has(index));
 
-    if (leftEveryChange) {
+    if (remaining.length < begun.ticket.effects.length) {
+      runtime.undos.retain(parsed.undoId, principal.memberId, parsed.workspaceId, remaining);
+    }
+
+    runtime.undos.release(principal.memberId);
+
+    if (failures.every((failure) => failure.reason === 'conflict')) {
+      const nothingReversed = failures.length === begun.ticket.effects.length;
+
       return refusal(
         'precondition_failed',
-        'The record changed after that action, so nothing was reversed.',
+        nothingReversed
+          ? 'The record changed after that action, so nothing was reversed. Undo is still available.'
+          : 'Some changes were reversed. The ones that changed since then are still available to undo.',
       );
     }
 
     return partialFailure(
-      'Undo could not reverse every change.',
+      'Undo could not reverse every change. The remaining changes are still available to undo.',
       failures.map((failure) => failure.id),
     );
   }
+
+  runtime.undos.finish(principal.memberId);
 
   return {
     ok: true,

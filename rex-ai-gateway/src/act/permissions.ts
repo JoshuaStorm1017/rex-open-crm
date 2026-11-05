@@ -70,13 +70,13 @@ export function assertToolPermitted(
 
   switch (tool.name) {
     case 'create_person':
-      return requireUpdate(audience, 'person', tool.name);
+      return requireCreate(audience, 'person', tool.name);
     case 'create_company':
-      return requireUpdate(audience, 'company', tool.name);
+      return requireCreate(audience, 'company', tool.name);
     case 'create_opportunity':
-      return requireUpdate(audience, 'opportunity', tool.name);
+      return requireCreate(audience, 'opportunity', tool.name);
     case 'create_note':
-      if (!audience.canUpdate.has('note')) {
+      if (!audience.canCreate.has('note')) {
         return refusal('forbidden', 'You cannot add notes.', { toolName: tool.name });
       }
 
@@ -106,6 +106,17 @@ export function assertToolPermitted(
       }
 
       return undefined;
+    case 'archive_record':
+      if (
+        !audience.canRead.has(tool.input.objectName) ||
+        !audience.canSoftDelete.has(tool.input.objectName)
+      ) {
+        return refusal('forbidden', `You cannot archive ${tool.input.objectName} records.`, {
+          toolName: tool.name,
+        });
+      }
+
+      return undefined;
   }
 }
 
@@ -119,6 +130,18 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
   }
 
   for (const effect of effects) {
+    if (effect.kind === 'archived') {
+      if (
+        !load.audience.canRead.has(effect.objectName) ||
+        !load.audience.canUpdate.has(effect.objectName)
+      ) {
+        return refusal(
+          'forbidden',
+          `You cannot update ${effect.objectName} records, so this archive cannot be undone.`,
+        );
+      }
+    }
+
     if (effect.kind === 'created') {
       const permissionObject = effect.objectName === 'noteTarget' ? 'note' : effect.objectName;
 
@@ -145,12 +168,12 @@ export function assertCanUndo(effects: ActEffect[], load: AudienceLoad): ActRefu
   return undefined;
 }
 
-function requireUpdate(
+function requireCreate(
   audience: ToolAudience,
   objectName: 'person' | 'company' | 'opportunity',
   toolName: AllowedToolName,
 ): ActRefusal | undefined {
-  if (audience.canUpdate.has(objectName)) {
+  if (audience.canCreate.has(objectName)) {
     return undefined;
   }
 
@@ -159,6 +182,7 @@ function requireUpdate(
 
 function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
   const canRead = new Set<TwentyObjectName>();
+  const canCreate = new Set<TwentyObjectName | 'note'>();
   const canUpdate = new Set<TwentyObjectName | 'note'>();
   const canSoftDelete = new Set<TwentyObjectName | 'note'>();
 
@@ -171,6 +195,10 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
       canRead.add(object.objectName);
     }
 
+    if (object.canCreate ?? object.canUpdate) {
+      canCreate.add(object.objectName);
+    }
+
     if (object.canUpdate) {
       canUpdate.add(object.objectName);
     }
@@ -180,5 +208,5 @@ function audienceFrom(capabilities: MemberCapabilities): ToolAudience {
     }
   }
 
-  return { canRead, canUpdate, canSoftDelete };
+  return { canRead, canCreate, canUpdate, canSoftDelete };
 }

@@ -449,6 +449,105 @@ describe('record page and undo', () => {
   });
 });
 
+describe('picker detail and undo retry', () => {
+  it('shows the record detail and keeps undo available when the reversal conflicts', async () => {
+    const user = userEvent.setup();
+    const choiceProposal = {
+      ok: true,
+      workspaceId: 'ws_demo',
+      proposal: {
+        id: 'proposal_22222222-2222-4222-8222-222222222222',
+        summary: 'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
+        tools: [],
+        lines: [
+          { tool: 'update_record', summary: 'Acme' },
+          { tool: 'update_record', summary: 'Acme' },
+          { tool: 'update_record', summary: 'Create new company “Acme”' },
+        ],
+        choice: {
+          prompt: 'Several companies match “Acme”. Choose one, or create a new one, then confirm.',
+          candidates: [
+            {
+              id: 'company_north',
+              label: 'Acme',
+              detail: 'north.example · Lisbon',
+              objectName: 'company',
+              action: 'use',
+            },
+            {
+              id: 'company_south',
+              label: 'Acme',
+              detail: 'south.example · Porto',
+              objectName: 'company',
+              action: 'use',
+            },
+            {
+              id: 'create_new',
+              label: 'Create new company “Acme”',
+              objectName: 'company',
+              action: 'create',
+            },
+          ],
+        },
+      },
+    };
+    const fetchImpl = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+
+      if (url.endsWith('/v1/ai/plan')) {
+        return jsonResponse(choiceProposal);
+      }
+
+      if (url.endsWith('/v1/ai/undo')) {
+        return jsonResponse({
+          ok: false,
+          refused: true,
+          reason: 'precondition_failed',
+          message: 'The record changed after that action, so it was not reversed. Undo is still available.',
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        results: [
+          {
+            tool: 'update_record',
+            status: 'updated',
+            record: { id: 'company_north', objectName: 'company', label: 'Acme' },
+          },
+        ],
+        undo: {
+          id: 'undo_33333333-3333-4333-8333-333333333333',
+          summary: 'Undo 1 field change.',
+        },
+      });
+    });
+
+    renderBar(fetchImpl, true);
+
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company named Acme set city to Lisbon',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(await screen.findByText('north.example · Lisbon')).toBeInTheDocument();
+    expect(screen.getByText('south.example · Porto')).toBeInTheDocument();
+    expect(screen.getByText('New record')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('radio', { name: /north\.example · Lisbon/ }));
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(await screen.findByRole('button', { name: 'Undo' }));
+
+    expect(
+      await screen.findByText(
+        'The record changed after that action, so it was not reversed. Undo is still available.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled();
+  });
+});
+
 describe('readOpenRecordFromPath', () => {
   it('reads a person, company, or opportunity show page', () => {
     expect(readOpenRecordFromPath('/object/opportunity/opp_1')).toEqual({

@@ -8,13 +8,47 @@ type ChoiceDraft = Omit<PendingChoice, 'candidates' | 'createTools' | 'query'> &
   query: string;
 };
 
-export function matchLabel(record: CreatedRecord): string {
-  const email = record.properties.email;
-  const domain = record.properties.domain;
-  const detail =
-    typeof email === 'string' ? email : typeof domain === 'string' ? domain : undefined;
+export function matchDetail(record: CreatedRecord): string {
+  if (record.objectName === 'opportunity') {
+    const parts: string[] = [];
+    const stage = record.properties.stage;
+    const amount = record.properties.amount;
 
-  return detail ? `${record.label} · ${detail}` : record.label;
+    if (typeof stage === 'string') {
+      parts.push(stage);
+    }
+
+    if (typeof amount === 'number') {
+      const currency =
+        typeof record.properties.currencyCode === 'string' ? record.properties.currencyCode : 'USD';
+      parts.push(currency === 'USD' ? `$${amount.toLocaleString('en-US')}` : `${amount.toLocaleString('en-US')} ${currency}`);
+    }
+
+    return parts.join(' · ');
+  }
+
+  const parts: string[] = [];
+  const email = record.properties.email;
+  const domain = record.properties.domain ?? record.properties.website;
+  const city = record.properties.city;
+
+  if (typeof email === 'string') {
+    parts.push(email);
+  }
+
+  if (typeof domain === 'string') {
+    parts.push(domain);
+  }
+
+  if (typeof city === 'string') {
+    parts.push(city);
+  }
+
+  return parts.join(' · ');
+}
+
+export function matchLabel(record: CreatedRecord): string {
+  return record.label;
 }
 
 export function createNewTools(choice: ChoiceDraft): ToolCall[] | undefined {
@@ -73,7 +107,10 @@ function updateAsCreate(choice: ChoiceDraft): ToolCall[] | undefined {
     const args: Record<string, unknown> = { ...names };
 
     if (
-      (choice.field === 'email' || choice.field === 'jobTitle' || choice.field === 'phone') &&
+      (choice.field === 'email' ||
+        choice.field === 'jobTitle' ||
+        choice.field === 'phone' ||
+        choice.field === 'linkedin') &&
       typeof choice.value === 'string'
     ) {
       args[choice.field] = choice.value;
@@ -90,8 +127,17 @@ function updateAsCreate(choice: ChoiceDraft): ToolCall[] | undefined {
     return [{ name: 'create_company', args: { name: choice.value } }];
   }
 
-  if (choice.field === 'domain' && typeof choice.value === 'string') {
+  if ((choice.field === 'domain' || choice.field === 'website') && typeof choice.value === 'string') {
     return [{ name: 'create_company', args: { name: choice.query, domain: choice.value } }];
+  }
+
+  if (
+    (choice.field === 'linkedin' || choice.field === 'address' || choice.field === 'city') &&
+    typeof choice.value === 'string'
+  ) {
+    return [
+      { name: 'create_company', args: { name: choice.query, [choice.field]: choice.value } },
+    ];
   }
 
   if (choice.field === 'accountOwner' && typeof choice.value === 'string') {

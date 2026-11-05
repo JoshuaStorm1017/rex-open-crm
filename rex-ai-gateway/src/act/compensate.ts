@@ -4,6 +4,7 @@ import { isUpdatableField } from './writable-fields';
 import type { ActEffect, ActPartialFailure } from './types';
 
 export type CompensateFailure = {
+  index: number;
   id: string;
   reason: 'conflict' | 'error';
 };
@@ -16,24 +17,29 @@ export async function compensate(
   const remaining: CompensateFailure[] = [];
   const reversedInThisPass = new Set<string>();
 
-  for (const effect of [...effects].reverse()) {
+  for (const { effect, index } of effects.map((effect, index) => ({ effect, index })).reverse()) {
     const key = `${effect.objectName}:${effect.id}`;
 
     try {
-      if (effect.kind === 'created') {
-        if (
-          effect.etag &&
-          isWorkspaceObject(effect.objectName) &&
-          !reversedInThisPass.has(key)
-        ) {
-          const current = await client.getRecord({
-            workspaceId,
-            objectName: effect.objectName,
-            id: effect.id,
-          });
+      if (effect.kind === 'archived') {
+        await client.restoreRecord({
+          workspaceId,
+          objectName: effect.objectName,
+          id: effect.id,
+        });
+        continue;
+      }
 
-          if (current.etag !== effect.etag) {
-            remaining.push({ id: effect.id, reason: 'conflict' });
+      if (effect.kind === 'created') {
+        if (effect.etag && !reversedInThisPass.has(key)) {
+          const current = await readCreatedEtag(client, workspaceId, effect);
+
+          if (current === 'missing') {
+            continue;
+          }
+
+          if (current !== effect.etag) {
+            remaining.push({ index, id: effect.id, reason: 'conflict' });
             continue;
           }
         }
@@ -47,7 +53,7 @@ export async function compensate(
       }
 
       if (!isUpdatableField(effect.objectName, effect.field)) {
-        remaining.push({ id: effect.id, reason: 'conflict' });
+        remaining.push({ index, id: effect.id, reason: 'conflict' });
         continue;
       }
 
@@ -56,7 +62,7 @@ export async function compensate(
         typeof effect.previous !== 'string' &&
         typeof effect.previous !== 'number'
       ) {
-        remaining.push({ id: effect.id, reason: 'conflict' });
+        remaining.push({ index, id: effect.id, reason: 'conflict' });
         continue;
       }
 
@@ -69,7 +75,7 @@ export async function compensate(
       // A later effect in this same undo already rewrote the row, so its etag moved.
       // Any other etag means the field may no longer hold the value this act wrote.
       if (!reversedInThisPass.has(key) && current.etag !== effect.etag) {
-        remaining.push({ id: effect.id, reason: 'conflict' });
+        remaining.push({ index, id: effect.id, reason: 'conflict' });
         continue;
       }
 
@@ -99,11 +105,42 @@ export async function compensate(
         continue;
       }
 
-      remaining.push({ id: effect.id, reason: 'error' });
+      remaining.push({ index, id: effect.id, reason: 'error' });
     }
   }
 
   return remaining;
+}
+
+async function readCreatedEtag(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  effect: Extract<ActEffect, { kind: 'created' }>,
+): Promise<string | 'missing'> {
+  try {
+    if (effect.objectName === 'note') {
+      const note = await client.getNote({ workspaceId, id: effect.id });
+      return note.etag;
+    }
+
+    if (effect.objectName === 'noteTarget' || !isWorkspaceObject(effect.objectName)) {
+      return effect.etag ?? 'missing';
+    }
+
+    const current = await client.getRecord({
+      workspaceId,
+      objectName: effect.objectName,
+      id: effect.id,
+    });
+
+    return current.etag;
+  } catch (error) {
+    if (error instanceof CrmNotFoundError) {
+      return 'missing';
+    }
+
+    throw error;
+  }
 }
 
 function isWorkspaceObject(objectName: string): objectName is TwentyObjectName {

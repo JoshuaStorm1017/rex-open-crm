@@ -1,5 +1,6 @@
 import { isRecord } from '../is-record';
 import type {
+  AddressFields,
   CreatedRecord,
   RecordComposites,
   TwentyObjectName,
@@ -70,10 +71,45 @@ export function cloneRecord(record: CreatedRecord): CreatedRecord {
                   })),
                 }
               : {}),
+            ...(record.composites.linkedinSecondaryLinks
+              ? {
+                  linkedinSecondaryLinks: record.composites.linkedinSecondaryLinks.map((link) => ({
+                    ...link,
+                  })),
+                }
+              : {}),
+            ...(record.composites.address ? { address: { ...record.composites.address } } : {}),
           },
         }
       : {}),
   };
+}
+
+export function projectField(
+  properties: Record<string, string | number>,
+  field: string,
+  value: string | number | null,
+): Record<string, string | number> {
+  const next = { ...properties };
+
+  if (value === null) {
+    delete next[field];
+  } else {
+    next[field] = value;
+  }
+
+  // website and domain are the same Twenty link. Keep both names pointing at it.
+  if (field === 'domain' || field === 'website') {
+    if (value === null) {
+      delete next.domain;
+      delete next.website;
+    } else {
+      next.domain = value;
+      next.website = value;
+    }
+  }
+
+  return next;
 }
 
 export function applyField(
@@ -81,12 +117,7 @@ export function applyField(
   field: string,
   value: string | number | null,
 ): void {
-  if (value === null) {
-    delete record.properties[field];
-  } else {
-    record.properties[field] = value;
-  }
-
+  record.properties = projectField(record.properties, field, value);
   record.label = labelFromProperties(record.objectName, record.properties);
 }
 
@@ -132,16 +163,42 @@ function readLinkList(value: unknown): Array<Record<string, string>> | undefined
   return links;
 }
 
+function readAddress(raw: Record<string, unknown>): AddressFields | undefined {
+  const source = isRecord(raw.address) ? raw.address : undefined;
+
+  if (!source) {
+    return undefined;
+  }
+
+  const address: AddressFields = {
+    ...(readString(source.addressStreet1) ? { addressStreet1: readString(source.addressStreet1) } : {}),
+    ...(readString(source.addressStreet2) ? { addressStreet2: readString(source.addressStreet2) } : {}),
+    ...(readString(source.addressCity) ? { addressCity: readString(source.addressCity) } : {}),
+    ...(readString(source.addressState) ? { addressState: readString(source.addressState) } : {}),
+    ...(readString(source.addressPostcode) ? { addressPostcode: readString(source.addressPostcode) } : {}),
+    ...(readString(source.addressCountry) ? { addressCountry: readString(source.addressCountry) } : {}),
+  };
+
+  return Object.keys(address).length > 0 ? address : undefined;
+}
+
 function readComposites(raw: Record<string, unknown>): RecordComposites | undefined {
   const emails = isRecord(raw.emails) ? raw.emails : undefined;
   const domainName = isRecord(raw.domainName) ? raw.domainName : undefined;
+  const linkedin = isRecord(raw.linkedinLink) ? raw.linkedinLink : undefined;
   const additionalEmails = readStringList(emails?.additionalEmails);
   const secondaryLinks = readLinkList(domainName?.secondaryLinks);
   const primaryLinkLabel = readString(domainName?.primaryLinkLabel);
+  const linkedinLabel = readString(linkedin?.primaryLinkLabel);
+  const linkedinSecondaryLinks = readLinkList(linkedin?.secondaryLinks);
+  const address = readAddress(raw);
   const composites: RecordComposites = {
     ...(additionalEmails ? { additionalEmails } : {}),
     ...(secondaryLinks ? { secondaryLinks } : {}),
     ...(primaryLinkLabel ? { primaryLinkLabel } : {}),
+    ...(linkedinLabel ? { linkedinLabel } : {}),
+    ...(linkedinSecondaryLinks ? { linkedinSecondaryLinks } : {}),
+    ...(address ? { address } : {}),
   };
 
   return Object.keys(composites).length > 0 ? composites : undefined;
@@ -160,6 +217,8 @@ function readPersonProperties(raw: Record<string, unknown>): Record<string, stri
   const phoneNumber = readString(phones?.primaryPhoneNumber);
   const callingCode = readString(phones?.primaryPhoneCallingCode);
   const phone = phoneNumber ? (callingCode ? `${callingCode} ${phoneNumber}` : phoneNumber) : readString(raw.phone);
+  const linkedinLink = isRecord(raw.linkedinLink) ? raw.linkedinLink : undefined;
+  const linkedin = readString(linkedinLink?.primaryLinkUrl) ?? readString(raw.linkedin);
 
   if (firstName) {
     properties.firstName = firstName;
@@ -181,6 +240,10 @@ function readPersonProperties(raw: Record<string, unknown>): Record<string, stri
     properties.phone = phone;
   }
 
+  if (linkedin) {
+    properties.linkedin = linkedin;
+  }
+
   if (companyId) {
     properties.companyId = companyId;
   }
@@ -195,7 +258,13 @@ function readCompanyProperties(raw: Record<string, unknown>): Record<string, str
   const domain =
     readString(domainName?.primaryLinkUrl) ??
     readString(raw.domain) ??
+    readString(raw.website) ??
     readString(raw.domainName);
+  const linkedinLink = isRecord(raw.linkedinLink) ? raw.linkedinLink : undefined;
+  const linkedin = readString(linkedinLink?.primaryLinkUrl) ?? readString(raw.linkedin);
+  const address = isRecord(raw.address) ? raw.address : undefined;
+  const street = readString(address?.addressStreet1) ?? readString(raw.address);
+  const city = readString(address?.addressCity) ?? readString(raw.city);
   const accountOwnerId = readString(raw.accountOwnerId) ?? readString(raw.accountOwner);
 
   if (name) {
@@ -204,6 +273,19 @@ function readCompanyProperties(raw: Record<string, unknown>): Record<string, str
 
   if (domain) {
     properties.domain = domain;
+    properties.website = domain;
+  }
+
+  if (linkedin) {
+    properties.linkedin = linkedin;
+  }
+
+  if (street) {
+    properties.address = street;
+  }
+
+  if (city) {
+    properties.city = city;
   }
 
   if (accountOwnerId) {

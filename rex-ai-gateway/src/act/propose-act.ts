@@ -5,7 +5,9 @@ import type { CreatedRecord, TwentyCrmClient } from '../twenty/twenty-crm-client
 import type { ProposalStore } from '../http/proposal-store';
 import type { LlmProvider } from '../llm/llm-provider';
 import { bindOpenRecord } from './bind-open-record';
-import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, matchLabel } from './create-new-choice';
+import { CREATE_NEW_CHOICE_ID, createNewLabel, createNewTools, matchDetail, matchLabel } from './create-new-choice';
+import { groundModelPlan } from './ground-model-plan';
+import { loadVisibleSnapshot, publicVisibleRecords } from './visible-snapshot';
 import type { PendingChoice } from './pending-choice';
 import { assertToolPermitted, catalogForAudience, loadAudience, type AudienceLoad } from './permissions';
 import { describeTool, summarizeLines } from './describe-tool';
@@ -70,6 +72,7 @@ export async function proposeAct(
   }
 
   let planned;
+  const snapshot = await loadVisibleSnapshot(client, parsed.workspaceId, audience);
 
   try {
     planned = await llm.plan({
@@ -77,6 +80,7 @@ export async function proposeAct(
       workspaceId: parsed.workspaceId,
       client,
       catalog,
+      visibleRecords: publicVisibleRecords(snapshot),
       ...(openRecord ? { openRecord: { objectName: openRecord.objectName, label: openRecord.label } } : {}),
     });
   } catch (error) {
@@ -98,7 +102,13 @@ export async function proposeAct(
     );
   }
 
-  return previewTools(client, parsed.workspaceId, planned.tools, options, audience, openRecord);
+  const grounded = groundModelPlan(planned.tools, parsed.intent, snapshot);
+
+  if ('refused' in grounded) {
+    return grounded;
+  }
+
+  return previewTools(client, parsed.workspaceId, grounded, options, audience, openRecord);
 }
 
 async function loadOpenRecord(
@@ -261,23 +271,28 @@ async function resolveNamedRecord(
   toolCount: number,
 ): Promise<ValidatedTool | { choice: PendingChoice } | ActRefusal> {
   const query =
-    tool.name === 'update_record'
+    tool.name === 'update_record' || tool.name === 'archive_record'
       ? tool.input.query
       : tool.name === 'create_note'
         ? tool.input.targetQuery
         : undefined;
   const hasId =
-    tool.name === 'update_record'
+    tool.name === 'update_record' || tool.name === 'archive_record'
       ? Boolean(tool.input.id)
       : tool.name === 'create_note'
         ? Boolean(tool.input.targetId)
         : true;
 
-  if (!query || hasId || (tool.name !== 'update_record' && tool.name !== 'create_note')) {
+  if (
+    !query ||
+    hasId ||
+    (tool.name !== 'update_record' && tool.name !== 'create_note' && tool.name !== 'archive_record')
+  ) {
     return tool;
   }
 
-  const objectName = tool.name === 'update_record' ? tool.input.objectName : tool.input.targetObject;
+  const objectName =
+    tool.name === 'create_note' ? tool.input.targetObject : tool.input.objectName;
   const matches = await client.searchRecords({
     workspaceId,
     objectName,
@@ -303,7 +318,7 @@ async function resolveNamedRecord(
     const draft: Omit<PendingChoice, 'candidates' | 'createTools' | 'query'> & {
       query: string;
     } = {
-      kind: tool.name === 'create_note' ? 'note' : 'update',
+      kind: tool.name === 'create_note' ? 'note' : tool.name === 'archive_record' ? 'archive' : 'update',
       objectName,
       field: tool.name === 'update_record' ? tool.input.field : '',
       value: tool.name === 'update_record' ? tool.input.value : '',
@@ -311,7 +326,7 @@ async function resolveNamedRecord(
       body: tool.name === 'create_note' ? tool.input.body : '',
       query,
     };
-    const createTools = createNewTools(draft);
+    const createTools = draft.kind === 'archive' ? undefined : createNewTools(draft);
 
     return {
       choice: {
@@ -321,6 +336,7 @@ async function resolveNamedRecord(
           ...matches.map((record) => ({
             id: record.id,
             label: matchLabel(record),
+            detail: matchDetail(record),
             etag: record.etag,
           })),
           ...(createTools
@@ -338,6 +354,10 @@ async function resolveNamedRecord(
   }
 
   if (tool.name === 'update_record') {
+    return { ...tool, input: { ...tool.input, id: match.id, query: undefined } };
+  }
+
+  if (tool.name === 'archive_record') {
     return { ...tool, input: { ...tool.input, id: match.id, query: undefined } };
   }
 
@@ -376,8 +396,13 @@ function storeChoice(
       summary,
       tools: [],
       lines: choice.candidates.map((candidate) => ({
-        tool: choice.kind === 'note' ? 'create_note' : 'update_record',
-        summary: candidate.label,
+        tool:
+          choice.kind === 'note'
+            ? 'create_note'
+            : choice.kind === 'archive'
+              ? 'archive_record'
+              : 'update_record',
+        summary: candidate.detail ? `${candidate.label} · ${candidate.detail}` : candidate.label,
       })),
       choice: {
         prompt: summary,
@@ -386,6 +411,7 @@ function storeChoice(
           label: candidate.label,
           objectName: choice.objectName,
           action: candidate.id === CREATE_NEW_CHOICE_ID ? ('create' as const) : ('use' as const),
+          ...(candidate.detail ? { detail: candidate.detail } : {}),
         })),
       },
     },
@@ -397,7 +423,7 @@ async function enrichUpdate(
   workspaceId: string,
   tool: ValidatedTool,
 ): Promise<{ record?: CreatedRecord } | ActRefusal> {
-  if (tool.name !== 'update_record' || !tool.input.id) {
+  if ((tool.name !== 'update_record' && tool.name !== 'archive_record') || !tool.input.id) {
     return {};
   }
 
@@ -442,6 +468,17 @@ function toolCallFromValidated(tool: ValidatedTool): ToolCall {
         id: tool.input.id,
         field: tool.input.field,
         value: tool.input.value,
+        ifMatch: tool.input.ifMatch,
+      },
+    };
+  }
+
+  if (tool.name === 'archive_record') {
+    return {
+      name: tool.name,
+      args: {
+        object: tool.input.objectName,
+        id: tool.input.id,
         ifMatch: tool.input.ifMatch,
       },
     };

@@ -12,6 +12,7 @@ import {
   TWENTY_OBJECT_PATH,
   conditionalUpdateFilter,
   graphqlSearchFilter,
+  RECORD_GRAPHQL_FIELDS,
   restSearchFilter,
   toClearPayload,
   toCompanyPayload,
@@ -20,7 +21,7 @@ import {
   toUpdatePayload,
   updateManyName,
 } from './map-to-twenty-payload';
-import { crmRecordFromTwenty, labelFromProperties, readEtag } from './record-fields';
+import { crmRecordFromTwenty, labelFromProperties, projectField, readEtag } from './record-fields';
 import {
   type CreateCompanyInput,
   type CreateNoteInput,
@@ -29,7 +30,10 @@ import {
   type CreatedRecord,
   type DeletableObjectName,
   type DeleteRecordInput,
+  type ArchiveRecordInput,
   type GetRecordInput,
+  type ListRecentInput,
+  type NoteLookupInput,
   type SearchRecordsInput,
   type TwentyCrmClient,
   type TwentyObjectName,
@@ -222,7 +226,7 @@ export function createHttpTwentyCrmClient(
         : await requestJson('/graphql', {
             method: 'POST',
             body: {
-              query: `query Get($id: UUID!) { ${target.singular}(filter: { id: { eq: $id } }) { id updatedAt name stage jobTitle companyId pointOfContactId closeDate emails { primaryEmail } domainName { primaryLinkUrl } amount { amountMicros currencyCode } } }`,
+              query: `query Get($id: UUID!) { ${target.singular}(filter: { id: { eq: $id } }) { ${RECORD_GRAPHQL_FIELDS[input.objectName]} } }`,
               variables: { id: input.id },
             },
           });
@@ -312,7 +316,8 @@ export function createHttpTwentyCrmClient(
     const target = deleteTarget(objectName);
 
     if (style === 'rest') {
-      await requestJson(`${target.restPath}/${id}`, { method: 'DELETE' });
+      // Without this flag Twenty destroys the row. Undo and archive both mean soft-delete.
+      await requestJson(`${target.restPath}/${id}?soft_delete=true`, { method: 'DELETE' });
       return;
     }
 
@@ -386,7 +391,7 @@ export function createHttpTwentyCrmClient(
           : await requestJson('/graphql', {
               method: 'POST',
               body: {
-                query: `query Search($filter: ${target.filterInputType}, $first: Int) { ${target.plural}(filter: $filter, first: $first) { edges { node { id updatedAt name stage jobTitle companyId pointOfContactId closeDate emails { primaryEmail } domainName { primaryLinkUrl } amount { amountMicros currencyCode } } } } }`,
+                query: `query Search($filter: ${target.filterInputType}, $first: Int) { ${target.plural}(filter: $filter, first: $first) { edges { node { ${RECORD_GRAPHQL_FIELDS[input.objectName]} } } } }`,
                 variables: {
                   filter: graphqlSearchFilter(input.objectName, input.query),
                   first: input.limit,
@@ -402,7 +407,7 @@ export function createHttpTwentyCrmClient(
     getRecord: (input: GetRecordInput) => loadRecord(input),
     async updateRecord(input: UpdateRecordInput) {
       const current = await loadRecord(input);
-      const nextProperties = { ...current.properties, [input.field]: input.value };
+      const nextProperties = projectField(current.properties, input.field, input.value);
 
       return commitFieldWrite(
         input,
@@ -419,8 +424,7 @@ export function createHttpTwentyCrmClient(
     },
     async clearRecordField(input: ClearRecordFieldInput) {
       const current = await loadRecord(input);
-      const nextProperties = { ...current.properties };
-      delete nextProperties[input.field];
+      const nextProperties = projectField(current.properties, input.field, null);
 
       return commitFieldWrite(
         input,
@@ -494,7 +498,7 @@ export function createHttpTwentyCrmClient(
           }
 
           if (style === 'rest') {
-            await requestJson(`/rest/notes/${safeNoteId}`, { method: 'DELETE' });
+            await requestJson(`/rest/notes/${safeNoteId}?soft_delete=true`, { method: 'DELETE' });
           } else {
             await requestJson('/graphql', {
               method: 'POST',
@@ -527,6 +531,89 @@ export function createHttpTwentyCrmClient(
         etag: readEtag(created),
         label: input.title ?? 'Note',
       };
+    },
+    async listRecent(input: ListRecentInput) {
+      const target = TWENTY_OBJECT_PATH[input.objectName];
+      const limit = Math.min(Math.max(input.limit, 1), 5);
+      const result =
+        style === 'rest'
+          ? await requestJson(
+              `${target.restPath}?limit=${limit}&depth=1&order_by=${encodeURIComponent('updatedAt[DescNullsLast]')}`,
+              { method: 'GET' },
+            )
+          : await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query: `query Recent($first: Int) { ${target.plural}(first: $first, orderBy: [{ updatedAt: DescNullsLast }]) { edges { node { ${RECORD_GRAPHQL_FIELDS[input.objectName]} } } } }`,
+                variables: { first: limit },
+              },
+            });
+
+      return readList(result.body, target.plural)
+        .map((item) => crmRecordFromTwenty(input.objectName, input.workspaceId, item))
+        .filter((record): record is CreatedRecord => record !== undefined)
+        .slice(0, limit);
+    },
+    async getNote(input: NoteLookupInput) {
+      const result =
+        style === 'rest'
+          ? await requestJson(`/rest/notes/${recordPathId(input.id)}`, { method: 'GET' })
+          : await requestJson('/graphql', {
+              method: 'POST',
+              body: {
+                query: 'query Get($id: UUID!) { note(filter: { id: { eq: $id } }) { id updatedAt title } }',
+                variables: { id: input.id },
+              },
+            });
+      const raw = readDataRecord(result.body, 'note');
+
+      if (!isRecord(raw) || typeof raw.id !== 'string' || raw.id.length === 0) {
+        throw new CrmNotFoundError(`No note found with id ${input.id}.`);
+      }
+
+      const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : 'Note';
+
+      return {
+        id: raw.id,
+        objectName: 'note',
+        workspaceId: input.workspaceId,
+        properties: { title },
+        etag: readEtag(raw),
+        label: title,
+      };
+    },
+    async archiveRecord(input: ArchiveRecordInput) {
+      const current = await loadRecord(input);
+
+      if (current.etag !== input.ifMatch) {
+        throw new CrmPreconditionError(
+          `If-Match ${input.ifMatch} does not match the current ${input.objectName} version ${current.etag}.`,
+          current.etag,
+        );
+      }
+
+      await deleteById(input.objectName, recordPathId(input.id));
+
+      return current;
+    },
+    async restoreRecord(input: DeleteRecordInput) {
+      const id = recordPathId(input.id);
+      const target = deleteTarget(input.objectName);
+
+      if (style === 'rest') {
+        await requestJson(`${target.restPath}/${id}/restore`, { method: 'PATCH' });
+        return;
+      }
+
+      const mutationName = `restore${target.mutationName.slice('delete'.length)}`;
+
+      await requestJson('/graphql', {
+        method: 'POST',
+        body: {
+          query: `mutation Restore($id: UUID!) { ${mutationName}(id: $id) { id } }`,
+          variables: { id },
+        },
+      });
     },
     async deleteRecord(input: DeleteRecordInput) {
       const id = recordPathId(input.id);
@@ -674,6 +761,7 @@ function readCapabilities(body: unknown): MemberCapabilities {
       objectName,
       canRead: permission.canReadObjectRecords === true,
       canUpdate: permission.canUpdateObjectRecords === true,
+      canCreate: permission.canUpdateObjectRecords === true,
       canSoftDelete: permission.canSoftDeleteObjectRecords === true,
     });
   }

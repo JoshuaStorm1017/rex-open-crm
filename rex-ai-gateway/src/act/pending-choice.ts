@@ -1,7 +1,7 @@
 import type { ToolCall } from './types';
 
 export type PendingChoice = {
-  kind: 'update' | 'note';
+  kind: 'update' | 'note' | 'archive';
   objectName: 'person' | 'company' | 'opportunity';
   field: string;
   value: string | number;
@@ -11,6 +11,7 @@ export type PendingChoice = {
   candidates: Array<{
     id: string;
     label: string;
+    detail?: string;
     etag: string;
   }>;
   createTools?: ToolCall[];

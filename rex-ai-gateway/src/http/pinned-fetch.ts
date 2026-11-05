@@ -2,7 +2,7 @@ import { lookup } from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 
-import { assertConnectableHost, isBlockedIp } from './public-url';
+import { assertConnectableHost, assertNoCleartextToPublicHost, isBlockedIp } from './public-url';
 
 const PIN_TTL_MS = 30_000;
 
@@ -30,6 +30,10 @@ export async function fetchWithPinnedDns(
   label = 'URL',
   lookupImpl: PinLookup = lookup,
 ): Promise<Response> {
+  if (label === 'REX_AI_BASE_URL') {
+    assertNoCleartextToPublicHost(url, label);
+  }
+
   const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
 
   if (fetchImpl !== fetch) {

@@ -224,6 +224,14 @@ describe('readLlmConfigFromEnv', () => {
         REX_AI_MODEL: 'mock-model',
       }),
     ).toThrow(/non-public|local/);
+    expect(() =>
+      readLlmConfigFromEnv({
+        REX_AI_PROVIDER: 'openai',
+        REX_AI_BASE_URL: 'http://llm.example/v1',
+        REX_AI_API_KEY: 'test-llm-key',
+        REX_AI_MODEL: 'mock-model',
+      }),
+    ).toThrow(/https/);
     expect(
       readLlmConfigFromEnv({
         REX_AI_PROVIDER: 'openai',

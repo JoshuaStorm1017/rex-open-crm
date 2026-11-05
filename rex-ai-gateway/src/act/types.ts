@@ -7,6 +7,7 @@ export const ALLOWED_TOOL_NAMES = [
   'create_note',
   'search_records',
   'update_record',
+  'archive_record',
 ] as const;
 
 export type AllowedToolName = (typeof ALLOWED_TOOL_NAMES)[number];
@@ -75,7 +76,13 @@ export type UpdatedToolResult = {
   record: CreatedRecord;
 };
 
-export type ToolResult = CreatedToolResult | SearchToolResult | UpdatedToolResult;
+export type ArchivedToolResult = {
+  tool: 'archive_record';
+  status: 'archived';
+  record: CreatedRecord;
+};
+
+export type ToolResult = CreatedToolResult | SearchToolResult | UpdatedToolResult | ArchivedToolResult;
 
 export type ActEffect =
   | {
@@ -90,6 +97,12 @@ export type ActEffect =
       id: string;
       field: string;
       previous: string | number | null;
+      etag: string;
+    }
+  | {
+      kind: 'archived';
+      objectName: 'person' | 'company' | 'opportunity';
+      id: string;
       etag: string;
     };
 
@@ -121,6 +134,7 @@ export type PlanChoice = {
     label: string;
     objectName: 'person' | 'company' | 'opportunity';
     action: 'use' | 'create';
+    detail?: string;
   }>;
 };
 

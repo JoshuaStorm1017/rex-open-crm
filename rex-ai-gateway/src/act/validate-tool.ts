@@ -5,6 +5,7 @@ import type {
   CreatePersonInput,
   TwentyObjectName,
 } from '../twenty/twenty-crm-client';
+import { canonicalLinkedinUrl } from '../twenty/linkedin-url';
 import { canonicalOpportunityStage } from '../twenty/opportunity-stages';
 import { parsePhone } from '../twenty/parse-phone';
 import { isSafeSearchQuery } from '../twenty/safe-search';
@@ -40,6 +41,14 @@ export type UpdateRecordToolInput = {
   useOpenRecord?: boolean;
 };
 
+export type ArchiveRecordToolInput = {
+  objectName: UpdatableObjectName;
+  id?: string;
+  query?: string;
+  ifMatch?: string;
+  useOpenRecord?: boolean;
+};
+
 export type ValidatedTool =
   | { name: 'create_person'; input: Omit<CreatePersonInput, 'workspaceId'> }
   | { name: 'create_company'; input: Omit<CreateCompanyInput, 'workspaceId'> }
@@ -52,7 +61,8 @@ export type ValidatedTool =
       input: Omit<CreateNoteInput, 'workspaceId'> & { useOpenRecord?: boolean };
     }
   | { name: 'search_records'; input: SearchRecordsToolInput }
-  | { name: 'update_record'; input: UpdateRecordToolInput };
+  | { name: 'update_record'; input: UpdateRecordToolInput }
+  | { name: 'archive_record'; input: ArchiveRecordToolInput };
 
 const DEFAULT_OPPORTUNITY_STAGE = 'NEW';
 
@@ -100,6 +110,8 @@ export function validateTool(
       return validateSearch(tool.args);
     case 'update_record':
       return validateUpdate(tool.args);
+    case 'archive_record':
+      return validateArchive(tool.args);
   }
 }
 
@@ -136,6 +148,11 @@ function validatePerson(
     return phone;
   }
 
+  const linkedin = optionalLinkedin(args, 'create_person');
+  if (isRefusal(linkedin)) {
+    return linkedin;
+  }
+
   return {
     name: 'create_person',
     input: {
@@ -144,6 +161,7 @@ function validatePerson(
       ...(email ? { email } : {}),
       ...(jobTitle ? { jobTitle } : {}),
       ...(phone ? { phone } : {}),
+      ...(linkedin ? { linkedin } : {}),
       ...(companyId ? { companyId } : {}),
     },
   };
@@ -162,11 +180,42 @@ function validateCompany(
     return domain;
   }
 
+  const website = optionalString(args, 'create_company', 'website');
+  if (isRefusal(website)) {
+    return website;
+  }
+
+  if (domain && website && domain !== website) {
+    return refusal('invalid_request', 'create_company domain and website must be the same link.', {
+      toolName: 'create_company',
+    });
+  }
+
+  const linkedin = optionalLinkedin(args, 'create_company');
+  if (isRefusal(linkedin)) {
+    return linkedin;
+  }
+
+  const address = optionalPlainText(args, 'create_company', 'address');
+  if (isRefusal(address)) {
+    return address;
+  }
+
+  const city = optionalPlainText(args, 'create_company', 'city');
+  if (isRefusal(city)) {
+    return city;
+  }
+
+  const link = domain ?? website;
+
   return {
     name: 'create_company',
     input: {
       name,
-      ...(domain ? { domain } : {}),
+      ...(link ? { domain: link } : {}),
+      ...(linkedin ? { linkedin } : {}),
+      ...(address ? { address } : {}),
+      ...(city ? { city } : {}),
     },
   };
 }
@@ -206,6 +255,14 @@ function validateOpportunity(
   const closeDate = optionalString(args, 'create_opportunity', 'closeDate');
   if (isRefusal(closeDate)) {
     return closeDate;
+  }
+
+  if (closeDate && !isCalendarDate(closeDate)) {
+    return refusal(
+      'invalid_request',
+      'create_opportunity closeDate must be a calendar date, YYYY-MM-DD.',
+      { toolName: 'create_opportunity' },
+    );
   }
 
   const amount = optionalAmount(args);
@@ -388,6 +445,73 @@ function validateUpdate(args: Record<string, unknown>): ValidatedTool | ActRefus
   };
 }
 
+function validateArchive(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+  const objectName = requireObjectName(args, 'archive_record');
+
+  if (typeof objectName !== 'string') {
+    return objectName;
+  }
+
+  const id = optionalString(args, 'archive_record', 'id');
+
+  if (isRefusal(id)) {
+    return id;
+  }
+
+  const query = optionalString(args, 'archive_record', 'query');
+
+  if (isRefusal(query)) {
+    return query;
+  }
+
+  const useOpenRecord = readOpenRecordFlag(args, 'archive_record');
+
+  if (typeof useOpenRecord !== 'boolean') {
+    return useOpenRecord;
+  }
+
+  if (!id && !query && !useOpenRecord) {
+    return refusal(
+      'missing_required_fields',
+      'Refusing archive_record: missing required fields: id.',
+      { toolName: 'archive_record', missingFields: ['id'] },
+    );
+  }
+
+  if (id && !RECORD_ID_PATTERN.test(id)) {
+    return invalidField('archive_record', 'id');
+  }
+
+  if (query && !isSafeSearchQuery(query)) {
+    return refusal(
+      'invalid_request',
+      'archive_record query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      { toolName: 'archive_record' },
+    );
+  }
+
+  const ifMatch = optionalString(args, 'archive_record', 'ifMatch');
+
+  if (isRefusal(ifMatch)) {
+    return ifMatch;
+  }
+
+  if (ifMatch && !IF_MATCH_PATTERN.test(ifMatch)) {
+    return invalidField('archive_record', 'ifMatch');
+  }
+
+  return {
+    name: 'archive_record',
+    input: {
+      objectName,
+      ...(id && !useOpenRecord ? { id } : {}),
+      ...(query && !id && !useOpenRecord ? { query } : {}),
+      ...(ifMatch ? { ifMatch } : {}),
+      ...(useOpenRecord ? { useOpenRecord: true } : {}),
+    },
+  };
+}
+
 function optionalStage(
   args: Record<string, unknown>,
   toolName: AllowedToolName,
@@ -409,6 +533,60 @@ function optionalStage(
   }
 
   return canonical;
+}
+
+function optionalLinkedin(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName,
+): string | undefined | ActRefusal {
+  const linkedin = optionalString(args, toolName, 'linkedin');
+
+  if (isRefusal(linkedin) || linkedin === undefined) {
+    return linkedin;
+  }
+
+  const canonical = canonicalLinkedinUrl(linkedin);
+
+  if (!canonical) {
+    return refusal(
+      'invalid_request',
+      `${toolName} linkedin must be a linkedin.com profile URL, for example https://www.linkedin.com/in/ada.`,
+      { toolName },
+    );
+  }
+
+  return canonical;
+}
+
+function optionalPlainText(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName,
+  key: string,
+): string | undefined | ActRefusal {
+  const value = optionalString(args, toolName, key);
+
+  if (isRefusal(value) || value === undefined) {
+    return value;
+  }
+
+  if (/[\u0000-\u001f]/.test(value)) {
+    return invalidField(toolName, key);
+  }
+
+  return value;
+}
+
+function isCalendarDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
 function optionalPhone(
@@ -637,6 +815,32 @@ function readUpdateValue(
     return stage;
   }
 
+  if (field === 'linkedin') {
+    const linkedin = canonicalLinkedinUrl(value);
+
+    if (!linkedin) {
+      return refusal(
+        'invalid_request',
+        'update_record linkedin must be a linkedin.com profile URL, for example https://www.linkedin.com/in/ada.',
+        { toolName: 'update_record' },
+      );
+    }
+
+    return linkedin;
+  }
+
+  if (field === 'closeDate' && !isCalendarDate(value)) {
+    return refusal(
+      'invalid_request',
+      'update_record closeDate must be a calendar date, YYYY-MM-DD.',
+      { toolName: 'update_record' },
+    );
+  }
+
+  if ((field === 'address' || field === 'city' || field === 'website' || field === 'domain') && /[\u0000-\u001f]/.test(value)) {
+    return invalidField('update_record', 'value');
+  }
+
   if (field === 'phone') {
     if (!parsePhone(value)) {
       return refusal(
@@ -762,8 +966,8 @@ function readString(
 }
 
 const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
-  create_person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone', 'companyId'],
-  create_company: ['name', 'domain'],
+  create_person: ['firstName', 'lastName', 'email', 'jobTitle', 'phone', 'linkedin', 'companyId'],
+  create_company: ['name', 'domain', 'website', 'linkedin', 'address', 'city'],
   create_opportunity: [
     'name',
     'amount',
@@ -776,6 +980,7 @@ const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
   create_note: ['title', 'body', 'targetObject', 'targetId', 'targetQuery', 'recordRef'],
   search_records: ['object', 'query', 'limit'],
   update_record: ['object', 'id', 'query', 'field', 'value', 'ifMatch', 'recordRef'],
+  archive_record: ['object', 'id', 'query', 'ifMatch', 'recordRef'],
 };
 
 function rejectUnknownArgs(

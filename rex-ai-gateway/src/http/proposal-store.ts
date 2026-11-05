@@ -10,6 +10,7 @@ const MAX_PROPOSALS = 200;
 export type ChoiceCandidate = {
   id: string;
   label: string;
+  detail?: string;
   etag: string;
 };
 
@@ -141,6 +142,17 @@ export class ProposalStore {
 }
 
 function toolFromChoice(choice: PendingChoice, candidate: ChoiceCandidate): ToolCall {
+  if (choice.kind === 'archive') {
+    return {
+      name: 'archive_record',
+      args: {
+        object: choice.objectName,
+        id: candidate.id,
+        ifMatch: candidate.etag,
+      },
+    };
+  }
+
   if (choice.kind === 'note') {
     return {
       name: 'create_note',

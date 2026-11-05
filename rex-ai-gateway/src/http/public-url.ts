@@ -68,7 +68,38 @@ export function assertPublicProviderBaseUrl(baseUrl: string): URL {
     throw new Error('REX_AI_BASE_URL must not target a non-public address.');
   }
 
+  // Loopback is already refused above. Any remaining http host would carry the API key in cleartext.
+  if (parsed.protocol === 'http:') {
+    throw new Error(
+      'REX_AI_BASE_URL must use https. Cleartext http is only allowed for a loopback host.',
+    );
+  }
+
   return parsed;
+}
+
+const CLEARTEXT_LOOPBACK = new Set(['localhost', '127.0.0.1', '::1']);
+
+export function assertNoCleartextToPublicHost(url: string, label: string): void {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${label} must be an http(s) URL.`);
+  }
+
+  if (parsed.protocol !== 'http:') {
+    return;
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+
+  if (CLEARTEXT_LOOPBACK.has(hostname)) {
+    return;
+  }
+
+  throw new Error(`${label} must use https. Cleartext http is only allowed for a loopback host.`);
 }
 
 export async function assertProviderHostIsPublic(hostname: string): Promise<void> {

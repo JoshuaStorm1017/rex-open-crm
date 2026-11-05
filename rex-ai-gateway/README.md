@@ -75,7 +75,7 @@ Refusals are HTTP 400 with `refused: true` and a `reason`:
 | `missing_required_fields` | a required arg is blank or absent |
 | `cross_workspace` | an arg names a workspace other than `workspaceId`, or the request workspace is not the one this process is bound to |
 | `unmapped_intent` | the intent is not one of the sentences the planner knows |
-| `unsafe_intent` | the planner refuses a delete, export, or credential request |
+| `unsafe_intent` | the planner refuses a hard delete, export, or credential request |
 | `ambiguous_intent` | an update does not name exactly one record, or it says "this record" when none is open |
 | `forbidden` | the signed-in member's role cannot perform the tool (HTTP 403) |
 | `not_found` | the named record does not exist |
@@ -93,16 +93,19 @@ Only these tools run. Anything else is refused before the client is called.
 
 | tool | required | optional |
 | --- | --- | --- |
-| `create_person` | `firstName`, `lastName` | `email`, `jobTitle`, `phone` (`+1 4155550134`), `companyId` (`$n` may point at an earlier create or update) |
-| `create_company` | `name` | `domain` |
+| `create_person` | `firstName`, `lastName` | `email`, `jobTitle`, `phone` (`+1 4155550134`), `linkedin`, `companyId` (`$n` may point at an earlier create or update) |
+| `create_company` | `name` | `domain` or `website`, `linkedin`, `address`, `city` |
 | `create_opportunity` | `name` | `amount`, `currencyCode` (default `USD` when amount is set), `stage` (`NEW`, `SCREENING`, `MEETING`, `PROPOSAL`, or `CUSTOMER`; default `NEW`), `companyId`, `pointOfContactId`, `closeDate` |
 | `create_note` | `body`, `targetObject` | `title`, `targetId` or `targetQuery` (`$n` may point at an earlier create or update) |
 | `search_records` | `object` (`person`, `company`, or `opportunity`), `query` | `limit` (1–20, default 10) |
 | `update_record` | `object`, `field`, `value`, and either `id` or `query` | `ifMatch` (filled from the current record when the preview can load it) |
+| `archive_record` | `object`, and either `id` or `query` | `ifMatch` (filled from the current record). Soft-delete only |
 
 `GET /v1/ai/tools` returns the same allowlist as JSON Schema for an external agent. It uses the same bearer check as act and audit. `ifMatch` is the record etag (`v1` on the mock, `updatedAt` from Twenty). A mismatch is HTTP 412 and does not write. Twenty's REST API ignores an `If-Match` header, so the HTTP client sends the etag as `updatedAt[eq]` on an update-many filter. Zero matched rows means nothing was written.
 
-Writable fields: person `firstName`, `lastName`, `email`, `jobTitle`, `phone`; company `name`, `domain`, `accountOwner` (also accepted as `owner`); opportunity `name`, `stage`, `amount`, `owner`. `stage` must be one of the Twenty opportunity values above. `owner` and `accountOwner` are `me` (the signed-in member) or a workspace member id. `phone` is a calling code the gateway knows (`+1`, `+33`, `+44`, `+49`, `+61`) plus the national number.
+Writable fields: person `firstName`, `lastName`, `email`, `jobTitle`, `phone`, `linkedin`; company `name`, `domain`, `website` (the same link as `domain`), `linkedin`, `address` (street), `city`, `accountOwner` (also accepted as `owner`); opportunity `name`, `stage`, `amount`, `closeDate`, `owner`. `stage` must be one of the Twenty opportunity values above. `closeDate` is `YYYY-MM-DD`. `linkedin` is a `linkedin.com` URL and is stored as `https`. `owner` and `accountOwner` are `me` (the signed-in member) or a workspace member id. `phone` is a calling code the gateway knows (`+1`, `+33`, `+44`, `+49`, `+61`) plus the national number.
+
+`archive_record` soft-deletes a person, company, or opportunity (`DELETE` with `soft_delete=true`, or the GraphQL `delete` mutation). It does not destroy the row. Undo of an archive calls Twenty's restore route. Hard delete stays refused.
 
 Search text is allowlisted before it is placed in a REST filter: 1–80 letters, numbers, spaces, or `. @ ' + -`. Quotes, brackets, commas, and LIKE wildcards are rejected, and the value is JSON-quoted rather than concatenated. GraphQL search already uses variables.
 
@@ -155,7 +158,7 @@ npm run start:twenty
 | `REX_AI_STATE_PATH` | SQLite file for previews, idempotency, and audit. Default `data/gateway-state.sqlite` in the gateway directory. Survives a restart |
 | `REX_AI_CORS_ORIGINS` | Comma-separated browser origins. Unset allows `http://localhost:3001`, `http://127.0.0.1:3001`, `http://localhost:3000`, and `http://127.0.0.1:3000`. Credentialed responses set `Access-Control-Allow-Credentials` only for an allowlisted origin |
 | `REX_AI_PROVIDER` | `mock` (default) or `openai`. Tests and `npm start` stay on `mock` |
-| `REX_AI_BASE_URL` | Public OpenAI-compatible origin, required when the provider is `openai`. Private, loopback, and metadata hosts are refused. DNS is pinned before the key is sent, and redirects are not followed |
+| `REX_AI_BASE_URL` | Public OpenAI-compatible **https** origin, required when the provider is `openai`. Cleartext `http` to a non-loopback host is refused so the API key is not sent in cleartext. Private, loopback, and metadata hosts are refused. DNS is pinned before the key is sent, and redirects are not followed |
 | `REX_AI_API_KEY` | Provider key. Read from the environment only. Never commit it, and never put it in `window._env_` |
 | `REX_AI_MODEL` | Model name, required when the provider is `openai` |
 
@@ -178,7 +181,7 @@ npm run start:twenty
 
 Leave `REX_AI_PROVIDER` unset, or set it to `mock`, to keep the deterministic planner. A public `TWENTY_API_URL` hostname is resolved and the connection is pinned to that address so a later DNS answer cannot move the member credential onto a private host. Loopback origins are not pinned.
 
-`GET /v1/ai/tools` returns only the tools the signed-in member can perform. Create follows Twenty's update permission, because there is no separate create flag. Search and update also require read. Notes require update on `note` and read on the target. Plan and act refuse a hidden tool with `forbidden` even if a model asks for it. When permissions cannot be read, the catalog is empty and nothing is proposed.
+`GET /v1/ai/tools` returns only the tools the signed-in member can perform. Create and update are separate gates. Twenty's object permission has no create flag, so the HTTP reader fills `canCreate` from `canUpdateObjectRecords`. A caller that supplies both can refuse creates while still allowing updates. Search and update also require read. Archive requires read and soft-delete, not update. Notes require create on `note` and read on the target. Field permissions stay out of scope. Plan and act refuse a hidden tool with `forbidden` even if a model asks for it. When permissions cannot be read, the catalog is empty and nothing is proposed.
 
 ## Plan, then confirm
 
@@ -207,11 +210,13 @@ add a note: Called the buyer
 
 The last two need `context` for the open record. "this deal" means the open opportunity.
 
-A named update that matches zero records is `not_found`. More than one person or company is a preview with one radio per match (the label includes the email or domain when it is known) and a "create new" choice. Confirm sends `choiceId`. `create_new` creates the person or company, then applies the note or the field change. Opportunities can be chosen but not created from that picker. Nothing is written until one choice is confirmed. Deletes, exports, and credential requests are `unsafe_intent`.
+A named update that matches zero records is `not_found`. More than one person, company, or opportunity is a preview with one radio per match. The name stays on the radio. The detail line shows email, domain, and city when those fields exist, or stage and amount for an opportunity. People and companies also get a "create new" choice. Confirm sends `choiceId`. `create_new` creates the person or company, then applies the note or the field change. Opportunities can be chosen but not created from that picker. Nothing is written until one choice is confirmed. Hard deletes, exports, and credential requests are `unsafe_intent`. `archive company named Acme` soft-deletes.
 
 On a record page the command bar sends `context: { objectName, recordId }` for the open person, company, or opportunity. The mock planner accepts "update this deal's stage to Proposal" and "add a note: …". The model is told to set `recordRef` to `open` and is not given the record id. The gateway loads the open record and substitutes its id before the preview is stored.
 
-A successful write returns `undo: { id, summary }` when the act created records or changed fields. `POST /v1/ai/undo` with that id and `confirmed: true` soft-deletes created records and writes the previous field values back, including clearing a field that was empty. The undo is audited as `undo`. Only the last reversible act for that member is kept. Search-only acts do not replace it.
+Before a real model plans, the gateway also loads a short list of records that the member can already read (up to five recent people, companies, and opportunities). The prompt contains a handle (`p1`, `c1`, `o1`), the label, and the same detail the picker shows. It does not contain the record id. The model may set `recordRef` to that handle. The gateway replaces the handle with the id it loaded. An id the model invents, and that the member did not type in the intent, is refused. A name query is still allowed when the record is not in the list, and several matches still open the picker.
+
+A successful write returns `undo: { id, summary }` when the act created records, changed fields, or archived a record. `POST /v1/ai/undo` with that id and `confirmed: true` soft-deletes created records, writes the previous field values back (including clearing a field that was empty), and restores an archived record. Created notes are compared to their etag first. If the note changed, nothing is deleted and the same undo id stays available for a retry. A conflicting field undo is kept the same way. The command bar leaves the Undo button in place and shows the refusal. The undo is audited as `undo`. Only the last reversible act for that member is kept. Search-only acts do not replace it.
 
 A multi-tool act is not a Twenty transaction. If a later tool fails, the gateway deletes the records created earlier in that act and restores updated fields to the value loaded before the write. When a rollback itself fails, the response is `partial_failure` (HTTP 409) and names the records that remain.
 

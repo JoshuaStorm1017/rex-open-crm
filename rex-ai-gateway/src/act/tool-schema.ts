@@ -10,6 +10,7 @@ export type ToolSchema = {
 
 export type ToolAudience = {
   canRead: ReadonlySet<TwentyObjectName>;
+  canCreate: ReadonlySet<TwentyObjectName | 'note'>;
   canUpdate: ReadonlySet<TwentyObjectName | 'note'>;
   canSoftDelete: ReadonlySet<TwentyObjectName | 'note'>;
 };
@@ -45,6 +46,7 @@ function fullCatalog(): ToolSchema[] {
             email: stringProperty('Primary email. Fictional addresses only in examples.'),
             jobTitle: stringProperty('Job title.'),
             phone: stringProperty('Primary phone, for example +1 4155550134.'),
+            linkedin: stringProperty('LinkedIn profile URL, for example https://www.linkedin.com/in/ada.'),
             companyId: stringProperty('Company record id, or $n for an earlier tool result.'),
           },
         },
@@ -58,7 +60,11 @@ function fullCatalog(): ToolSchema[] {
           required: ['name'],
           properties: {
             name: stringProperty('Company name.'),
-            domain: stringProperty('Domain or URL, stored as a link.'),
+            domain: stringProperty('Website domain or URL, stored as a link. Same field as website.'),
+            website: stringProperty('Company website. Same link as domain.'),
+            linkedin: stringProperty('Company LinkedIn URL, for example https://www.linkedin.com/company/acme.'),
+            address: stringProperty('Street address.'),
+            city: stringProperty('City.'),
           },
         },
       },
@@ -102,8 +108,8 @@ function fullCatalog(): ToolSchema[] {
             targetQuery: stringProperty('Name to search when targetId is omitted.'),
             recordRef: {
               type: 'string',
-              enum: ['open'],
-              description: 'Set to open to use the record on screen. Do not send an id.',
+              description:
+                'open for the record on screen, or a visible-record handle such as p1, c1, or o1. Do not send an id.',
             },
           },
         },
@@ -158,8 +164,32 @@ function fullCatalog(): ToolSchema[] {
             ifMatch: stringProperty('Current etag. The write is refused when it does not match.'),
             recordRef: {
               type: 'string',
-              enum: ['open'],
-              description: 'Set to open to use the record on screen. Do not send an id.',
+              description:
+                'open for the record on screen, or a visible-record handle such as p1, c1, or o1. Do not send an id.',
+            },
+          },
+        },
+      },
+      {
+        name: 'archive_record',
+        description:
+          'Soft-delete one person, company, or opportunity. Twenty keeps the row and sets deleted at. id, query, or recordRef is required. ifMatch is the record etag. Hard delete is not available.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['object'],
+          properties: {
+            object: {
+              type: 'string',
+              enum: ['person', 'company', 'opportunity'],
+            },
+            id: stringProperty('Record id from this workspace. Omit when query or recordRef is set.'),
+            query: stringProperty('Name fragment when the id is not known. Several matches become choices.'),
+            ifMatch: stringProperty('Current etag. The archive is refused when it does not match.'),
+            recordRef: {
+              type: 'string',
+              description:
+                'open for the record on screen, or a visible-record handle such as p1, c1, or o1. Do not send an id.',
             },
           },
         },
@@ -170,17 +200,19 @@ function fullCatalog(): ToolSchema[] {
 function isVisible(tool: ToolSchema, audience: ToolAudience): boolean {
   switch (tool.name) {
     case 'create_person':
-      return audience.canUpdate.has('person');
+      return audience.canCreate.has('person');
     case 'create_company':
-      return audience.canUpdate.has('company');
+      return audience.canCreate.has('company');
     case 'create_opportunity':
-      return audience.canUpdate.has('opportunity');
+      return audience.canCreate.has('opportunity');
     case 'create_note':
-      return audience.canUpdate.has('note') && readableNames(audience).length > 0;
+      return audience.canCreate.has('note') && readableNames(audience).length > 0;
     case 'search_records':
       return readableNames(audience).length > 0;
     case 'update_record':
       return updatableNames(audience).length > 0;
+    case 'archive_record':
+      return archivableNames(audience).length > 0;
   }
 }
 
@@ -191,6 +223,10 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
 
   if (tool.name === 'update_record') {
     return withEnum(tool, 'object', updatableNames(audience));
+  }
+
+  if (tool.name === 'archive_record') {
+    return withEnum(tool, 'object', archivableNames(audience));
   }
 
   if (tool.name === 'create_note') {
@@ -217,6 +253,12 @@ function readableNames(audience: ToolAudience): TwentyObjectName[] {
 function updatableNames(audience: ToolAudience): TwentyObjectName[] {
   return (['person', 'company', 'opportunity'] as const).filter(
     (name) => audience.canRead.has(name) && audience.canUpdate.has(name),
+  );
+}
+
+function archivableNames(audience: ToolAudience): TwentyObjectName[] {
+  return (['person', 'company', 'opportunity'] as const).filter(
+    (name) => audience.canRead.has(name) && audience.canSoftDelete.has(name),
   );
 }
 
