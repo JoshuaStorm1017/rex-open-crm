@@ -31,6 +31,11 @@ export type SearchRecordsToolInput = {
   limit: number;
 };
 
+export type SearchTimelineToolInput = {
+  query: string;
+  limit: number;
+};
+
 export type UpdateRecordToolInput = {
   objectName: UpdatableObjectName;
   id?: string;
@@ -61,7 +66,11 @@ export type ValidatedTool =
       input: Omit<CreateNoteInput, 'workspaceId'> & { useOpenRecord?: boolean };
     }
   | { name: 'search_records'; input: SearchRecordsToolInput }
+  | { name: 'search_notes'; input: SearchTimelineToolInput }
+  | { name: 'search_tasks'; input: SearchTimelineToolInput }
+  | { name: 'search_activities'; input: SearchTimelineToolInput }
   | { name: 'update_record'; input: UpdateRecordToolInput }
+  | { name: 'update_matching_records'; input: UpdateRecordToolInput }
   | { name: 'archive_record'; input: ArchiveRecordToolInput };
 
 const DEFAULT_OPPORTUNITY_STAGE = 'NEW';
@@ -108,8 +117,14 @@ export function validateTool(
       return validateNote(tool.args);
     case 'search_records':
       return validateSearch(tool.args);
+    case 'search_notes':
+    case 'search_tasks':
+    case 'search_activities':
+      return validateTimelineSearch(tool.name, tool.args);
     case 'update_record':
       return validateUpdate(tool.args);
+    case 'update_matching_records':
+      return validateBulkUpdate(tool.args);
     case 'archive_record':
       return validateArchive(tool.args);
   }
@@ -333,6 +348,86 @@ function validateSearch(args: Record<string, unknown>): ValidatedTool | ActRefus
       objectName,
       query,
       limit: limit ?? 10,
+    },
+  };
+}
+
+function validateTimelineSearch(
+  toolName: 'search_notes' | 'search_tasks' | 'search_activities',
+  args: Record<string, unknown>,
+): ValidatedTool | ActRefusal {
+  const query = requireString(args, toolName, 'query');
+
+  if (typeof query !== 'string') {
+    return query;
+  }
+
+  if (!isSafeSearchQuery(query)) {
+    return refusal(
+      'invalid_request',
+      `${toolName} query must be 1–80 letters, numbers, spaces, or . @ ' + -, with no filter syntax or LIKE wildcards.`,
+      { toolName },
+    );
+  }
+
+  const limit = optionalLimit(args, toolName);
+
+  if (isRefusal(limit)) {
+    return limit;
+  }
+
+  return {
+    name: toolName,
+    input: {
+      query,
+      limit: limit ?? 10,
+    },
+  };
+}
+
+function validateBulkUpdate(args: Record<string, unknown>): ValidatedTool | ActRefusal {
+  const update = validateUpdate({ ...args, id: 'bulk' });
+
+  if (isRefusal(update)) {
+    return refusal(update.reason, update.message.replaceAll('update_record', 'update_matching_records'), {
+      toolName: 'update_matching_records',
+      missingFields: update.missingFields,
+    });
+  }
+
+  if (update.name !== 'update_record') {
+    return update;
+  }
+
+  const query = optionalString(args, 'update_matching_records', 'query');
+
+  if (isRefusal(query)) {
+    return query;
+  }
+
+  if (!query) {
+    return refusal(
+      'missing_required_fields',
+      'Refusing update_matching_records: missing required fields: query.',
+      { toolName: 'update_matching_records', missingFields: ['query'] },
+    );
+  }
+
+  if (!isSafeSearchQuery(query)) {
+    return refusal(
+      'invalid_request',
+      'update_matching_records query must be 1–80 letters, numbers, spaces, or . @ \' + -, with no filter syntax or LIKE wildcards.',
+      { toolName: 'update_matching_records' },
+    );
+  }
+
+  return {
+    name: 'update_matching_records',
+    input: {
+      objectName: update.input.objectName,
+      query,
+      field: update.input.field,
+      value: update.input.value,
     },
   };
 }
@@ -742,7 +837,10 @@ function optionalRelationId(
   return read;
 }
 
-function optionalLimit(args: Record<string, unknown>): number | undefined | ActRefusal {
+function optionalLimit(
+  args: Record<string, unknown>,
+  toolName: AllowedToolName = 'search_records',
+): number | undefined | ActRefusal {
   if (!Object.prototype.hasOwnProperty.call(args, 'limit') || args.limit == null) {
     return undefined;
   }
@@ -752,8 +850,8 @@ function optionalLimit(args: Record<string, unknown>): number | undefined | ActR
   if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 20) {
     return refusal(
       'invalid_request',
-      'search_records limit must be an integer from 1 to 20.',
-      { toolName: 'search_records' },
+      `${toolName} limit must be an integer from 1 to 20.`,
+      { toolName },
     );
   }
 
@@ -979,7 +1077,11 @@ const TOOL_ARG_KEYS: Record<AllowedToolName, readonly string[]> = {
   ],
   create_note: ['title', 'body', 'targetObject', 'targetId', 'targetQuery', 'recordRef'],
   search_records: ['object', 'query', 'limit'],
+  search_notes: ['query', 'limit'],
+  search_tasks: ['query', 'limit'],
+  search_activities: ['query', 'limit'],
   update_record: ['object', 'id', 'query', 'field', 'value', 'ifMatch', 'recordRef'],
+  update_matching_records: ['object', 'query', 'field', 'value'],
   archive_record: ['object', 'id', 'query', 'ifMatch', 'recordRef'],
 };
 

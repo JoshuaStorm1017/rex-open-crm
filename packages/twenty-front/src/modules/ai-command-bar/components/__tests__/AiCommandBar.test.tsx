@@ -778,6 +778,65 @@ describe('side panel and several choices', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled();
   });
+
+  it('shows tool calls while the model is planning, then settles into confirm', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const fetchImpl = jest.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: partial\ndata: ${JSON.stringify({
+                partial: true,
+                lines: [
+                  {
+                    tool: 'create_company',
+                    summary: 'Planning create_company…',
+                  },
+                ],
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+
+      return {
+        headers: {
+          get: () => 'text/event-stream',
+        },
+        body: stream,
+      } as Response;
+    });
+
+    renderBar(fetchImpl, true);
+    await user.type(screen.getByRole('textbox', { name: 'Command' }), INTENT);
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+
+    expect(
+      await screen.findByText('Planning create_company…'),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm' }),
+    ).not.toBeInTheDocument();
+
+    streamController?.enqueue(
+      encoder.encode(`event: proposal\ndata: ${JSON.stringify(proposal)}\n\n`),
+    );
+    streamController?.close();
+
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Create company "Acme Corp".')).toBeInTheDocument();
+    expect(
+      screen.queryByText('Planning create_company…'),
+    ).not.toBeInTheDocument();
+  });
 });
 
 describe('readOpenRecordFromPath', () => {

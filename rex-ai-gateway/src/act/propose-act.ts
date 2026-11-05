@@ -11,6 +11,7 @@ import { loadVisibleSnapshot, publicVisibleRecords } from './visible-snapshot';
 import type { ChoiceGroup, PendingBatch, PendingBatchStep, PendingChoice } from './pending-choice';
 import { assertToolPermitted, catalogForAudience, loadAudience, type AudienceLoad } from './permissions';
 import { describeTool, summarizeLines } from './describe-tool';
+import type { PartialToolCall } from '../llm/llm-provider';
 import { parseGatewayRequest, type OpenRecordContext } from './parse-request';
 import {
   MAX_TOOLS_PER_REQUEST,
@@ -31,6 +32,7 @@ export type ProposeActOptions = ExecuteActOptions & {
   proposals?: ProposalStore;
   memberId?: string;
   actorMemberId?: string;
+  onPartial?: (tools: PartialToolCall[]) => void;
 };
 
 export async function proposeAct(
@@ -74,16 +76,20 @@ export async function proposeAct(
 
   let planned;
   const snapshot = await loadVisibleSnapshot(client, parsed.workspaceId, audience);
+  const planInput = {
+    intent: parsed.intent,
+    workspaceId: parsed.workspaceId,
+    client,
+    catalog,
+    visibleRecords: publicVisibleRecords(snapshot),
+    ...(openRecord ? { openRecord: { objectName: openRecord.objectName, label: openRecord.label } } : {}),
+  };
 
   try {
-    planned = await llm.plan({
-      intent: parsed.intent,
-      workspaceId: parsed.workspaceId,
-      client,
-      catalog,
-      visibleRecords: publicVisibleRecords(snapshot),
-      ...(openRecord ? { openRecord: { objectName: openRecord.objectName, label: openRecord.label } } : {}),
-    });
+    planned =
+      options.onPartial && llm.planStream
+        ? await llm.planStream(planInput, options.onPartial)
+        : await llm.plan(planInput);
   } catch (error) {
     return upstreamFailure(error, 0);
   }
@@ -192,9 +198,16 @@ async function previewTools(
 
   const memberId = options.memberId ?? 'member_direct';
   const slots: PreviewSlot[] = [];
+  const bulkTools = new Set<ValidatedTool>();
 
   try {
-    for (const tool of validated) {
+    const expanded = await expandMatchingUpdates(client, workspaceId, validated, bulkTools);
+
+    if ('refused' in expanded) {
+      return expanded;
+    }
+
+    for (const tool of expanded) {
       const named = await resolveNamedRecord(client, workspaceId, tool);
 
       if ('refused' in named) {
@@ -237,7 +250,7 @@ async function previewTools(
   }
 
   if (choiceCount > 0) {
-    return storeBatch(workspaceId, memberId, slots, options.proposals);
+    return storeBatch(workspaceId, memberId, slots, options.proposals, bulkTools);
   }
 
   const lines: ProposalLine[] = [];
@@ -250,11 +263,64 @@ async function previewTools(
     }
 
     markChained(slot.tool, seenRecord);
-    lines.push(describeTool(slot.tool, slot.record));
+    lines.push(describeTool(slot.tool, slot.record, { disambiguate: bulkTools.has(slot.tool) }));
     normalized.push(toolCallFromValidated(slot.tool));
   }
 
   return storePreview(workspaceId, memberId, normalized, lines, options.proposals);
+}
+
+async function expandMatchingUpdates(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  tools: ValidatedTool[],
+  bulkTools: Set<ValidatedTool>,
+): Promise<ValidatedTool[] | ActRefusal> {
+  const expanded: ValidatedTool[] = [];
+
+  for (const tool of tools) {
+    if (tool.name !== 'update_matching_records') {
+      expanded.push(tool);
+      continue;
+    }
+
+    const matches = await client.searchRecords({
+      workspaceId,
+      objectName: tool.input.objectName,
+      query: tool.input.query ?? '',
+      limit: MAX_TOOLS_PER_REQUEST + 1,
+    });
+
+    if (matches.length === 0) {
+      return refusal('not_found', `No ${tool.input.objectName} matches “${tool.input.query ?? ''}”.`, {
+        toolName: tool.name,
+      });
+    }
+
+    if (matches.length > MAX_TOOLS_PER_REQUEST || expanded.length + matches.length > MAX_TOOLS_PER_REQUEST) {
+      return refusal(
+        'invalid_request',
+        `This matches ${matches.length} ${tool.input.objectName} records. A preview lists at most ${MAX_TOOLS_PER_REQUEST}. Narrow the query. Nothing was written.`,
+        { toolName: tool.name },
+      );
+    }
+
+    for (const match of matches) {
+      const update: ValidatedTool = {
+        name: 'update_record',
+        input: {
+          objectName: tool.input.objectName,
+          id: match.id,
+          field: tool.input.field,
+          value: tool.input.value,
+        },
+      };
+      bulkTools.add(update);
+      expanded.push(update);
+    }
+  }
+
+  return expanded;
 }
 
 function assignActor(tool: ValidatedTool, actorMemberId: string | undefined): ValidatedTool {
@@ -463,6 +529,28 @@ function toolCallFromValidated(tool: ValidatedTool): ToolCall {
     };
   }
 
+  if (tool.name === 'search_notes' || tool.name === 'search_tasks' || tool.name === 'search_activities') {
+    return {
+      name: tool.name,
+      args: {
+        query: tool.input.query,
+        limit: tool.input.limit,
+      },
+    };
+  }
+
+  if (tool.name === 'update_matching_records') {
+    return {
+      name: tool.name,
+      args: {
+        object: tool.input.objectName,
+        query: tool.input.query,
+        field: tool.input.field,
+        value: tool.input.value,
+      },
+    };
+  }
+
   if (tool.name === 'update_record') {
     return {
       name: tool.name,
@@ -539,6 +627,7 @@ function storeBatch(
   memberId: string,
   slots: PreviewSlot[],
   proposals: ProposalStore | undefined,
+  bulkTools: Set<ValidatedTool>,
 ): PlanResult {
   const groups: Array<ChoiceGroup & { key: string }> = [];
   const steps: PendingBatchStep[] = [];
@@ -548,7 +637,7 @@ function storeBatch(
   for (const slot of slots) {
     if (slot.type === 'ready') {
       markChained(slot.tool, seenRecord);
-      lines.push(describeTool(slot.tool, slot.record));
+      lines.push(describeTool(slot.tool, slot.record, { disambiguate: bulkTools.has(slot.tool) }));
       steps.push({ type: 'tool', tool: toolCallFromValidated(slot.tool) });
       continue;
     }

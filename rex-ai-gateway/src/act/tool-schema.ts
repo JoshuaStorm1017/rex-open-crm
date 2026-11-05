@@ -1,4 +1,4 @@
-import type { TwentyObjectName } from '../twenty/twenty-crm-client';
+import type { TimelineObjectName, TwentyObjectName } from '../twenty/twenty-crm-client';
 import { ALLOWED_TOOL_NAMES } from './types';
 import { UPDATABLE_FIELDS, type UpdatableObjectName } from './writable-fields';
 
@@ -13,6 +13,7 @@ export type ToolAudience = {
   canCreate: ReadonlySet<TwentyObjectName | 'note'>;
   canUpdate: ReadonlySet<TwentyObjectName | 'note'>;
   canSoftDelete: ReadonlySet<TwentyObjectName | 'note'>;
+  canReadTimeline: ReadonlySet<TimelineObjectName>;
   writableFields?: ReadonlyMap<TwentyObjectName, ReadonlySet<string>>;
   unreadableFields?: ReadonlyMap<TwentyObjectName, ReadonlySet<string>>;
   fieldPermissionsUnreadable?: ReadonlySet<TwentyObjectName>;
@@ -142,6 +143,63 @@ function fullCatalog(): ToolSchema[] {
         },
       },
       {
+        name: 'search_notes',
+        description:
+          'Find notes by title or body. Read-only. Twenty stores the body as markdown on bodyV2. The search runs only after confirm.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['query'],
+          properties: {
+            query: stringProperty('Text to match in the title or the note body. 1–80 characters, without filter punctuation.'),
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 20,
+              description: 'Maximum matches. Defaults to 10.',
+            },
+          },
+        },
+      },
+      {
+        name: 'search_tasks',
+        description:
+          'Find tasks by title or body. Read-only. The search runs only after confirm.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['query'],
+          properties: {
+            query: stringProperty('Text to match in the task title or body. 1–80 characters, without filter punctuation.'),
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 20,
+              description: 'Maximum matches. Defaults to 10.',
+            },
+          },
+        },
+      },
+      {
+        name: 'search_activities',
+        description:
+          'Find timeline activities by the cached name of the linked record. Read-only. Twenty does not full-text index activity payloads, so this matches linkedRecordCachedName. The search runs only after confirm.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['query'],
+          properties: {
+            query: stringProperty('Text to match against the linked record name. 1–80 characters, without filter punctuation.'),
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 20,
+              description: 'Maximum matches. Defaults to 10.',
+            },
+          },
+        },
+      },
+      {
         name: 'update_record',
         description:
           'Update one allowlisted field. id or query is required. ifMatch is the record etag (If-Match). A mismatch does not write. Several updates of one record in one preview refresh If-Match after each write. owner and accountOwner accept "me" or a workspace member id. stage must be NEW, SCREENING, MEETING, PROPOSAL, or CUSTOMER. phone looks like +1 4155550134. Writable fields: ' +
@@ -167,6 +225,29 @@ function fullCatalog(): ToolSchema[] {
               type: 'string',
               description:
                 'open for the record on screen, or a visible-record handle such as p1, c1, or o1. Do not send an id.',
+            },
+          },
+        },
+      },
+      {
+        name: 'update_matching_records',
+        description:
+          'Update one allowlisted field on every record the query matches. The preview lists each record and the field. Confirm is still required. At most 8 records. A wider match is refused instead of updating a subset. Writable fields: ' +
+          writableFieldSummary() +
+          '.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['object', 'query', 'field', 'value'],
+          properties: {
+            object: {
+              type: 'string',
+              enum: ['person', 'company', 'opportunity'],
+            },
+            query: stringProperty('Name fragment. Every match is listed in the preview.'),
+            field: stringProperty('One writable field for that object.'),
+            value: {
+              description: 'New value. amount is a number. Every other field is a string.',
             },
           },
         },
@@ -201,16 +282,26 @@ function fullCatalog(): ToolSchema[] {
 function isVisible(tool: ToolSchema, audience: ToolAudience): boolean {
   switch (tool.name) {
     case 'create_person':
-      return audience.canCreate.has('person');
+      return audience.canCreate.has('person') && requiredFieldsAllowed(audience, 'person', ['firstName', 'lastName']);
     case 'create_company':
-      return audience.canCreate.has('company');
+      return audience.canCreate.has('company') && requiredFieldsAllowed(audience, 'company', ['name']);
     case 'create_opportunity':
-      return audience.canCreate.has('opportunity');
+      return (
+        audience.canCreate.has('opportunity') &&
+        requiredFieldsAllowed(audience, 'opportunity', ['name', 'stage'])
+      );
     case 'create_note':
       return audience.canCreate.has('note') && readableNames(audience).length > 0;
     case 'search_records':
       return readableNames(audience).length > 0;
+    case 'search_notes':
+      return audience.canReadTimeline.has('note');
+    case 'search_tasks':
+      return audience.canReadTimeline.has('task');
+    case 'search_activities':
+      return audience.canReadTimeline.has('timelineActivity');
     case 'update_record':
+    case 'update_matching_records':
       return updatableNames(audience).length > 0;
     case 'archive_record':
       return archivableNames(audience).length > 0;
@@ -222,7 +313,7 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
     return withEnum(tool, 'object', readableNames(audience));
   }
 
-  if (tool.name === 'update_record') {
+  if (tool.name === 'update_record' || tool.name === 'update_matching_records') {
     const objects = updatableNames(audience);
     const description = tool.description.replace(
       /Writable fields:.*\.$/,
@@ -230,6 +321,10 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
     );
 
     return withEnum({ ...tool, description }, 'object', objects);
+  }
+
+  if (tool.name === 'create_person' || tool.name === 'create_company' || tool.name === 'create_opportunity') {
+    return narrowCreateFields(tool, audience);
   }
 
   if (tool.name === 'archive_record') {
@@ -241,6 +336,39 @@ function narrow(tool: ToolSchema, audience: ToolAudience): ToolSchema {
   }
 
   return tool;
+}
+
+const RELATION_CREATE_KEYS = new Set(['companyId', 'pointOfContactId', 'currencyCode']);
+
+function narrowCreateFields(tool: ToolSchema, audience: ToolAudience): ToolSchema {
+  const objectName =
+    tool.name === 'create_person' ? 'person' : tool.name === 'create_company' ? 'company' : 'opportunity';
+  const allowed = new Set(writableFieldNames(audience, objectName));
+  const properties = isProperties(tool.inputSchema.properties) ? { ...tool.inputSchema.properties } : {};
+
+  for (const key of Object.keys(properties)) {
+    if (RELATION_CREATE_KEYS.has(key)) {
+      continue;
+    }
+
+    const field = key === 'website' ? 'domain' : key;
+
+    if (!allowed.has(field)) {
+      delete properties[key];
+    }
+  }
+
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties } };
+}
+
+function requiredFieldsAllowed(
+  audience: ToolAudience,
+  objectName: UpdatableObjectName,
+  required: string[],
+): boolean {
+  const allowed = new Set(writableFieldNames(audience, objectName));
+
+  return required.every((field) => allowed.has(field));
 }
 
 function withEnum(tool: ToolSchema, key: string, values: string[]): ToolSchema {

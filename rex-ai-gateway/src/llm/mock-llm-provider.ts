@@ -1,7 +1,7 @@
 import { mapIntentToTool } from '../act/map-intent';
 import { refusal, type ActRefusal, type ToolCall } from '../act/types';
 import type { TwentyObjectName } from '../twenty/twenty-crm-client';
-import type { LlmPlan, LlmPlanInput, LlmProvider } from './llm-provider';
+import type { LlmPlan, LlmPlanInput, LlmProvider, PartialToolCall } from './llm-provider';
 
 const UNSAFE_PATTERN =
   /^(?:delete|drop|destroy|wipe|remove|truncate|export|dump)\b|\b(?:password|api key|credential|access token)\b|\b(?:drop table|delete from)\b/i;
@@ -14,6 +14,16 @@ const NOTE_PATTERN =
 
 const SEARCH_PATTERN =
   /^(?:find|search) (?<object>people|persons|person|companies|company|opportunities|opportunity|deals) (?:named|called|for|matching) (?<query>.+)$/i;
+
+const SEARCH_NOTES_PATTERN = /^(?:find|search) notes? (?:about|matching|for|containing) (?<query>.+)$/i;
+
+const SEARCH_TASKS_PATTERN = /^(?:find|search) tasks? (?:about|matching|for|named|containing) (?<query>.+)$/i;
+
+const SEARCH_ACTIVITIES_PATTERN =
+  /^(?:find|search) activities (?:about|matching|for|on|linked to) (?<query>.+)$/i;
+
+const BULK_UPDATE_PATTERN =
+  /^update all (?<object>people|persons|person|companies|company|opportunities|opportunity|deals) named (?<query>.+?) set (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+)$/i;
 
 const THIS_UPDATE_PATTERN =
   /^(?:update|set|change) this (?<object>deal|opportunity|person|company|record)(?:['’]s)? (?<field>[A-Za-z][A-Za-z0-9]*) to (?<value>.+)$/i;
@@ -48,6 +58,30 @@ export function createMockLlmProvider(): LlmProvider {
   return {
     async plan(input) {
       return planDeterministic(input);
+    },
+    async planStream(input, emit) {
+      const planned = await planDeterministic(input);
+
+      if (!planned.ok) {
+        return planned;
+      }
+
+      const partials: PartialToolCall[] = [];
+
+      for (const tool of planned.tools) {
+        partials.push({ name: tool.name, args: {}, complete: false });
+        emit(partials.map((item) => ({ ...item, args: { ...item.args } })));
+        const current = partials[partials.length - 1];
+
+        if (current) {
+          current.args = tool.args;
+          current.complete = true;
+        }
+
+        emit(partials.map((item) => ({ ...item, args: { ...item.args } })));
+      }
+
+      return planned;
     },
   };
 }
@@ -163,6 +197,46 @@ async function planDeterministic(input: LlmPlanInput): Promise<LlmPlan> {
 
   if (thisNote?.groups?.body && (thisNote.groups.object || input.openRecord)) {
     return thisRecordNote(input, thisNote.groups);
+  }
+
+  const bulk = BULK_UPDATE_PATTERN.exec(text);
+
+  if (bulk?.groups?.object && bulk.groups.query && bulk.groups.field && bulk.groups.value) {
+    const field = bulk.groups.field;
+
+    return {
+      ok: true,
+      summary: `Update every ${bulk.groups.object} named ${trimValue(bulk.groups.query)}.`,
+      tools: [
+        {
+          name: 'update_matching_records',
+          args: {
+            object: objectNameFor(bulk.groups.object),
+            query: trimValue(bulk.groups.query),
+            field,
+            value: fieldValue(field, bulk.groups.value),
+          },
+        },
+      ],
+    };
+  }
+
+  const noteSearch = SEARCH_NOTES_PATTERN.exec(text);
+
+  if (noteSearch?.groups?.query) {
+    return timelineSearch('search_notes', 'notes', noteSearch.groups.query);
+  }
+
+  const taskSearch = SEARCH_TASKS_PATTERN.exec(text);
+
+  if (taskSearch?.groups?.query) {
+    return timelineSearch('search_tasks', 'tasks', taskSearch.groups.query);
+  }
+
+  const activitySearch = SEARCH_ACTIVITIES_PATTERN.exec(text);
+
+  if (activitySearch?.groups?.query) {
+    return timelineSearch('search_activities', 'activities', activitySearch.groups.query);
   }
 
   const search = SEARCH_PATTERN.exec(text);
@@ -422,6 +496,20 @@ function openObject(
   }
 
   return openRecord.objectName;
+}
+
+function timelineSearch(
+  name: 'search_notes' | 'search_tasks' | 'search_activities',
+  label: string,
+  query: string,
+): LlmPlan {
+  const trimmed = trimValue(query);
+
+  return {
+    ok: true,
+    summary: `Search ${label} for ${trimmed}.`,
+    tools: [{ name, args: { query: trimmed } }],
+  };
 }
 
 function updateTool(groups: Record<string, string | undefined>): ToolCall {

@@ -7,7 +7,7 @@ import type {
 } from './twenty-crm-client';
 
 export function labelFromProperties(
-  objectName: TwentyObjectName | 'note',
+  objectName: CreatedRecord['objectName'],
   properties: Record<string, string | number>,
 ): string {
   if (objectName === 'person') {
@@ -33,6 +33,55 @@ export function labelFromProperties(
   }
 
   return objectName;
+}
+
+export function activityRecordFromTwenty(
+  objectName: 'note' | 'task' | 'timelineActivity',
+  workspaceId: string,
+  raw: unknown,
+): CreatedRecord | undefined {
+  if (!isRecord(raw) || typeof raw.id !== 'string' || raw.id.length === 0) {
+    return undefined;
+  }
+
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const body = readMarkdown(raw.bodyV2).replace(/\s+/g, ' ').trim().slice(0, 240);
+  const linkedName = typeof raw.linkedRecordCachedName === 'string' ? raw.linkedRecordCachedName.trim() : '';
+  const label = title || linkedName || body || raw.id;
+  const properties: Record<string, string | number> = {};
+
+  if (title) {
+    properties.title = title;
+  }
+
+  if (body) {
+    properties.body = body;
+  }
+
+  if (linkedName) {
+    properties.name = linkedName;
+  }
+
+  return {
+    id: raw.id,
+    objectName,
+    workspaceId,
+    properties,
+    etag: readEtag(raw),
+    label,
+  };
+}
+
+function readMarkdown(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (isRecord(value) && typeof value.markdown === 'string') {
+    return value.markdown;
+  }
+
+  return '';
 }
 
 export function readEtag(value: unknown): string {

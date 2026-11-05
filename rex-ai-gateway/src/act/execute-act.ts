@@ -116,6 +116,14 @@ export async function executeAct(
       );
     }
 
+    if (result.name === 'update_matching_records') {
+      return refusal(
+        'confirmation_required',
+        'A bulk update is stored as one write per record. Propose it again so the preview lists every target.',
+        { toolName: result.name },
+      );
+    }
+
     validated.push(result);
   }
 
@@ -354,6 +362,20 @@ async function dispatch(
       const records = await client.searchRecords({ ...tool.input, workspaceId });
       return { tool: tool.name, status: 'found', records };
     }
+    case 'search_notes': {
+      const records = await client.searchNotes({ ...tool.input, workspaceId });
+      return { tool: tool.name, status: 'found', records };
+    }
+    case 'search_tasks': {
+      const records = await client.searchTasks({ ...tool.input, workspaceId });
+      return { tool: tool.name, status: 'found', records };
+    }
+    case 'search_activities': {
+      const records = await client.searchActivities({ ...tool.input, workspaceId });
+      return { tool: tool.name, status: 'found', records };
+    }
+    case 'update_matching_records':
+      throw new Error('update_matching_records must be expanded before confirm.');
     case 'update_record': {
       const ifMatch = tool.input.ifMatch;
 
@@ -405,10 +427,18 @@ function withFreshEtag<TTool extends ValidatedTool & { name: 'update_record' | '
   tool: TTool,
   results: ToolResult[],
 ): TTool | ActRefusal {
-  const priorEtag = etagFromPriorWrite(tool.input.objectName, tool.input.id, results);
+  const prior = priorWrite(tool.input.objectName, tool.input.id, results);
 
-  if (priorEtag) {
-    return { ...tool, input: { ...tool.input, ifMatch: priorEtag } };
+  if (prior?.status === 'archived') {
+    return refusal(
+      'precondition_failed',
+      `Refusing ${tool.name}: ${tool.input.id ?? 'the record'} was archived earlier in this preview, so a later write was not sent.`,
+      { toolName: tool.name },
+    );
+  }
+
+  if (prior && prior.status !== 'found') {
+    return { ...tool, input: { ...tool.input, ifMatch: prior.record.etag } };
   }
 
   if (tool.input.ifMatch === 'chained') {
@@ -422,11 +452,11 @@ function withFreshEtag<TTool extends ValidatedTool & { name: 'update_record' | '
   return tool;
 }
 
-function etagFromPriorWrite(
+function priorWrite(
   objectName: string,
   id: string | undefined,
   results: ToolResult[],
-): string | undefined {
+): ToolResult | undefined {
   if (!id) {
     return undefined;
   }
@@ -439,7 +469,7 @@ function etagFromPriorWrite(
     }
 
     if (result.record.id === id && result.record.objectName === objectName) {
-      return result.record.etag;
+      return result;
     }
   }
 
@@ -476,6 +506,10 @@ function effectsFor(
   snapshot: CreatedRecord | undefined,
 ): ActEffect[] {
   if (result.status === 'created') {
+    if (result.record.objectName === 'task' || result.record.objectName === 'timelineActivity') {
+      return [];
+    }
+
     return [
       {
         kind: 'created',

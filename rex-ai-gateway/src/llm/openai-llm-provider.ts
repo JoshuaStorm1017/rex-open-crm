@@ -3,7 +3,7 @@ import { toolCatalog } from '../act/tool-schema';
 import { refusal, type ToolCall } from '../act/types';
 import { fetchWithPinnedDns } from '../http/pinned-fetch';
 import { assertPublicProviderBaseUrl } from '../http/public-url';
-import type { LlmPlan, LlmPlanInput, LlmProvider } from './llm-provider';
+import type { LlmPlan, LlmPlanInput, LlmProvider, PartialToolCall } from './llm-provider';
 import type { LlmConfig } from './read-llm-config';
 
 const REFUSAL_REASONS = new Set(['unsafe_intent', 'ambiguous_intent', 'unmapped_intent']);
@@ -57,6 +57,200 @@ export function createOpenAiLlmProvider(
 
       return parseModelPlan(text);
     },
+    async planStream(input, emit) {
+      const response = await fetchWithPinnedDns(
+        endpoint,
+        {
+          method: 'POST',
+          redirect: 'error',
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: config.model,
+            temperature: 0,
+            stream: true,
+            tool_choice: 'auto',
+            tools: (input.catalog ?? toolCatalog()).tools.map((tool) => ({
+              type: 'function',
+              function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.inputSchema,
+              },
+            })),
+            messages: [
+              { role: 'system', content: plannerSystemPrompt(input) },
+              { role: 'user', content: input.intent },
+            ],
+          }),
+          signal: AbortSignal.timeout(20_000),
+        },
+        fetchImpl,
+        'REX_AI_BASE_URL',
+      );
+
+      if (!response.ok) {
+        throw new Error(`LLM request failed with ${response.status}.`);
+      }
+
+      if (!response.body) {
+        throw new Error('LLM stream did not include a body.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = '';
+      const state = createStreamState();
+
+      while (true) {
+        const chunk = await reader.read();
+
+        if (chunk.done) {
+          break;
+        }
+
+        pending += decoder.decode(chunk.value, { stream: true });
+        const split = pending.split('\n');
+        pending = split.pop() ?? '';
+
+        for (const line of split) {
+          if (applyStreamLine(state, line)) {
+            emit(snapshotToolCalls(state));
+          }
+        }
+      }
+
+      if (pending.trim().length > 0 && applyStreamLine(state, pending)) {
+        emit(snapshotToolCalls(state));
+      }
+
+      return parseModelPlan(JSON.stringify(completionFromStream(state)));
+    },
+  };
+}
+
+type StreamState = {
+  calls: Map<number, { name: string; arguments: string }>;
+  content: string;
+};
+
+export function createStreamState(): StreamState {
+  return { calls: new Map(), content: '' };
+}
+
+export function applyStreamLine(state: StreamState, line: string): boolean {
+  const trimmed = line.trim();
+
+  if (!trimmed.startsWith('data:')) {
+    return false;
+  }
+
+  const data = trimmed.slice('data:'.length).trim();
+
+  if (data.length === 0 || data === '[DONE]') {
+    return false;
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return false;
+  }
+
+  return applyStreamDelta(state, parsed);
+}
+
+export function applyStreamDelta(state: StreamState, payload: unknown): boolean {
+  if (!isRecord(payload) || !Array.isArray(payload.choices)) {
+    return false;
+  }
+
+  const choice = payload.choices[0];
+
+  if (!isRecord(choice)) {
+    return false;
+  }
+
+  const delta = isRecord(choice.delta) ? choice.delta : undefined;
+
+  if (!delta) {
+    return false;
+  }
+
+  if (typeof delta.content === 'string' && delta.content.length > 0) {
+    state.content += delta.content;
+  }
+
+  if (!Array.isArray(delta.tool_calls)) {
+    return typeof delta.content === 'string' && delta.content.length > 0;
+  }
+
+  let changed = false;
+
+  for (const call of delta.tool_calls) {
+    if (!isRecord(call) || typeof call.index !== 'number' || !isRecord(call.function)) {
+      continue;
+    }
+
+    const current = state.calls.get(call.index) ?? { name: '', arguments: '' };
+
+    if (typeof call.function.name === 'string' && call.function.name.length > 0) {
+      current.name += call.function.name;
+      changed = true;
+    }
+
+    if (typeof call.function.arguments === 'string' && call.function.arguments.length > 0) {
+      current.arguments += call.function.arguments;
+      changed = true;
+    }
+
+    state.calls.set(call.index, current);
+  }
+
+  return changed;
+}
+
+export function snapshotToolCalls(state: StreamState): PartialToolCall[] {
+  return [...state.calls.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .flatMap(([, call]) => {
+      if (call.name.length === 0) {
+        return [];
+      }
+
+      const args = readArguments(call.arguments);
+
+      return [
+        {
+          name: call.name,
+          args: args ?? {},
+          complete: args !== undefined,
+        },
+      ];
+    });
+}
+
+function completionFromStream(state: StreamState): unknown {
+  return {
+    choices: [
+      {
+        message: {
+          content: state.content,
+          tool_calls: [...state.calls.entries()]
+            .sort((left, right) => left[0] - right[0])
+            .map(([, call]) => ({
+              function: {
+                name: call.name,
+                arguments: call.arguments,
+              },
+            })),
+        },
+      },
+    ],
   };
 }
 
@@ -68,6 +262,8 @@ export function plannerSystemPrompt(input: LlmPlanInput): string {
     'amount is major currency units. $50k means 50000.',
     'website is the company domain link. linkedin is a linkedin.com URL. city and address are the company address. closeDate is YYYY-MM-DD.',
     'A named record without a handle uses update_record query, archive_record query, or create_note targetQuery.',
+    'To change every match, call update_matching_records once. Do not invent ids. The preview lists each record.',
+    'search_notes matches note title and body. search_tasks matches task title and body. search_activities matches the linked record name.',
     'When the user means the open record, set recordRef to "open" and omit id and query. Never copy an id from the label.',
     'For a listed record, set recordRef to its handle. Never send the handle as an id, and never invent an id.',
   ];

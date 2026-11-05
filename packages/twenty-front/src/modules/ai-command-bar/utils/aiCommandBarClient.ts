@@ -73,6 +73,7 @@ export const proposeAiCommand = async (
   intent: string,
   fetchImpl: FetchImpl,
   openRecord?: AiOpenRecord,
+  onPartial?: (lines: AiProposalLine[]) => void,
 ): Promise<AiCommandOutcome<AiProposal>> => {
   const payload = await postAiCommand(
     config,
@@ -83,6 +84,8 @@ export const proposeAiCommand = async (
       ...(openRecord ? { context: openRecord } : {}),
     },
     fetchImpl,
+    undefined,
+    onPartial,
   );
 
   if (payload.kind === 'message') {
@@ -180,10 +183,15 @@ const postAiCommand = async (
   body: Record<string, unknown>,
   fetchImpl: FetchImpl,
   idempotencyKey?: string,
+  onPartial?: (lines: AiProposalLine[]) => void,
 ): Promise<AiCommandOutcome<unknown>> => {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
   };
+
+  if (onPartial) {
+    headers.accept = 'text/event-stream';
+  }
 
   if (idempotencyKey) {
     headers['idempotency-key'] = idempotencyKey;
@@ -205,6 +213,15 @@ const postAiCommand = async (
     };
   }
 
+  const contentType =
+    typeof response.headers?.get === 'function'
+      ? (response.headers.get('content-type') ?? '')
+      : '';
+
+  if (contentType.includes('text/event-stream')) {
+    return readPlanStream(response, onPartial);
+  }
+
   let payload: unknown;
 
   try {
@@ -224,6 +241,123 @@ const postAiCommand = async (
   }
 
   return { kind: 'data', data: payload };
+};
+
+const readPlanStream = async (
+  response: Response,
+  onPartial?: (lines: AiProposalLine[]) => void,
+): Promise<AiCommandOutcome<unknown>> => {
+  const body = response.body;
+
+  if (!body) {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an empty preview.',
+    };
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let proposal: unknown;
+  let failure: string | undefined;
+
+  while (true) {
+    const chunk = await reader.read();
+
+    if (chunk.done) {
+      break;
+    }
+
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+
+    for (const part of parts) {
+      const event = readSseEvent(part);
+
+      if (!event) {
+        continue;
+      }
+
+      if (event.name === 'partial') {
+        const lines = readPartialLines(event.data);
+
+        if (lines && onPartial) {
+          onPartial(lines);
+        }
+
+        continue;
+      }
+
+      if (event.name === 'proposal') {
+        proposal = event.data;
+        continue;
+      }
+
+      if (event.name === 'error') {
+        failure = readMessage(event.data);
+      }
+    }
+  }
+
+  if (proposal !== undefined) {
+    return { kind: 'data', data: proposal };
+  }
+
+  return {
+    kind: 'message',
+    message: failure ?? 'The preview ended before it could be confirmed.',
+  };
+};
+
+const readSseEvent = (
+  chunk: string,
+): { name: string; data: unknown } | undefined => {
+  let name = 'message';
+  const dataLines: string[] = [];
+
+  for (const line of chunk.split('\n')) {
+    if (line.startsWith('event:')) {
+      name = line.slice('event:'.length).trim();
+    }
+
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice('data:'.length).trim());
+    }
+  }
+
+  if (dataLines.length === 0) {
+    return undefined;
+  }
+
+  try {
+    return { name, data: JSON.parse(dataLines.join('\n')) };
+  } catch {
+    return undefined;
+  }
+};
+
+const readPartialLines = (payload: unknown): AiProposalLine[] | undefined => {
+  if (!isPlainObject(payload) || !Array.isArray(payload.lines)) {
+    return undefined;
+  }
+
+  const lines: AiProposalLine[] = [];
+
+  for (const line of payload.lines) {
+    if (
+      !isPlainObject(line) ||
+      typeof line.tool !== 'string' ||
+      typeof line.summary !== 'string'
+    ) {
+      return undefined;
+    }
+
+    lines.push({ tool: line.tool, summary: line.summary });
+  }
+
+  return lines;
 };
 
 const readProposal = (payload: unknown): AiProposal | undefined => {

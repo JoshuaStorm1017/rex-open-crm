@@ -40,6 +40,8 @@ export type CreateNoteInput = {
 
 export type TwentyObjectName = 'person' | 'company' | 'opportunity';
 
+export type TimelineObjectName = 'note' | 'task' | 'timelineActivity';
+
 export type DeletableObjectName = TwentyObjectName | 'note' | 'noteTarget';
 
 export type AddressFields = {
@@ -62,7 +64,7 @@ export type RecordComposites = {
 
 export type CreatedRecord = {
   id: string;
-  objectName: TwentyObjectName | 'note';
+  objectName: TwentyObjectName | TimelineObjectName;
   workspaceId: string;
   properties: Record<string, string | number>;
   etag: string;
@@ -73,6 +75,12 @@ export type CreatedRecord = {
 export type SearchRecordsInput = {
   workspaceId: string;
   objectName: TwentyObjectName;
+  query: string;
+  limit: number;
+};
+
+export type SearchTimelineInput = {
+  workspaceId: string;
   query: string;
   limit: number;
 };
@@ -124,7 +132,7 @@ export type ArchiveRecordInput = {
   ifMatch: string;
 };
 
-export type ObjectCapabilityName = TwentyObjectName | 'note';
+export type ObjectCapabilityName = TwentyObjectName | TimelineObjectName;
 
 export type FieldCapability = {
   name: string;
@@ -153,6 +161,9 @@ export type TwentyCrmClient = {
   createOpportunity: (input: CreateOpportunityInput) => Promise<CreatedRecord>;
   createNote: (input: CreateNoteInput) => Promise<CreatedRecord>;
   searchRecords: (input: SearchRecordsInput) => Promise<CreatedRecord[]>;
+  searchNotes: (input: SearchTimelineInput) => Promise<CreatedRecord[]>;
+  searchTasks: (input: SearchTimelineInput) => Promise<CreatedRecord[]>;
+  searchActivities: (input: SearchTimelineInput) => Promise<CreatedRecord[]>;
   listRecent: (input: ListRecentInput) => Promise<CreatedRecord[]>;
   getRecord: (input: GetRecordInput) => Promise<CreatedRecord>;
   getNote: (input: NoteLookupInput) => Promise<CreatedRecord>;

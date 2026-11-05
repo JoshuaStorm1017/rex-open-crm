@@ -576,8 +576,18 @@ describe('permission catalog', () => {
         ? catalog.tools.map((tool) => (isRecord(tool) ? tool.name : undefined))
         : [];
 
-    expect(names).toEqual(['create_company', 'search_records', 'update_record', 'archive_record']);
-    const update = isRecord(catalog) && Array.isArray(catalog.tools) ? catalog.tools[2] : undefined;
+    expect(names).toEqual([
+      'create_company',
+      'search_records',
+      'search_notes',
+      'update_record',
+      'update_matching_records',
+      'archive_record',
+    ]);
+    const update =
+      isRecord(catalog) && Array.isArray(catalog.tools)
+        ? catalog.tools.find((tool) => isRecord(tool) && tool.name === 'update_record')
+        : undefined;
     expect(update).toMatchObject({
       inputSchema: { properties: { object: { enum: ['company'] } } },
     });

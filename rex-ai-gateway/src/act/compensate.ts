@@ -6,13 +6,14 @@ import type { ActEffect, ActPartialFailure } from './types';
 export type CompensateFailure = {
   index: number;
   id: string;
-  reason: 'conflict' | 'error';
+  reason: 'conflict' | 'error' | 'superseded';
 };
 
 export async function compensate(
   client: TwentyCrmClient,
   workspaceId: string,
   effects: ActEffect[],
+  shouldContinue: () => boolean = () => true,
 ): Promise<CompensateFailure[]> {
   const remaining: CompensateFailure[] = [];
   const reversedInThisPass = new Set<string>();
@@ -21,6 +22,11 @@ export async function compensate(
     const key = `${effect.objectName}:${effect.id}`;
 
     try {
+      if (!shouldContinue()) {
+        remaining.push({ index, id: effect.id, reason: 'superseded' });
+        continue;
+      }
+
       if (effect.kind === 'archived') {
         await client.restoreRecord({
           workspaceId,
@@ -71,6 +77,11 @@ export async function compensate(
         objectName: effect.objectName,
         id: effect.id,
       });
+
+      if (!shouldContinue()) {
+        remaining.push({ index, id: effect.id, reason: 'superseded' });
+        continue;
+      }
 
       // A later effect in this same undo already rewrote the row, so its etag moved.
       // Any other etag means the field may no longer hold the value this act wrote.

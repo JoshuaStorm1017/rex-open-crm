@@ -96,6 +96,34 @@ export function restSearchFilter(objectName: TwentyObjectName, query: string): s
   return `name[ilike]:${quoted}`;
 }
 
+export function restTimelineSearchFilter(
+  kind: 'note' | 'task' | 'activity',
+  query: string,
+): string {
+  const quoted = quoteFilterValue(`%${query}%`);
+
+  if (kind === 'activity') {
+    return `linkedRecordCachedName[ilike]:${quoted}`;
+  }
+
+  return `or(title[ilike]:${quoted},bodyV2.markdown[ilike]:${quoted})`;
+}
+
+export function graphqlTimelineSearchFilter(
+  kind: 'note' | 'task' | 'activity',
+  query: string,
+): Record<string, unknown> {
+  const ilike = `%${query}%`;
+
+  if (kind === 'activity') {
+    return { linkedRecordCachedName: { ilike } };
+  }
+
+  return {
+    or: [{ title: { ilike } }, { bodyV2: { markdown: { ilike } } }],
+  };
+}
+
 export function graphqlSearchFilter(
   objectName: TwentyObjectName,
   query: string,
