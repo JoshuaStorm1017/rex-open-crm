@@ -90,7 +90,16 @@ export type AiActResult = {
   links: AiRecordLink[];
   undo?: AiUndo;
   undos?: AiUndo[];
+  confirmedPlanId?: string;
 };
+
+export type AiSkill = {
+  id: string;
+  name: string;
+  tools: string[];
+};
+
+export type AiCaptureSource = 'card' | 'voice';
 
 export type AiUndoResult = {
   next?: AiUndo;
@@ -124,8 +133,10 @@ export const proposeAiCommand = async (
     onPartial,
   );
 
-  if (payload.kind === 'message') {
-    return payload;
+  if (payload.kind !== 'data') {
+    return payload.kind === 'message'
+      ? payload
+      : { kind: 'message', message: payload.message };
   }
 
   const view = readPlan(payload.data);
@@ -171,6 +182,7 @@ export const executeAiCommand = async (
 
   const undo = readUndo(payload.data);
   const undos = readUndos(payload.data);
+  const confirmedPlanId = readConfirmedPlanId(payload.data);
 
   return {
     kind: 'data',
@@ -178,8 +190,168 @@ export const executeAiCommand = async (
       links: readRecordLinks(payload.data),
       ...(undo ? { undo } : {}),
       ...(undos ? { undos } : {}),
+      ...(confirmedPlanId ? { confirmedPlanId } : {}),
     },
   };
+};
+
+export const reproposeAiCommand = async (
+  config: AiCommandBarConfig,
+  proposalId: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiPlanView>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/repropose',
+    {
+      workspaceId: config.workspaceId,
+      proposalId,
+    },
+    fetchImpl,
+  );
+
+  return readPlanOutcome(payload);
+};
+
+export const proposeAiCapture = async (
+  config: AiCommandBarConfig,
+  source: AiCaptureSource,
+  text: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiPlanView>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/plan',
+    {
+      workspaceId: config.workspaceId,
+      capture: { source, text },
+    },
+    fetchImpl,
+  );
+
+  return readPlanOutcome(payload);
+};
+
+export const proposeAiSkill = async (
+  config: AiCommandBarConfig,
+  skillId: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiPlanView>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/plan',
+    {
+      workspaceId: config.workspaceId,
+      skillId,
+    },
+    fetchImpl,
+  );
+
+  return readPlanOutcome(payload);
+};
+
+export const saveAiSkill = async (
+  config: AiCommandBarConfig,
+  skillName: string,
+  confirmedPlanId: string,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiSkill>> => {
+  const payload = await postAiCommand(
+    config,
+    '/v1/ai/skills',
+    {
+      workspaceId: config.workspaceId,
+      skillName,
+      confirmedPlanId,
+    },
+    fetchImpl,
+  );
+
+  if (payload.kind !== 'data') {
+    return payload;
+  }
+
+  const skill = readSkill(payload.data);
+
+  if (!skill) {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an unexpected skill.',
+    };
+  }
+
+  return { kind: 'data', data: skill };
+};
+
+export const listAiSkills = async (
+  config: AiCommandBarConfig,
+  fetchImpl: FetchImpl,
+): Promise<AiCommandOutcome<AiSkill[]>> => {
+  let response: Response;
+
+  try {
+    response = await fetchImpl(
+      `${config.gatewayUrl}/v1/ai/skills?workspaceId=${encodeURIComponent(config.workspaceId)}`,
+      {
+        method: 'GET',
+        credentials: 'include',
+      },
+    );
+  } catch {
+    return {
+      kind: 'message',
+      message: 'The AI gateway is unreachable.',
+    };
+  }
+
+  let payload: unknown;
+
+  try {
+    payload = await response.json();
+  } catch {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an unexpected response.',
+    };
+  }
+
+  if (!isPlainObject(payload) || payload.ok !== true) {
+    return { kind: 'message', message: readMessage(payload) };
+  }
+
+  if (!Array.isArray(payload.skills)) {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an unexpected skill list.',
+    };
+  }
+
+  const skills = payload.skills.flatMap((skill) => {
+    const parsed = readSkill({ skill });
+
+    return parsed ? [parsed] : [];
+  });
+
+  return { kind: 'data', data: skills };
+};
+
+const readPlanOutcome = (
+  payload: AiCommandOutcome<unknown>,
+): AiCommandOutcome<AiPlanView> => {
+  if (payload.kind !== 'data') {
+    return payload;
+  }
+
+  const view = readPlan(payload.data);
+
+  if (!view) {
+    return {
+      kind: 'message',
+      message: 'The AI gateway returned an unexpected plan.',
+    };
+  }
+
+  return { kind: 'data', data: view };
 };
 
 export const undoAiCommand = async (
@@ -200,8 +372,10 @@ export const undoAiCommand = async (
     idempotencyKey,
   );
 
-  if (payload.kind === 'message') {
-    return payload;
+  if (payload.kind !== 'data') {
+    return payload.kind === 'message'
+      ? payload
+      : { kind: 'message', message: payload.message };
   }
 
   const next = readUndo(payload.data);
@@ -832,6 +1006,36 @@ const pushRecord = (links: AiRecordLink[], record: unknown): void => {
 };
 
 const UNDO_ID_PATTERN = /^undo_[0-9a-f-]{36}$/;
+
+const readConfirmedPlanId = (payload: unknown): string | undefined => {
+  if (!isPlainObject(payload) || typeof payload.confirmedPlanId !== 'string') {
+    return undefined;
+  }
+
+  return payload.confirmedPlanId;
+};
+
+const readSkill = (payload: unknown): AiSkill | undefined => {
+  if (!isPlainObject(payload) || !isPlainObject(payload.skill)) {
+    return undefined;
+  }
+
+  const { id, name, tools } = payload.skill;
+
+  if (
+    typeof id !== 'string' ||
+    typeof name !== 'string' ||
+    !Array.isArray(tools)
+  ) {
+    return undefined;
+  }
+
+  const toolNames = tools.filter(
+    (tool): tool is string => typeof tool === 'string',
+  );
+
+  return { id, name, tools: toolNames };
+};
 
 const readUndo = (payload: unknown): AiUndo | undefined => {
   if (!isPlainObject(payload) || !isPlainObject(payload.undo)) {

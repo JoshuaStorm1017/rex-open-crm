@@ -15,6 +15,7 @@ export async function collectWarnings(
 ): Promise<ProposalWarning[]> {
   return [
     ...(await duplicateEmailWarnings(client, workspaceId, slots)),
+    ...(await duplicateNameWarnings(client, workspaceId, slots)),
     ...inPreviewAmountWarnings(slots),
     ...(await companyAmountWarnings(client, workspaceId, slots)),
   ];
@@ -64,6 +65,221 @@ async function duplicateEmailWarnings(
   }
 
   return warnings;
+}
+
+async function duplicateNameWarnings(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  slots: PreviewSlot[],
+): Promise<ProposalWarning[]> {
+  const warnings: ProposalWarning[] = [];
+  const seen = new Set<string>();
+
+  for (const target of nameTargets(slots)) {
+    const companies = await companyIdsFor(client, workspaceId, slots, target);
+
+    for (const company of companies) {
+      const key = `${target.firstName.toLowerCase()} ${target.lastName.toLowerCase()}@${company.id}`;
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+      const matches = await client.searchRecords({
+        workspaceId,
+        objectName: 'person',
+        query: `${target.firstName} ${target.lastName}`,
+        limit: 10,
+        linkedCompanyId: company.id,
+      });
+      const duplicate = matches.find(
+        (record) =>
+          record.id !== target.selfId &&
+          record.properties.companyId === company.id &&
+          sameName(record, target.firstName, target.lastName),
+      );
+
+      if (!duplicate) {
+        continue;
+      }
+
+      seen.add(key);
+      warnings.push({
+        code: 'duplicate_name',
+        message: `Another person named ${target.firstName} ${target.lastName} is already linked to ${company.label}. This preview still proposes that name.`,
+      });
+    }
+  }
+
+  return warnings;
+}
+
+function nameTargets(slots: PreviewSlot[]): Array<{
+  firstName: string;
+  lastName: string;
+  companyId?: string;
+  companyName?: string;
+  selfId?: string;
+}> {
+  const targets: Array<{
+    firstName: string;
+    lastName: string;
+    companyId?: string;
+    companyName?: string;
+    selfId?: string;
+  }> = [];
+
+  for (const slot of slots) {
+    if (slot.type !== 'ready' || slot.tool.name !== 'create_person') {
+      continue;
+    }
+
+    const companyId = slot.tool.input.companyId;
+
+    targets.push({
+      firstName: slot.tool.input.firstName,
+      lastName: slot.tool.input.lastName,
+      ...(companyId?.startsWith('$')
+        ? { companyName: companyNameAt(slots, companyId) }
+        : companyId
+          ? { companyId }
+          : {}),
+    });
+  }
+
+  const people = new Map<
+    string,
+    {
+      firstName?: string;
+      lastName?: string;
+      companyId?: string;
+      nameChanged: boolean;
+    }
+  >();
+
+  for (const slot of slots) {
+    if (
+      slot.type !== 'ready' ||
+      slot.tool.name !== 'update_record' ||
+      slot.tool.input.objectName !== 'person' ||
+      !slot.tool.input.id ||
+      !slot.record
+    ) {
+      continue;
+    }
+
+    const current = people.get(slot.tool.input.id) ?? {
+      firstName: stringProp(slot.record, 'firstName'),
+      lastName: stringProp(slot.record, 'lastName'),
+      companyId: stringProp(slot.record, 'companyId'),
+      nameChanged: false,
+    };
+
+    if (slot.tool.input.field === 'firstName') {
+      current.firstName = String(slot.tool.input.value);
+      current.nameChanged = true;
+    }
+
+    if (slot.tool.input.field === 'lastName') {
+      current.lastName = String(slot.tool.input.value);
+      current.nameChanged = true;
+    }
+
+    people.set(slot.tool.input.id, current);
+  }
+
+  for (const [id, person] of people) {
+    if (
+      !person.nameChanged ||
+      !person.firstName ||
+      !person.lastName ||
+      !person.companyId
+    ) {
+      continue;
+    }
+
+    targets.push({
+      firstName: person.firstName,
+      lastName: person.lastName,
+      companyId: person.companyId,
+      selfId: id,
+    });
+  }
+
+  return targets;
+}
+
+function companyNameAt(slots: PreviewSlot[], ref: string): string | undefined {
+  const index = Number(ref.slice(1));
+  const slot = slots[index];
+
+  if (!slot || slot.type !== 'ready' || slot.tool.name !== 'create_company') {
+    return undefined;
+  }
+
+  return slot.tool.input.name;
+}
+
+async function companyIdsFor(
+  client: TwentyCrmClient,
+  workspaceId: string,
+  _slots: PreviewSlot[],
+  target: { companyId?: string; companyName?: string },
+): Promise<Array<{ id: string; label: string }>> {
+  if (target.companyId) {
+    try {
+      const company = await client.getRecord({
+        workspaceId,
+        objectName: 'company',
+        id: target.companyId,
+      });
+
+      return [{ id: company.id, label: company.label }];
+    } catch {
+      return [{ id: target.companyId, label: target.companyId }];
+    }
+  }
+
+  if (!target.companyName) {
+    return [];
+  }
+
+  const matches = await client.searchRecords({
+    workspaceId,
+    objectName: 'company',
+    query: target.companyName,
+    limit: 8,
+  });
+
+  return matches
+    .filter((company) => {
+      const name = company.properties.name;
+
+      return (
+        company.label.toLowerCase() === target.companyName?.toLowerCase() ||
+        (typeof name === 'string' &&
+          name.toLowerCase() === target.companyName?.toLowerCase())
+      );
+    })
+    .map((company) => ({ id: company.id, label: company.label }));
+}
+
+function sameName(
+  record: CreatedRecord,
+  firstName: string,
+  lastName: string,
+): boolean {
+  return (
+    stringProp(record, 'firstName')?.toLowerCase() ===
+      firstName.toLowerCase() &&
+    stringProp(record, 'lastName')?.toLowerCase() === lastName.toLowerCase()
+  );
+}
+
+function stringProp(record: CreatedRecord, field: string): string | undefined {
+  const value = record.properties[field];
+
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function inPreviewAmountWarnings(slots: PreviewSlot[]): ProposalWarning[] {

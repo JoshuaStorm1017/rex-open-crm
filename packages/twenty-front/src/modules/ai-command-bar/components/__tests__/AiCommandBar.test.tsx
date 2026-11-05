@@ -12,12 +12,17 @@ import { readOpenRecordFromPath } from '@/ai-command-bar/utils/readOpenRecordFro
 
 import { AiCommandBar } from '@/ai-command-bar/components/AiCommandBar';
 import { AiRecordFieldPreview } from '@/ai-command-bar/components/AiRecordFieldPreview';
+import { AiRecordTableFieldPreview } from '@/ai-command-bar/components/AiRecordTableFieldPreview';
 import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   readAiCommandBarConfig,
   type AiCommandBarConfig,
 } from '@/ai-command-bar/utils/readAiCommandBarConfig';
 import { isAiCommandBarShortcut } from '@/ai-command-bar/utils/isAiCommandBarShortcut';
+import {
+  FieldContext,
+  type GenericFieldContextType,
+} from '@/object-record/record-field/ui/contexts/FieldContext';
 
 i18n.load('en', {});
 i18n.activate('en');
@@ -606,9 +611,9 @@ describe('side panel and several choices', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Propose' }));
 
-    const planCall = fetchImpl.mock.calls.find((call) =>
-      String(call[0]).endsWith('/v1/ai/plan'),
-    );
+    const planCall = (
+      fetchImpl.mock.calls as unknown as Array<[unknown, RequestInit?]>
+    ).find((call) => String(call[0]).endsWith('/v1/ai/plan'));
 
     expect(JSON.parse(String(planCall?.[1]?.body))).toEqual({
       workspaceId: 'ws_demo',
@@ -710,9 +715,9 @@ describe('side panel and several choices', () => {
     await user.click(screen.getByRole('radio', { name: 'Acme South' }));
     await user.click(screen.getByRole('button', { name: 'Confirm' }));
 
-    const actCall = fetchImpl.mock.calls.find((call) =>
-      String(call[0]).endsWith('/v1/ai/act'),
-    );
+    const actCall = (
+      fetchImpl.mock.calls as unknown as Array<[unknown, RequestInit?]>
+    ).find((call) => String(call[0]).endsWith('/v1/ai/act'));
 
     expect(JSON.parse(String(actCall?.[1]?.body))).toMatchObject({
       choices: { '0': 'person_north', '1': 'company_south' },
@@ -812,7 +817,7 @@ describe('side panel and several choices', () => {
           get: () => 'text/event-stream',
         },
         body: stream,
-      } as Response;
+      } as unknown as Response;
     });
 
     renderBar(fetchImpl, true);
@@ -885,7 +890,9 @@ const updateProposal = {
 
 describe('round 7 preview', () => {
   afterEach(() => {
-    getDefaultStore().set(aiCommandBarFieldPreviewState.atom, []);
+    act(() => {
+      getDefaultStore().set(aiCommandBarFieldPreviewState.atom, []);
+    });
   });
 
   it('shows current against proposed, a warning, and the same diff beside the field', async () => {
@@ -910,9 +917,7 @@ describe('round 7 preview', () => {
     expect(
       await screen.findByText('Current city “Lisbon”. Proposed “Faro”.'),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Proposed change: Current city/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/city: Current city/)).toBeInTheDocument();
     expect(
       screen.getByText(/Another person already uses ada@analytical.example/),
     ).toBeInTheDocument();
@@ -1045,7 +1050,7 @@ describe('round 7 preview', () => {
         return {
           headers: { get: () => 'text/event-stream' },
           body: stream,
-        } as Response;
+        } as unknown as Response;
       },
     );
 
@@ -1076,6 +1081,291 @@ describe('round 7 preview', () => {
 
     expect(await screen.findByText('Acme Corp')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Undo' })).toBeInTheDocument();
+  });
+});
+
+describe('round 8 command bar', () => {
+  afterEach(() => {
+    act(() => {
+      getDefaultStore().set(aiCommandBarFieldPreviewState.atom, []);
+    });
+  });
+
+  it('reloads a blocked preview into a new confirm', async () => {
+    const user = userEvent.setup();
+    const reloadedId = 'proposal_33333333-3333-4333-8333-333333333333';
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+
+        if (url.endsWith('/v1/ai/plan')) {
+          return jsonResponse(updateProposal);
+        }
+
+        if (url.endsWith('/v1/ai/repropose')) {
+          return jsonResponse({
+            ...updateProposal,
+            proposal: {
+              ...updateProposal.proposal,
+              id: reloadedId,
+              changes: [
+                {
+                  ...CITY_CHANGE,
+                  current: 'Porto',
+                  summary: 'Current city “Porto”. Proposed “Faro”.',
+                },
+              ],
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: false,
+          refused: true,
+          reason: 'precondition_failed',
+          message: 'Current city “Porto”. Proposed “Faro”. Confirm is blocked.',
+          stale: [
+            {
+              ...CITY_CHANGE,
+              current: 'Porto',
+              summary: 'Current city “Porto”. Proposed “Faro”.',
+            },
+          ],
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Reload preview' }));
+
+    expect(
+      await screen.findByText('Current city “Porto”. Proposed “Faro”.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText(/Confirm is blocked/)).toBeInTheDocument();
+
+    const actBodies = fetchImpl.mock.calls
+      .filter(([input]) => String(input).endsWith('/v1/ai/act'))
+      .map(
+        ([, init]) => JSON.parse(String(init?.body)) as { proposalId?: string },
+      );
+
+    expect(actBodies[1]?.proposalId).toBe(reloadedId);
+  });
+
+  it('saves a confirmed plan and runs it behind confirm', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+
+        if (url.endsWith('/v1/ai/plan') && body.skillId) {
+          return jsonResponse(updateProposal);
+        }
+
+        if (url.endsWith('/v1/ai/plan')) {
+          return jsonResponse(updateProposal);
+        }
+
+        if (url.endsWith('/v1/ai/skills') && init?.method === 'GET') {
+          return jsonResponse({
+            ok: true,
+            skills: [
+              {
+                id: 'skill_44444444-4444-4444-8444-444444444444',
+                name: 'Move Acme',
+                tools: ['update_record'],
+              },
+            ],
+          });
+        }
+
+        if (url.endsWith('/v1/ai/skills')) {
+          expect(body).toEqual({
+            workspaceId: 'ws_demo',
+            skillName: 'Move Acme',
+            confirmedPlanId: 'confirmed_55555555-5555-4555-8555-555555555555',
+          });
+          expect(body).not.toHaveProperty('summary');
+
+          return jsonResponse({
+            ok: true,
+            summary: 'Saved skill Move Acme.',
+            skill: {
+              id: 'skill_44444444-4444-4444-8444-444444444444',
+              name: 'Move Acme',
+              tools: ['update_record'],
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          results: [],
+          confirmedPlanId: 'confirmed_55555555-5555-4555-8555-555555555555',
+          undo: { id: 'undo_1', summary: 'Undo 1 field change.' },
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.type(
+      screen.getByRole('textbox', { name: 'Command' }),
+      'update company Acme set city to Faro',
+    );
+    await user.click(screen.getByRole('button', { name: 'Propose' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+    await user.type(
+      await screen.findByRole('textbox', { name: 'Skill name' }),
+      'Move Acme',
+    );
+    await user.click(screen.getByRole('button', { name: 'Save skill' }));
+    expect(
+      await screen.findByText(
+        'Saved. Run it from Saved skills. Confirm still applies.',
+      ),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Close' }));
+    await user.click(screen.getByRole('button', { name: /AI command/ }));
+    await user.click(screen.getByRole('button', { name: 'Saved skills' }));
+    await user.click(await screen.findByRole('button', { name: 'Run' }));
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeEnabled();
+
+    const skillPlan = fetchImpl.mock.calls.find(([input, init]) => {
+      if (!String(input).endsWith('/v1/ai/plan') || !init?.body) {
+        return false;
+      }
+
+      const body = JSON.parse(String(init.body)) as { skillId?: string };
+
+      return body.skillId === 'skill_44444444-4444-4444-8444-444444444444';
+    });
+
+    expect(skillPlan).toBeDefined();
+  });
+
+  it('previews a card without creating until confirm', async () => {
+    const user = userEvent.setup();
+    const fetchImpl = jest.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+
+        if (url.endsWith('/v1/ai/plan')) {
+          expect(body.capture).toEqual({
+            source: 'voice',
+            text: 'person Ada Lovelace at Analytical Engines',
+          });
+          expect(body).not.toHaveProperty('intent');
+
+          return jsonResponse({
+            ...proposal,
+            proposal: {
+              ...proposal.proposal,
+              summary:
+                'Create company “Analytical Engines”. Create person Ada Lovelace.',
+            },
+          });
+        }
+
+        return jsonResponse({
+          ok: true,
+          workspaceId: 'ws_demo',
+          results: [],
+        });
+      },
+    );
+
+    renderBar(fetchImpl, true);
+    await user.click(screen.getByRole('button', { name: 'Card or voice' }));
+    await user.click(screen.getByRole('radio', { name: 'Voice' }));
+    await user.type(
+      screen.getByRole('textbox', { name: 'Card or dictation' }),
+      'person Ada Lovelace at Analytical Engines',
+    );
+    await user.click(screen.getByRole('button', { name: 'Preview capture' }));
+    expect(
+      await screen.findByRole('button', { name: 'Confirm' }),
+    ).toBeEnabled();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows each bulk row and both parts of a composite field', () => {
+    getDefaultStore().set(aiCommandBarFieldPreviewState.atom, [
+      CITY_CHANGE,
+      {
+        ...CITY_CHANGE,
+        recordId: 'company_2',
+        label: 'Northwind',
+        summary: 'Current city “Lisbon”. Proposed “Faro”.',
+      },
+      {
+        recordId: 'company_1',
+        objectName: 'company',
+        label: 'Acme',
+        field: 'address',
+        metadataField: 'address',
+        current: '1 Dock',
+        proposed: '12 Analytical Way',
+        summary: 'Current address “1 Dock”. Proposed “12 Analytical Way”.',
+      },
+    ]);
+
+    render(
+      <I18nProvider i18n={i18n}>
+        <FieldContext.Provider
+          value={
+            {
+              recordId: 'company_1',
+              fieldDefinition: { metadata: { fieldName: 'address' } },
+            } as GenericFieldContextType
+          }
+        >
+          <AiRecordTableFieldPreview />
+        </FieldContext.Provider>
+        <FieldContext.Provider
+          value={
+            {
+              recordId: 'company_2',
+              fieldDefinition: { metadata: { fieldName: 'address' } },
+            } as GenericFieldContextType
+          }
+        >
+          <AiRecordTableFieldPreview />
+        </FieldContext.Provider>
+        <AiRecordFieldPreview recordId="company_1" fieldName="address" />
+      </I18nProvider>,
+    );
+
+    expect(screen.getAllByText('Proposed city: Faro')).toHaveLength(2);
+    expect(
+      screen.getByText('Proposed address: 12 Analytical Way'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/address: Current address “1 Dock”/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/city: Current city “Lisbon”/)).toBeInTheDocument();
   });
 });
 

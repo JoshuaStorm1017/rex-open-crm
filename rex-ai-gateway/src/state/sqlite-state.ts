@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,6 +16,17 @@ import {
   type StoredProposal,
 } from '../http/proposal-store';
 import {
+  cloneTools,
+  SkillStore,
+  SKILL_LIMIT,
+  CONFIRMED_PLAN_LIMIT,
+  summarize,
+  type ConfirmedPlan,
+  type SaveSkillResult,
+  type SkillSummary,
+  type StoredSkill,
+} from '../http/skill-store';
+import {
   summarizeUndo,
   UndoStore,
   UNDO_STACK_LIMIT,
@@ -27,6 +39,7 @@ export type GatewayState = {
   idempotency: IdempotencyStore;
   audit: AuditLog;
   undos: UndoStore;
+  skills: SkillStore;
   close: () => void;
 };
 
@@ -78,6 +91,28 @@ export function openGatewayState(filename: string): GatewayState {
       member_id TEXT PRIMARY KEY,
       generation INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS undo_lock (
+      member_id TEXT PRIMARY KEY,
+      undo_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      locked_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS confirmed_plans (
+      id TEXT PRIMARY KEY,
+      member_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      tools_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS skills (
+      id TEXT PRIMARY KEY,
+      member_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      tools_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS skills_member ON skills (member_id, created_at);
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
       at TEXT NOT NULL,
@@ -106,6 +141,7 @@ export function openGatewayState(filename: string): GatewayState {
     ),
     audit: new SqliteAuditLog(database, () => restrictStateFiles(filename)),
     undos: new SqliteUndoStore(database, () => restrictStateFiles(filename)),
+    skills: new SqliteSkillStore(database, () => restrictStateFiles(filename)),
     close: () => {
       database.close();
       restrictStateFiles(filename);
@@ -369,11 +405,25 @@ class SqliteUndoStore extends UndoStore {
   ): TakeUndoResult {
     const result = super.begin(id, memberId, workspaceId);
 
-    if (result.ok) {
-      this.setGenerationAtBegin(memberId, this.readGeneration(memberId));
+    if (!result.ok) {
+      return result;
     }
 
+    const generation = this.readGeneration(memberId);
+
+    if (!this.claimSharedLock(memberId, id, generation)) {
+      super.release(memberId);
+      return { ok: false, reason: 'busy' };
+    }
+
+    this.setGenerationAtBegin(memberId, generation);
+
     return result;
+  }
+
+  override release(memberId: string): void {
+    super.release(memberId);
+    this.clearLock(memberId);
   }
 
   override superseded(memberId: string): boolean {
@@ -426,6 +476,7 @@ class SqliteUndoStore extends UndoStore {
   override finish(memberId: string): void {
     const id = this.runningUndoId(memberId);
     super.finish(memberId);
+    this.clearLock(memberId);
 
     if (!id) {
       return;
@@ -457,6 +508,39 @@ class SqliteUndoStore extends UndoStore {
     this.restrict();
 
     return true;
+  }
+
+  // A lock older than a minute is stolen so a crashed process cannot block undo forever.
+  private claimSharedLock(
+    memberId: string,
+    undoId: string,
+    generation: number,
+  ): boolean {
+    const now = Date.now();
+    const row = this.database
+      .prepare(
+        `INSERT INTO undo_lock (member_id, undo_id, generation, locked_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(member_id) DO UPDATE SET
+           undo_id = excluded.undo_id,
+           generation = excluded.generation,
+           locked_at = excluded.locked_at
+         WHERE undo_lock.locked_at <= ?
+         RETURNING member_id`,
+      )
+      .get(memberId, undoId, generation, now, now - 60_000) as
+      | { member_id: string }
+      | undefined;
+    this.restrict();
+
+    return Boolean(row);
+  }
+
+  private clearLock(memberId: string): void {
+    this.database
+      .prepare('DELETE FROM undo_lock WHERE member_id = ?')
+      .run(memberId);
+    this.restrict();
   }
 
   private readGeneration(memberId: string): number {
@@ -505,6 +589,232 @@ class SqliteUndoStore extends UndoStore {
     }
 
     return { ok: true, ticket };
+  }
+}
+
+class SqliteSkillStore extends SkillStore {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly restrict: () => void,
+  ) {
+    super();
+  }
+
+  override saveConfirmed(
+    memberId: string,
+    workspaceId: string,
+    tools: ToolCall[],
+  ): ConfirmedPlan | undefined {
+    const stored = cloneTools(tools);
+
+    if (stored.length === 0) {
+      return undefined;
+    }
+
+    const plan: ConfirmedPlan = {
+      id: `confirmed_${randomUUID()}`,
+      memberId,
+      workspaceId,
+      tools: stored,
+      createdAt: Date.now(),
+    };
+    this.database
+      .prepare(
+        `INSERT INTO confirmed_plans (id, member_id, workspace_id, tools_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        plan.id,
+        plan.memberId,
+        plan.workspaceId,
+        JSON.stringify(plan.tools),
+        plan.createdAt,
+      );
+    this.database
+      .prepare(
+        `DELETE FROM confirmed_plans WHERE member_id = ? AND id NOT IN (
+           SELECT id FROM confirmed_plans WHERE member_id = ? ORDER BY created_at DESC LIMIT ?
+         )`,
+      )
+      .run(memberId, memberId, CONFIRMED_PLAN_LIMIT);
+    this.restrict();
+
+    return plan;
+  }
+
+  override readConfirmed(
+    id: string,
+    memberId: string,
+  ): ConfirmedPlan | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT workspace_id, tools_json, created_at FROM confirmed_plans
+         WHERE id = ? AND member_id = ?`,
+      )
+      .get(id, memberId) as
+      | { workspace_id: string; tools_json: string; created_at: number }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    const tools = parseStoredTools(row.tools_json);
+
+    if (!tools) {
+      return undefined;
+    }
+
+    return {
+      id,
+      memberId,
+      workspaceId: row.workspace_id,
+      tools,
+      createdAt: row.created_at,
+    };
+  }
+
+  override saveSkill(
+    memberId: string,
+    workspaceId: string,
+    name: string,
+    tools: ToolCall[],
+  ): SaveSkillResult {
+    const stored = cloneTools(tools);
+
+    if (stored.length === 0) {
+      return { ok: false, reason: 'empty' };
+    }
+
+    const duplicate = this.database
+      .prepare(
+        `SELECT id FROM skills
+         WHERE member_id = ? AND workspace_id = ? AND lower(name) = lower(?)`,
+      )
+      .get(memberId, workspaceId, name) as { id: string } | undefined;
+
+    if (duplicate) {
+      return { ok: false, reason: 'duplicate' };
+    }
+
+    const count = this.database
+      .prepare(
+        'SELECT COUNT(*) AS count FROM skills WHERE member_id = ? AND workspace_id = ?',
+      )
+      .get(memberId, workspaceId) as { count: number } | undefined;
+
+    if ((count?.count ?? 0) >= SKILL_LIMIT) {
+      return { ok: false, reason: 'full' };
+    }
+
+    const skill: StoredSkill = {
+      id: `skill_${randomUUID()}`,
+      memberId,
+      workspaceId,
+      name,
+      tools: stored,
+      createdAt: Date.now(),
+    };
+    this.database
+      .prepare(
+        `INSERT INTO skills (id, member_id, workspace_id, name, tools_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        skill.id,
+        skill.memberId,
+        skill.workspaceId,
+        skill.name,
+        JSON.stringify(skill.tools),
+        skill.createdAt,
+      );
+    this.restrict();
+
+    return { ok: true, skill };
+  }
+
+  override list(memberId: string, workspaceId: string): SkillSummary[] {
+    const rows = this.database
+      .prepare(
+        `SELECT id, name, tools_json FROM skills
+         WHERE member_id = ? AND workspace_id = ?
+         ORDER BY created_at DESC`,
+      )
+      .all(memberId, workspaceId) as Array<{
+      id: string;
+      name: string;
+      tools_json: string;
+    }>;
+
+    return rows.flatMap((row) => {
+      const tools = parseStoredTools(row.tools_json);
+
+      if (!tools) {
+        return [];
+      }
+
+      return [
+        summarize({
+          id: row.id,
+          memberId,
+          workspaceId,
+          name: row.name,
+          tools,
+          createdAt: 0,
+        }),
+      ];
+    });
+  }
+
+  override read(id: string, memberId: string): StoredSkill | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT workspace_id, name, tools_json, created_at FROM skills
+         WHERE id = ? AND member_id = ?`,
+      )
+      .get(id, memberId) as
+      | {
+          workspace_id: string;
+          name: string;
+          tools_json: string;
+          created_at: number;
+        }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    const tools = parseStoredTools(row.tools_json);
+
+    if (!tools) {
+      return undefined;
+    }
+
+    return {
+      id,
+      memberId,
+      workspaceId: row.workspace_id,
+      name: row.name,
+      tools,
+      createdAt: row.created_at,
+    };
+  }
+}
+
+function parseStoredTools(value: string): ToolCall[] | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+
+    if (!Array.isArray(parsed)) {
+      return undefined;
+    }
+
+    const tools = cloneTools(parsed as ToolCall[]);
+
+    return tools.length === parsed.length ? tools : undefined;
+  } catch {
+    return undefined;
   }
 }
 

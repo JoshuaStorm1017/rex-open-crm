@@ -8,12 +8,21 @@ import { themeCssVariables } from 'twenty-ui/theme';
 import { aiCommandBarFieldPreviewState } from '@/ai-command-bar/states/aiCommandBarFieldPreviewState';
 import {
   executeAiCommand,
+  listAiSkills,
+  proposeAiCapture,
   proposeAiCommand,
+  proposeAiSkill,
+  reproposeAiCommand,
+  saveAiSkill,
   undoAiCommand,
   type AiAnswer,
+  type AiCaptureSource,
+  type AiCommandOutcome,
+  type AiPlanView,
   type AiProposal,
   type AiProposalLine,
   type AiRecordLink,
+  type AiSkill,
   type AiUndo,
 } from '@/ai-command-bar/utils/aiCommandBarClient';
 import { useSetAtomState } from '@/ui/utilities/state/jotai/hooks/useSetAtomState';
@@ -55,6 +64,8 @@ type Phase =
       undo?: AiUndo;
       undos?: AiUndo[];
       notice?: string;
+      status?: string;
+      confirmedPlanId?: string;
     }
   | { name: 'undoing'; draft: string; links: AiRecordLink[]; undo: AiUndo }
   | { name: 'refused'; draft: string; message: string };
@@ -86,6 +97,13 @@ export const AiCommandBar = ({
   const openRecord = panelRecord ?? routeRecord;
   const [open, setOpen] = useState(initialOpen);
   const [phase, setPhase] = useState<Phase>({ name: 'compose', draft: '' });
+  const [skillName, setSkillName] = useState('');
+  const [skills, setSkills] = useState<AiSkill[]>([]);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [captureOpen, setCaptureOpen] = useState(false);
+  const [captureSource, setCaptureSource] = useState<AiCaptureSource>('card');
+  const [captureText, setCaptureText] = useState('');
+  const canListen = speechRecognitionAvailable();
   const setFieldPreview = useSetAtomState(aiCommandBarFieldPreviewState);
   const executing = phase.name === 'executing' || phase.name === 'undoing';
   const busy = phase.name === 'planning' || executing;
@@ -146,7 +164,7 @@ export const AiCommandBar = ({
 
       const focusable = [
         ...dialog.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), a[href]',
+          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), a[href]',
         ),
       ];
       const first = focusable[0];
@@ -239,7 +257,12 @@ export const AiCommandBar = ({
       return;
     }
 
+    showPlan(draft, outcome);
+  };
+
+  const showPlan = (draft: string, outcome: AiCommandOutcome<AiPlanView>) => {
     if (outcome.kind === 'message' || outcome.kind === 'stale') {
+      setFieldPreview([]);
       setPhase({
         name: 'refused',
         draft,
@@ -252,6 +275,7 @@ export const AiCommandBar = ({
     }
 
     if (!outcome.data.proposal) {
+      setFieldPreview([]);
       setPhase({
         name: 'answer',
         draft,
@@ -272,6 +296,180 @@ export const AiCommandBar = ({
       choiceIds: {},
       ...(outcome.data.answer ? { answer: outcome.data.answer } : {}),
     });
+  };
+
+  const reloadPreview = async (
+    current: Extract<Phase, { name: 'preview' }>,
+  ) => {
+    const generation = readGeneration();
+
+    setPhase({ name: 'planning', draft: current.draft, lines: [] });
+    const outcome = await reproposeAiCommand(
+      resolvedConfig,
+      current.proposal.id,
+      fetchImpl,
+    );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    showPlan(current.draft, outcome);
+  };
+
+  const previewCapture = async () => {
+    const text = captureText.trim();
+
+    if (text.length === 0) {
+      return;
+    }
+
+    const generation = String(Number(readGeneration()) + 1);
+    const input = inputRef.current;
+
+    if (input !== null) {
+      input.dataset.generation = generation;
+    }
+
+    setFieldPreview([]);
+    setPhase({ name: 'planning', draft: '', lines: [] });
+    const outcome = await proposeAiCapture(
+      resolvedConfig,
+      captureSource,
+      text,
+      fetchImpl,
+    );
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    showPlan('', outcome);
+  };
+
+  const loadSkills = async () => {
+    setSkillsOpen(true);
+    const outcome = await listAiSkills(resolvedConfig, fetchImpl);
+
+    if (outcome.kind === 'data') {
+      setSkills(outcome.data);
+      return;
+    }
+
+    setPhase((current) =>
+      current.name === 'compose'
+        ? { ...current, notice: outcome.message }
+        : current,
+    );
+  };
+
+  const runSkill = async (skill: AiSkill) => {
+    const generation = String(Number(readGeneration()) + 1);
+    const input = inputRef.current;
+
+    if (input !== null) {
+      input.dataset.generation = generation;
+    }
+
+    setFieldPreview([]);
+    setPhase({ name: 'planning', draft: skill.name, lines: [] });
+    const outcome = await proposeAiSkill(resolvedConfig, skill.id, fetchImpl);
+
+    if (generation !== readGeneration()) {
+      return;
+    }
+
+    showPlan(skill.name, outcome);
+  };
+
+  const saveSkill = async (current: Extract<Phase, { name: 'done' }>) => {
+    const name = skillName.trim();
+
+    if (!current.confirmedPlanId || name.length === 0) {
+      return;
+    }
+
+    const outcome = await saveAiSkill(
+      resolvedConfig,
+      name,
+      current.confirmedPlanId,
+      fetchImpl,
+    );
+
+    if (outcome.kind !== 'data') {
+      setPhase({
+        ...current,
+        notice: outcome.message,
+      });
+      return;
+    }
+
+    setSkills((currentSkills) => [outcome.data, ...currentSkills]);
+    setSkillName('');
+    setPhase({
+      ...current,
+      notice: undefined,
+      status: t`Saved. Run it from Saved skills. Confirm still applies.`,
+    });
+  };
+
+  const listen = () => {
+    const recognition = speechRecognition();
+
+    if (!recognition || phase.name !== 'compose') {
+      return;
+    }
+
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.continuous = false;
+    recognition.onresult = (event) => {
+      const transcript = event.results[0]?.[0]?.transcript ?? '';
+
+      if (transcript.trim().length > 0) {
+        setCaptureSource('voice');
+        setCaptureText(transcript.trim());
+      }
+    };
+    recognition.onerror = () => {
+      setPhase((current) =>
+        current.name === 'compose'
+          ? {
+              ...current,
+              notice: t`Dictation stopped. Paste the words instead.`,
+            }
+          : current,
+      );
+    };
+    recognition.start();
+  };
+
+  const readCardFile = (file: File) => {
+    const textFile =
+      file.type.startsWith('text') ||
+      file.name.endsWith('.txt') ||
+      file.name.endsWith('.vcf');
+
+    if (!textFile) {
+      setPhase((current) =>
+        current.name === 'compose'
+          ? {
+              ...current,
+              notice: t`Paste the card text. A photo is not read.`,
+            }
+          : current,
+      );
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setCaptureSource('card');
+        setCaptureText(reader.result.slice(0, 2000));
+      }
+    };
+    reader.readAsText(file);
   };
 
   const confirm = async (current: Extract<Phase, { name: 'preview' }>) => {
@@ -335,6 +533,9 @@ export const AiCommandBar = ({
       links: outcome.data.links,
       ...(outcome.data.undo ? { undo: outcome.data.undo } : {}),
       ...(outcome.data.undos ? { undos: outcome.data.undos } : {}),
+      ...(outcome.data.confirmedPlanId
+        ? { confirmedPlanId: outcome.data.confirmedPlanId }
+        : {}),
     });
   };
 
@@ -363,12 +564,16 @@ export const AiCommandBar = ({
       return;
     }
 
-    if (outcome.kind === 'message') {
+    if (outcome.kind !== 'data') {
       setPhase({
         name: 'done',
         links: current.links,
         undo: current.undo,
         ...(current.undos ? { undos: current.undos } : {}),
+        ...(current.confirmedPlanId
+          ? { confirmedPlanId: current.confirmedPlanId }
+          : {}),
+        ...(current.status ? { status: current.status } : {}),
         notice: outcome.message,
       });
       return;
@@ -492,6 +697,40 @@ export const AiCommandBar = ({
             {phase.name === 'compose' && phase.notice && (
               <StyledNotice role="status">{phase.notice}</StyledNotice>
             )}
+            {phase.name === 'compose' && (
+              <StyledActions>
+                <StyledSecondary
+                  type="button"
+                  onClick={() => setCaptureOpen((current) => !current)}
+                >
+                  {t`Card or voice`}
+                </StyledSecondary>
+                <StyledSecondary
+                  type="button"
+                  onClick={() => void loadSkills()}
+                >
+                  {t`Saved skills`}
+                </StyledSecondary>
+              </StyledActions>
+            )}
+            {phase.name === 'compose' && captureOpen && (
+              <CaptureFields
+                source={captureSource}
+                text={captureText}
+                canListen={canListen}
+                onSource={setCaptureSource}
+                onText={setCaptureText}
+                onFile={readCardFile}
+                onListen={listen}
+                onPreview={() => void previewCapture()}
+              />
+            )}
+            {phase.name === 'compose' && skillsOpen && (
+              <SkillList
+                skills={skills}
+                onRun={(skill) => void runSkill(skill)}
+              />
+            )}
             {phase.name === 'planning' && (
               <>
                 <StyledNotice role="status">{t`Proposing actions…`}</StyledNotice>
@@ -519,7 +758,10 @@ export const AiCommandBar = ({
                 )}
                 {phase.name === 'preview' &&
                   phase.proposal.warnings?.map((warning) => (
-                    <StyledWarning key={warning.code} role="status">
+                    <StyledWarning
+                      key={`${warning.code}-${warning.message}`}
+                      role="status"
+                    >
                       {warning.message}
                     </StyledWarning>
                   ))}
@@ -651,6 +893,14 @@ export const AiCommandBar = ({
                 >
                   {t`Cancel`}
                 </StyledSecondary>
+                {phase.blocked && (
+                  <StyledSecondary
+                    type="button"
+                    onClick={() => void reloadPreview(phase)}
+                  >
+                    {t`Reload preview`}
+                  </StyledSecondary>
+                )}
               </StyledActions>
             )}
             {phase.name === 'answer' && (
@@ -684,6 +934,9 @@ export const AiCommandBar = ({
             {phase.name === 'done' && (
               <>
                 <StyledSummary>{t`Done`}</StyledSummary>
+                {phase.status && (
+                  <StyledNotice role="status">{phase.status}</StyledNotice>
+                )}
                 {phase.notice && (
                   <StyledError role="alert">{phase.notice}</StyledError>
                 )}
@@ -713,7 +966,24 @@ export const AiCommandBar = ({
                     ))}
                   </StyledList>
                 )}
+                {phase.confirmedPlanId && (
+                  <StyledInput
+                    aria-label={t`Skill name`}
+                    value={skillName}
+                    placeholder={t`Name this skill`}
+                    onChange={(event) => setSkillName(event.target.value)}
+                  />
+                )}
                 <StyledActions>
+                  {phase.confirmedPlanId && (
+                    <StyledSecondary
+                      type="button"
+                      disabled={skillName.trim().length === 0}
+                      onClick={() => void saveSkill(phase)}
+                    >
+                      {t`Save skill`}
+                    </StyledSecondary>
+                  )}
                   {phase.undo && (
                     <StyledSecondary
                       type="button"
@@ -799,6 +1069,30 @@ const StyledHint = styled.p`
   color: ${themeCssVariables.font.color.tertiary};
   font-size: ${themeCssVariables.font.size.xs};
   margin: 0;
+`;
+
+const StyledTextArea = styled.textarea`
+  background: ${themeCssVariables.background.secondary};
+  border: 1px solid ${themeCssVariables.border.color.medium};
+  border-radius: ${themeCssVariables.border.radius.sm};
+  box-sizing: border-box;
+  color: ${themeCssVariables.font.color.primary};
+  font: inherit;
+  min-height: 96px;
+  padding: ${themeCssVariables.spacing[2]} ${themeCssVariables.spacing[3]};
+  width: 100%;
+`;
+
+const StyledFileLabel = styled.label`
+  align-items: center;
+  color: ${themeCssVariables.font.color.secondary};
+  cursor: pointer;
+  display: inline-flex;
+  font-size: ${themeCssVariables.font.size.sm};
+
+  input {
+    margin-left: ${themeCssVariables.spacing[2]};
+  }
 `;
 
 const StyledInput = styled.input`
@@ -900,6 +1194,154 @@ const StyledList = styled.ul`
   margin: 0;
   padding-left: ${themeCssVariables.spacing[4]};
 `;
+
+type SpeechResult = {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+};
+
+type SpeechRecognitionLike = {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((event: SpeechResult) => void) | null;
+  onerror: (() => void) | null;
+  start: () => void;
+};
+
+const speechHost = (): {
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+} =>
+  window as unknown as {
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  };
+
+const speechRecognitionAvailable = (): boolean => {
+  const host = speechHost();
+
+  return Boolean(host.SpeechRecognition ?? host.webkitSpeechRecognition);
+};
+
+const speechRecognition = (): SpeechRecognitionLike | undefined => {
+  const host = speechHost();
+  const Recognition = host.SpeechRecognition ?? host.webkitSpeechRecognition;
+
+  return Recognition ? new Recognition() : undefined;
+};
+
+const CaptureFields = ({
+  source,
+  text,
+  canListen,
+  onSource,
+  onText,
+  onFile,
+  onListen,
+  onPreview,
+}: {
+  source: AiCaptureSource;
+  text: string;
+  canListen: boolean;
+  onSource: (source: AiCaptureSource) => void;
+  onText: (text: string) => void;
+  onFile: (file: File) => void;
+  onListen: () => void;
+  onPreview: () => void;
+}) => {
+  const { t } = useLingui();
+
+  return (
+    <>
+      <StyledChoices>
+        <legend>{t`Card or voice`}</legend>
+        <label>
+          <input
+            type="radio"
+            name="ai-capture-source"
+            checked={source === 'card'}
+            onChange={() => onSource('card')}
+          />
+          {t`Card`}
+        </label>
+        <label>
+          <input
+            type="radio"
+            name="ai-capture-source"
+            checked={source === 'voice'}
+            onChange={() => onSource('voice')}
+          />
+          {t`Voice`}
+        </label>
+      </StyledChoices>
+      <StyledTextArea
+        aria-label={t`Card or dictation`}
+        value={text}
+        placeholder={t`Paste a card, a vCard, or a short dictation`}
+        onChange={(event) => onText(event.target.value)}
+      />
+      <StyledActions>
+        <StyledFileLabel>
+          {t`Card file`}
+          <input
+            aria-label={t`Card file`}
+            type="file"
+            accept="text/plain,.txt,.vcf,text/vcard"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+
+              if (file) {
+                onFile(file);
+              }
+            }}
+          />
+        </StyledFileLabel>
+        {canListen && (
+          <StyledSecondary type="button" onClick={onListen}>
+            {t`Listen`}
+          </StyledSecondary>
+        )}
+        <StyledPrimary
+          type="button"
+          disabled={text.trim().length === 0}
+          onClick={onPreview}
+        >
+          {t`Preview capture`}
+        </StyledPrimary>
+      </StyledActions>
+    </>
+  );
+};
+
+const SkillList = ({
+  skills,
+  onRun,
+}: {
+  skills: AiSkill[];
+  onRun: (skill: AiSkill) => void;
+}) => {
+  const { t } = useLingui();
+
+  if (skills.length === 0) {
+    return <StyledNotice>{t`No saved skills.`}</StyledNotice>;
+  }
+
+  return (
+    <StyledList>
+      {skills.map((skill) => (
+        <li key={skill.id}>
+          <span>
+            {skill.name}
+            {skill.tools.length > 0 ? ` (${skill.tools.join(', ')})` : ''}
+          </span>{' '}
+          <StyledSecondary type="button" onClick={() => onRun(skill)}>
+            {t`Run`}
+          </StyledSecondary>
+        </li>
+      ))}
+    </StyledList>
+  );
+};
 
 const AnswerList = ({ answer }: { answer: AiAnswer }) => (
   <>

@@ -1,3 +1,4 @@
+import { AiRecordTableFieldPreview } from '@/ai-command-bar/components/AiRecordTableFieldPreview';
 import { FieldContext } from '@/object-record/record-field/ui/contexts/FieldContext';
 import { useIsFieldInputOnly } from '@/object-record/record-field/ui/hooks/useIsFieldInputOnly';
 import { useRecordTableBodyContextOrThrow } from '@/object-record/record-table/contexts/RecordTableBodyContext';
@@ -32,6 +33,7 @@ export const RecordTableCellDisplayMode = ({
       onClick={handleClick}
     >
       {children}
+      <AiRecordTableFieldPreview />
     </RecordTableCellDisplayContainer>
   );
 };
