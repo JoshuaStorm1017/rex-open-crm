@@ -500,3 +500,5 @@ const main = () => {
   moduleIndexFiles.forEach(createTypeScriptFile);
 };
 main();
+// tsx keeps the event loop open when nx pipes stdin, so database:init never finishes.
+process.exit(0);

@@ -47,7 +47,7 @@
         "{projectRoot}/src/**/*/index.ts",
         "{projectRoot}/package.json"
       ],
-      "options": { "command": "tsx {projectRoot}/scripts/generateBarrels.ts" }
+      "options": { "command": "tsx {projectRoot}/scripts/generateBarrels.ts < /dev/null" }
     },
     "generateIconDictionary": {
       "executor": "nx:run-commands",
