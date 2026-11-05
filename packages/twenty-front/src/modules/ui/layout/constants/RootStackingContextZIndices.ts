@@ -12,4 +12,5 @@ export enum RootStackingContextZIndices {
   WelcomeOverlay = 10000,
   Toaster = 10002,
   NotFound = 10001,
+  AiCommandBar = 10003,
 }

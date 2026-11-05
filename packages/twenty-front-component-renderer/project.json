@@ -40,11 +40,11 @@
       ],
       "options": {
         "cwd": "packages/twenty-front-component-renderer",
-        "command": "tsx -r tsconfig-paths/register scripts/remote-dom/generate-remote-dom-elements.ts"
+        "command": "tsx -r tsconfig-paths/register scripts/remote-dom/generate-remote-dom-elements.ts < /dev/null"
       },
       "configurations": {
         "verbose": {
-          "command": "tsx -r tsconfig-paths/register scripts/remote-dom/generate-remote-dom-elements.ts --verbose"
+          "command": "tsx -r tsconfig-paths/register scripts/remote-dom/generate-remote-dom-elements.ts --verbose < /dev/null"
         }
       }
     },

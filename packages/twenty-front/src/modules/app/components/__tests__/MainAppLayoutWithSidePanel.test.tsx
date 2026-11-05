@@ -57,6 +57,10 @@ jest.mock('@/log-console/components/LogConsole', () => ({
   LogConsole: () => null,
 }));
 
+jest.mock('@/ai-command-bar/components/AiCommandBar', () => ({
+  AiCommandBar: () => null,
+}));
+
 jest.mock('@/side-panel/routing/components/SidePanelPathUrlSyncEffect', () => ({
   SidePanelPathUrlSyncEffect: () => null,
 }));

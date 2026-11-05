@@ -4,6 +4,7 @@ export type CreatePersonInput = {
   lastName: string;
   email?: string;
   jobTitle?: string;
+  phone?: string;
   companyId?: string;
 };
 
@@ -24,19 +25,72 @@ export type CreateOpportunityInput = {
   closeDate?: string;
 };
 
+export type CreateNoteInput = {
+  workspaceId: string;
+  title?: string;
+  body: string;
+  targetObject: 'person' | 'company' | 'opportunity';
+  targetId?: string;
+  targetQuery?: string;
+};
+
 export type TwentyObjectName = 'person' | 'company' | 'opportunity';
+
+export type DeletableObjectName = TwentyObjectName | 'note' | 'noteTarget';
+
+export type RecordComposites = {
+  additionalEmails?: string[];
+  primaryLinkLabel?: string;
+  secondaryLinks?: Array<Record<string, string>>;
+};
 
 export type CreatedRecord = {
   id: string;
-  objectName: TwentyObjectName;
+  objectName: TwentyObjectName | 'note';
   workspaceId: string;
   properties: Record<string, string | number>;
+  etag: string;
+  label: string;
+  composites?: RecordComposites;
+};
+
+export type SearchRecordsInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  query: string;
+  limit: number;
+};
+
+export type GetRecordInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+};
+
+export type UpdateRecordInput = {
+  workspaceId: string;
+  objectName: TwentyObjectName;
+  id: string;
+  field: string;
+  value: string | number;
+  ifMatch: string;
+};
+
+export type DeleteRecordInput = {
+  workspaceId: string;
+  objectName: DeletableObjectName;
+  id: string;
 };
 
 export type TwentyCrmClient = {
   createPerson: (input: CreatePersonInput) => Promise<CreatedRecord>;
   createCompany: (input: CreateCompanyInput) => Promise<CreatedRecord>;
   createOpportunity: (input: CreateOpportunityInput) => Promise<CreatedRecord>;
+  createNote: (input: CreateNoteInput) => Promise<CreatedRecord>;
+  searchRecords: (input: SearchRecordsInput) => Promise<CreatedRecord[]>;
+  getRecord: (input: GetRecordInput) => Promise<CreatedRecord>;
+  updateRecord: (input: UpdateRecordInput) => Promise<CreatedRecord>;
+  deleteRecord: (input: DeleteRecordInput) => Promise<void>;
 };
 
 function withDefinedStrings(
@@ -61,6 +115,7 @@ export function personProperties(
     lastName: input.lastName,
     email: input.email,
     jobTitle: input.jobTitle,
+    phone: input.phone,
     companyId: input.companyId,
   });
 }

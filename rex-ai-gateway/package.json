@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Thin allowlisted tool gateway that creates Twenty people, companies, and opportunities.",
+  "description": "Allowlisted tool gateway for Twenty people, companies, and opportunities.",
   "engines": {
     "node": ">=22"
   },

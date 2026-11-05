@@ -4,9 +4,14 @@ export const ALLOWED_TOOL_NAMES = [
   'create_person',
   'create_company',
   'create_opportunity',
+  'create_note',
+  'search_records',
+  'update_record',
 ] as const;
 
 export type AllowedToolName = (typeof ALLOWED_TOOL_NAMES)[number];
+
+export const MAX_TOOLS_PER_REQUEST = 8;
 
 export type ToolCall = {
   name: string;
@@ -18,7 +23,14 @@ export type RefusalReason =
   | 'unknown_tool'
   | 'missing_required_fields'
   | 'cross_workspace'
-  | 'unmapped_intent';
+  | 'unmapped_intent'
+  | 'unsafe_intent'
+  | 'ambiguous_intent'
+  | 'not_found'
+  | 'precondition_failed'
+  | 'unauthorized'
+  | 'idempotency_conflict'
+  | 'confirmation_required';
 
 export type ActRefusal = {
   ok: false;
@@ -36,19 +48,71 @@ export type ActUpstreamFailure = {
   message: string;
 };
 
+export type ActPartialFailure = {
+  ok: false;
+  refused: false;
+  reason: 'partial_failure';
+  message: string;
+  remainingRecordIds: string[];
+};
+
 export type CreatedToolResult = {
-  tool: AllowedToolName;
+  tool: 'create_person' | 'create_company' | 'create_opportunity' | 'create_note';
   status: 'created';
   record: CreatedRecord;
 };
 
+export type SearchToolResult = {
+  tool: 'search_records';
+  status: 'found';
+  records: CreatedRecord[];
+};
+
+export type UpdatedToolResult = {
+  tool: 'update_record';
+  status: 'updated';
+  record: CreatedRecord;
+};
+
+export type ToolResult = CreatedToolResult | SearchToolResult | UpdatedToolResult;
+
 export type ActSuccess = {
   ok: true;
   workspaceId: string;
-  results: CreatedToolResult[];
+  results: ToolResult[];
 };
 
-export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure;
+export type ActResult = ActSuccess | ActRefusal | ActUpstreamFailure | ActPartialFailure;
+
+export type ProposalLine = {
+  tool: AllowedToolName;
+  summary: string;
+};
+
+export type PlanChoice = {
+  prompt: string;
+  candidates: Array<{
+    id: string;
+    label: string;
+    objectName: 'person' | 'company' | 'opportunity';
+  }>;
+};
+
+export type PlanProposal = {
+  id: string;
+  summary: string;
+  tools: ToolCall[];
+  lines: ProposalLine[];
+  choice?: PlanChoice;
+};
+
+export type PlanSuccess = {
+  ok: true;
+  workspaceId: string;
+  proposal: PlanProposal;
+};
+
+export type PlanResult = PlanSuccess | ActRefusal | ActUpstreamFailure;
 
 export function refusal(
   reason: RefusalReason,
@@ -62,5 +126,20 @@ export function refusal(
     message,
     ...(extra?.toolName ? { toolName: extra.toolName } : {}),
     ...(extra?.missingFields ? { missingFields: extra.missingFields } : {}),
+  };
+}
+
+export function upstreamFailure(error: unknown, completedCount: number): ActUpstreamFailure {
+  const detail = error instanceof Error ? error.message : 'Twenty request failed';
+  const message =
+    completedCount > 0
+      ? `Twenty request failed after ${completedCount} tool(s) succeeded. ${detail}`
+      : detail;
+
+  return {
+    ok: false,
+    refused: false,
+    reason: 'upstream_error',
+    message: message.replace(/\s+/g, ' ').trim().slice(0, 500),
   };
 }

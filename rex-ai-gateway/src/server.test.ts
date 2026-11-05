@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { isRecord } from './is-record';
+import { IdempotencyStore } from './http/idempotency-store';
+import { CrmPartialWriteError } from './twenty/crm-errors';
 import { createMockTwentyCrmClient } from './twenty/mock-twenty-crm-client';
 import { startGateway, type RunningGateway } from './server';
 
@@ -337,7 +339,31 @@ describe('POST /v1/ai/act', () => {
     expect(payload).toMatchObject({
       ok: false,
       refused: true,
-      reason: 'unmapped_intent',
+      reason: 'unsafe_intent',
+    });
+    expect(client.created).toHaveLength(0);
+  });
+
+  it('does not write a tools array that was not confirmed from a preview', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      confirmed: true,
+      tools: [
+        {
+          name: 'create_company',
+          args: { name: 'Analytical Engines' },
+        },
+      ],
+    });
+
+    expect(response.status).toBe(400);
+    expect(payload).toMatchObject({
+      ok: false,
+      refused: true,
+      reason: 'confirmation_required',
     });
     expect(client.created).toHaveLength(0);
   });
@@ -366,6 +392,150 @@ describe('POST /v1/ai/act', () => {
       reason: 'upstream_error',
     });
   });
+
+  it('refuses a new idempotency key instead of forgetting an old one', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await startGateway({
+      client,
+      port: 0,
+      idempotency: new IdempotencyStore(1),
+    });
+    closers.push(() => gateway.close());
+
+    const firstPlan = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [{ name: 'create_company', args: { name: 'Analytical Engines' } }],
+    });
+    const first = await postJson(
+      gateway,
+      '/v1/ai/act',
+      {
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        proposalId: proposalId(firstPlan.payload),
+      },
+      { 'idempotency-key': 'first-company-key' },
+    );
+    const secondPlan = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [{ name: 'create_company', args: { name: 'Other Engines' } }],
+    });
+    const second = await postJson(
+      gateway,
+      '/v1/ai/act',
+      {
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        proposalId: proposalId(secondPlan.payload),
+      },
+      { 'idempotency-key': 'second-company-key' },
+    );
+
+    expect(first.response.status).toBe(200);
+    expect(second.response.status).toBe(503);
+    expect(second.payload).toMatchObject({ refused: true, reason: 'invalid_request' });
+    expect(client.created.map((record) => record.properties.name)).toEqual([
+      'Analytical Engines',
+    ]);
+  });
+
+  it('rolls back an earlier create when a later tool fails', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createPerson = async () => {
+      throw new Error('person write failed');
+    };
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        { name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } },
+      ],
+    });
+
+    expect(response.status).toBe(502);
+    expect(payload).toMatchObject({ reason: 'upstream_error' });
+    expect(JSON.stringify(payload)).toContain('rolled back');
+    expect(client.created).toHaveLength(0);
+  });
+
+  it('reports records that could not be rolled back', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createPerson = async () => {
+      throw new Error('person write failed');
+    };
+    client.deleteRecord = async () => {
+      throw new Error('delete failed');
+    };
+    const gateway = await openGateway(client);
+
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        { name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } },
+      ],
+    });
+
+    expect(response.status).toBe(409);
+    expect(payload).toMatchObject({ reason: 'partial_failure' });
+    expect(client.created).toHaveLength(1);
+  });
+
+  it('names a note that could not be deleted after a failed link', async () => {
+    const client = createMockTwentyCrmClient();
+    client.createNote = async () => {
+      throw new CrmPartialWriteError('Linking the note failed. The note could not be deleted.', [
+        'note_orphan',
+      ]);
+    };
+    const gateway = await openGateway(client);
+    const { response, payload } = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        { name: 'create_company', args: { name: 'Analytical Engines' } },
+        {
+          name: 'create_note',
+          args: { body: 'A fictional note.', targetObject: 'company', targetId: '$0' },
+        },
+      ],
+    });
+
+    expect(response.status).toBe(409);
+    expect(payload).toMatchObject({
+      reason: 'partial_failure',
+      remainingRecordIds: ['note_orphan'],
+    });
+    expect(client.created).toHaveLength(0);
+  });
+
+  it('refuses an unknown opportunity stage and an unsafe search query', async () => {
+    const client = createMockTwentyCrmClient();
+    const gateway = await openGateway(client);
+    const stage = await postAct(gateway, {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'create_opportunity',
+          args: { name: 'Difference Engine', stage: 'WON' },
+        },
+      ],
+    });
+    const search = await postJson(gateway, '/v1/ai/plan', {
+      workspaceId: 'ws_demo',
+      tools: [
+        {
+          name: 'search_records',
+          args: { object: 'company', query: 'Acme" or name[eq]:"x' },
+        },
+      ],
+    });
+
+    expect(stage.payload).toMatchObject({ refused: true, reason: 'invalid_request' });
+    expect(search.payload).toMatchObject({ refused: true, reason: 'invalid_request' });
+    expect(client.created).toHaveLength(0);
+  });
 });
 
 async function openGateway(
@@ -385,13 +555,56 @@ async function postAct(
   gateway: RunningGateway,
   body: unknown,
 ): Promise<{ response: Response; payload: unknown }> {
-  const response = await fetch(`${gateway.url}/v1/ai/act`, {
+  if (isRecord(body) && body.confirmed === true && !('proposalId' in body)) {
+    return postJson(gateway, '/v1/ai/act', body);
+  }
+
+  const planned = await postJson(gateway, '/v1/ai/plan', body);
+
+  if (
+    !isRecord(planned.payload) ||
+    planned.payload.ok !== true ||
+    !isRecord(planned.payload.proposal) ||
+    typeof planned.payload.proposal.id !== 'string'
+  ) {
+    return planned;
+  }
+
+  const workspaceId =
+    isRecord(body) && typeof body.workspaceId === 'string' ? body.workspaceId : 'ws_demo';
+
+  return postJson(gateway, '/v1/ai/act', {
+    workspaceId,
+    confirmed: true,
+    proposalId: planned.payload.proposal.id,
+  });
+}
+
+async function postJson(
+  gateway: RunningGateway,
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<{ response: Response; payload: unknown }> {
+  const response = await fetch(`${gateway.url}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-rex-member': 'ada@analytical.example',
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
 
   return { response, payload: await response.json() };
+}
+
+function proposalId(payload: unknown): string {
+  return isRecord(payload) &&
+    isRecord(payload.proposal) &&
+    typeof payload.proposal.id === 'string'
+    ? payload.proposal.id
+    : '';
 }
 
 function isSuccess(value: unknown): value is {

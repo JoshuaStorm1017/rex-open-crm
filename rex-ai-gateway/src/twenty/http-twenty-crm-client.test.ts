@@ -2,13 +2,17 @@ import { createServer, type ServerResponse } from 'node:http';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { withMemberCredential } from '../auth/call-context';
 import { isRecord } from '../is-record';
-import { createHttpTwentyCrmClient } from './http-twenty-crm-client';
+import { CrmPartialWriteError, CrmPreconditionError } from './crm-errors';
+import { createHttpTwentyCrmClient, readTwentyApiOrigin } from './http-twenty-crm-client';
 import { startGateway } from '../server';
 
 type CapturedRequest = {
+  method: string | undefined;
   url: string | undefined;
   authorization: string | undefined;
+  ifMatch: string | undefined;
   body: unknown;
 };
 
@@ -19,6 +23,40 @@ afterEach(async () => {
     const close = closers.pop();
     await close?.();
   }
+});
+
+const memberCredential = { kind: 'bearer' as const, token: 'member-access-token-value' };
+
+function createClient(
+  config: Parameters<typeof createHttpTwentyCrmClient>[0],
+): ReturnType<typeof createHttpTwentyCrmClient> {
+  const client = createHttpTwentyCrmClient(config);
+
+  return new Proxy(client, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+
+      if (typeof value !== 'function') {
+        return value;
+      }
+
+      return (...args: unknown[]) =>
+        withMemberCredential(memberCredential, () =>
+          (value as (...inner: unknown[]) => Promise<unknown>).apply(target, args),
+        );
+    },
+  });
+}
+
+describe('readTwentyApiOrigin', () => {
+  it('accepts a loopback http origin and rejects anything else on http', () => {
+    expect(readTwentyApiOrigin('http://127.0.0.1:3000')).toBe('http://127.0.0.1:3000');
+    expect(readTwentyApiOrigin('https://crm.example')).toBe('https://crm.example');
+    expect(() => readTwentyApiOrigin('http://crm.example')).toThrow(/loopback/);
+    expect(() => readTwentyApiOrigin('http://127.0.0.1:3000/rest')).toThrow(/path/);
+    expect(() => readTwentyApiOrigin('http://user:pass@127.0.0.1:3000')).toThrow(/credentials/);
+    expect(() => readTwentyApiOrigin('file:///tmp/twenty')).toThrow(/http/);
+  });
 });
 
 describe('createHttpTwentyCrmClient', () => {
@@ -36,9 +74,8 @@ describe('createHttpTwentyCrmClient', () => {
       });
     });
 
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'rest',
     });
 
@@ -75,7 +112,7 @@ describe('createHttpTwentyCrmClient', () => {
       '/rest/companies',
       '/rest/opportunities',
     ]);
-    expect(twenty.captured.every((request) => request.authorization === 'Bearer test-workspace-key')).toBe(true);
+    expect(twenty.captured.every((request) => request.authorization === 'Bearer member-access-token-value')).toBe(true);
     expect(twenty.captured[0]?.body).toEqual({
       name: { firstName: 'Ada', lastName: 'Lovelace' },
       emails: {
@@ -109,9 +146,8 @@ describe('createHttpTwentyCrmClient', () => {
       });
     });
 
-    const client = createHttpTwentyCrmClient({
+    const client = createClient({
       apiUrl: twenty.url,
-      apiKey: 'test-workspace-key',
       style: 'graphql',
     });
 
@@ -135,7 +171,7 @@ describe('createHttpTwentyCrmClient', () => {
     expect(query).toContain('PersonCreateInput');
   });
 
-  it('forwards a gateway act call through the HTTP client', async () => {
+  it('forwards a confirmed gateway act call through the HTTP client', async () => {
     const twenty = await startFakeTwenty((_captured, response) => {
       sendJson(response, 201, {
         data: { createPerson: { id: 'person_from_twenty' } },
@@ -143,19 +179,56 @@ describe('createHttpTwentyCrmClient', () => {
     });
     const gateway = await startGateway({
       port: 0,
-      client: createHttpTwentyCrmClient({
+      client: createClient({
         apiUrl: twenty.url,
-        apiKey: 'test-workspace-key',
       }),
     });
     closers.push(() => gateway.close());
 
-    const response = await fetch(`${gateway.url}/v1/ai/act`, {
+    const planned = await fetch(`${gateway.url}/v1/ai/plan`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
       body: JSON.stringify({
         workspaceId: 'ws_demo',
         intent: 'create person Ada Lovelace email ada@analytical.example',
+      }),
+    });
+    const planPayload: unknown = await planned.json();
+    const proposalId =
+      isRecord(planPayload) &&
+      isRecord(planPayload.proposal) &&
+      typeof planPayload.proposal.id === 'string'
+        ? planPayload.proposal.id
+        : '';
+    const direct = await fetch(`${gateway.url}/v1/ai/act`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
+      body: JSON.stringify({
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        tools: [{ name: 'create_person', args: { firstName: 'Ada', lastName: 'Lovelace' } }],
+      }),
+    });
+
+    expect(direct.status).toBe(400);
+    expect(twenty.captured).toHaveLength(0);
+
+    const response = await fetch(`${gateway.url}/v1/ai/act`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-rex-member': 'ada@analytical.example',
+      },
+      body: JSON.stringify({
+        workspaceId: 'ws_demo',
+        confirmed: true,
+        proposalId,
       }),
     });
     const payload: unknown = await response.json();
@@ -182,6 +255,190 @@ describe('createHttpTwentyCrmClient', () => {
     });
     expect(twenty.captured[0]?.url).toBe('/rest/people');
   });
+
+  it('searches companies and patches only when If-Match matches', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      const url = captured.url ?? '';
+
+      if (captured.method === 'GET' && url.startsWith('/rest/companies?')) {
+        sendJson(response, 200, {
+          data: {
+            companies: [
+              {
+                id: 'company_row',
+                name: 'Analytical Engines',
+                updatedAt: '2026-01-01T00:00:00.000Z',
+                domainName: { primaryLinkUrl: 'https://analytical.example' },
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (captured.method === 'GET' && url.startsWith('/rest/companies/company_row')) {
+        sendJson(response, 200, {
+          data: {
+            company: {
+              id: 'company_row',
+              name: 'Analytical Engines',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              domainName: { primaryLinkUrl: 'https://analytical.example' },
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        data: {
+          updateCompanies: [
+            {
+              id: 'company_row',
+              updatedAt: '2026-01-02T00:00:00.000Z',
+            },
+          ],
+        },
+      });
+    });
+    const client = createClient({
+      apiUrl: twenty.url,
+      style: 'rest',
+    });
+
+    const found = await client.searchRecords({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      query: 'Analytical',
+      limit: 10,
+    });
+
+    expect(found).toMatchObject([
+      {
+        id: 'company_row',
+        etag: '2026-01-01T00:00:00.000Z',
+        properties: { name: 'Analytical Engines' },
+      },
+    ]);
+    expect(decodeURIComponent(twenty.captured[0]?.url ?? '')).toContain(
+      'name[ilike]:"%Analytical%"',
+    );
+
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'company',
+        id: 'company_row',
+        field: 'domain',
+        value: 'engines.example',
+        ifMatch: 'stale-etag',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+    expect(twenty.captured.filter((request) => request.method === 'PATCH')).toHaveLength(0);
+
+    const updated = await client.updateRecord({
+      workspaceId: 'ws_demo',
+      objectName: 'company',
+      id: 'company_row',
+      field: 'domain',
+      value: 'engines.example',
+      ifMatch: '2026-01-01T00:00:00.000Z',
+    });
+    const patch = twenty.captured.find((request) => request.method === 'PATCH');
+
+    expect(updated.etag).toBe('2026-01-02T00:00:00.000Z');
+    expect(updated.properties.domain).toBe('engines.example');
+    expect(decodeURIComponent(patch?.url ?? '')).toContain(
+      'and(id[eq]:"company_row",updatedAt[eq]:"2026-01-01T00:00:00.000Z")',
+    );
+    expect(patch?.ifMatch).toBeUndefined();
+    expect(patch?.body).toEqual({
+      domainName: {
+        primaryLinkUrl: 'https://engines.example',
+        primaryLinkLabel: '',
+        secondaryLinks: [],
+      },
+    });
+    expect(JSON.stringify(patch?.body)).not.toContain('ws_demo');
+  });
+
+  it('does not request a traversed record id and reports a note delete that failed', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'POST' && captured.url === '/rest/notes') {
+        sendJson(response, 201, { data: { createNote: { id: 'note_orphan', updatedAt: 'v1' } } });
+        return;
+      }
+
+      sendJson(response, 500, { data: {} });
+    });
+    const client = createClient({ apiUrl: twenty.url, style: 'rest' });
+
+    await expect(
+      client.deleteRecord({ workspaceId: 'ws_demo', objectName: 'note', id: '../metadata' }),
+    ).rejects.toThrow(/unsafe record id/);
+    expect(twenty.captured).toHaveLength(0);
+
+    await expect(
+      client.createNote({
+        workspaceId: 'ws_demo',
+        body: 'A fictional note.',
+        targetObject: 'company',
+        targetId: 'company_row',
+      }),
+    ).rejects.toBeInstanceOf(CrmPartialWriteError);
+    expect(twenty.captured.map((request) => request.url)).toEqual([
+      '/rest/notes',
+      '/rest/noteTargets',
+      '/rest/notes/note_orphan',
+    ]);
+  });
+
+  it('keeps additional emails when the primary email changes and writes nothing on a lost race', async () => {
+    const twenty = await startFakeTwenty((captured, response) => {
+      if (captured.method === 'GET') {
+        sendJson(response, 200, {
+          data: {
+            person: {
+              id: 'person_row',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              name: { firstName: 'Ada', lastName: 'Lovelace' },
+              emails: {
+                primaryEmail: 'ada@analytical.example',
+                additionalEmails: ['ada.archive@analytical.example'],
+              },
+            },
+          },
+        });
+        return;
+      }
+
+      sendJson(response, 200, { data: { updatePeople: [] } });
+    });
+    const client = createClient({
+      apiUrl: twenty.url,
+      style: 'rest',
+    });
+
+    await expect(
+      client.updateRecord({
+        workspaceId: 'ws_demo',
+        objectName: 'person',
+        id: 'person_row',
+        field: 'email',
+        value: 'ada.office@analytical.example',
+        ifMatch: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(CrmPreconditionError);
+
+    const patch = twenty.captured.find((request) => request.method === 'PATCH');
+
+    expect(patch?.body).toEqual({
+      emails: {
+        primaryEmail: 'ada.office@analytical.example',
+        additionalEmails: ['ada.archive@analytical.example'],
+      },
+    });
+  });
 });
 
 async function startFakeTwenty(
@@ -197,8 +454,12 @@ async function startFakeTwenty(
 
     const text = Buffer.concat(chunks).toString('utf8');
     const entry: CapturedRequest = {
+      method: request.method,
       url: request.url,
       authorization: request.headers.authorization,
+      ifMatch: Array.isArray(request.headers['if-match'])
+        ? request.headers['if-match'][0]
+        : request.headers['if-match'],
       body: text.length === 0 ? undefined : JSON.parse(text),
     };
     captured.push(entry);

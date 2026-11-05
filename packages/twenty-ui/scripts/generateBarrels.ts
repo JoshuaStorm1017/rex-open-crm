@@ -594,3 +594,5 @@ const main = () => {
   createTypeScriptFile(generateIndividualEntry(moduleDirectories));
 };
 main();
+// tsx keeps the event loop open when nx pipes stdin, so dependent tasks never finish.
+process.exit(0);
