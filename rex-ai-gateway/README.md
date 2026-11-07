@@ -276,3 +276,7 @@ NX_DAEMON=false NX_ISOLATE_PLUGINS=false yarn nx database:init twenty-server
 Postgres and Redis must already be listening. `packages/twenty-utils/setup-dev-env.sh` starts them when Docker or local packages are available. On a host where service start is blocked, `pg_ctlcluster 16 main start` and `redis-server --daemonize yes` are enough. Copy `packages/twenty-server/.env.example` to `packages/twenty-server/.env` before the server boots. The dev sign-in form is prefilled; use Continue with Email.
 
 REST posts JSON to `/rest/people`, `/rest/companies`, `/rest/opportunities`, `/rest/notes`, and `/rest/noteTargets`. GraphQL posts to `/graphql` with the matching mutations. The member credential's Twenty workspace is the one that receives the rows. The gateway does not add its `ws_*` token to the Twenty payload.
+
+## Development orchestration
+
+`rex-dev-pipeline` is a separate pilot. It does not change plan or confirm. A CRM write still waits for a stored preview id. The pipeline uses the same shape for code: pin a contract, keep tests and review bound to a commit SHA, and require a recorded owner approval before a simulated merge. Live effects stay off. See `rex-dev-pipeline/README.md`.
