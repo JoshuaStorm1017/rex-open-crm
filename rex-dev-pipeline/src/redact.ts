@@ -1,6 +1,8 @@
 const BEARER_PATTERN = /Bearer\s+[A-Za-z0-9._~+/-]+=*/gi;
 const TOKEN_PATTERN =
   /\b(sk|rk|pk|ghp|github_pat|xox[baprs]|cursor)_[A-Za-z0-9_-]+/g;
+const CURSOR_KEY_PATTERN = /\b(crsr|key)_[A-Za-z0-9_-]{8,}/g;
+const SLACK_TOKEN_PATTERN = /\bxox[baprs]-[A-Za-z0-9-]{8,}/g;
 const SK_PREFIX_PATTERN = /\b(sk|rk|pk)-[A-Za-z0-9_-]+/g;
 const ASSIGNED_SECRET_PATTERN =
   /(api[_-]?key|authorization|secret|token|password|credential)\s*[:=]\s*\S+/gi;
@@ -16,6 +18,8 @@ export function redact(value: string): string {
     .replace(BEARER_PATTERN, 'Bearer [redacted]')
     .replace(ASSIGNED_SECRET_PATTERN, '$1=[redacted]')
     .replace(TOKEN_PATTERN, '[redacted]')
+    .replace(CURSOR_KEY_PATTERN, '[redacted]')
+    .replace(SLACK_TOKEN_PATTERN, '[redacted]')
     .replace(SK_PREFIX_PATTERN, '[redacted]');
 }
 

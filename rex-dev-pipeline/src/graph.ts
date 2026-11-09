@@ -42,6 +42,12 @@ export const PIPELINE_EDGES: readonly PipelineEdge[] = [
     decidedBy: 'code',
   },
   {
+    from: 'pinned_contract',
+    to: 'reconciling',
+    on: 'outcome_unknown',
+    decidedBy: 'code',
+  },
+  {
     from: 'implementation',
     to: 'trusted_tests',
     on: 'implementation_result',
@@ -150,6 +156,12 @@ export const PIPELINE_EDGES: readonly PipelineEdge[] = [
     decidedBy: 'code',
   },
   {
+    from: 'guarded_merge',
+    to: 'reconciling',
+    on: 'outcome_unknown',
+    decidedBy: 'code',
+  },
+  {
     from: 'reconciling',
     to: 'implementation',
     on: 'reconciled',
@@ -170,6 +182,18 @@ export const PIPELINE_EDGES: readonly PipelineEdge[] = [
   {
     from: 'reconciling',
     to: 'bounded_repair',
+    on: 'reconciled',
+    decidedBy: 'code',
+  },
+  {
+    from: 'reconciling',
+    to: 'pinned_contract',
+    on: 'reconciled_absent',
+    decidedBy: 'code',
+  },
+  {
+    from: 'reconciling',
+    to: 'guarded_merge',
     on: 'reconciled',
     decidedBy: 'code',
   },
@@ -212,6 +236,18 @@ export function isDocumentedTransition(
     return true;
   }
 
+  // Block is an overlay because invalidation, test failure, and approval
+  // problems enter it from more than one state. Verified, failed, and paused
+  // do not.
+  if (
+    to === 'blocked' &&
+    from !== 'verified' &&
+    from !== 'failed' &&
+    from !== 'paused'
+  ) {
+    return true;
+  }
+
   if (from === 'paused' && RESUME_TARGETS.has(to)) {
     return true;
   }
@@ -233,7 +269,9 @@ export function formatGraph(current?: PipelineState): string {
     lines.push(`  ${edge.from} -> ${edge.to} [label="${edge.on}"];`);
   }
 
-  lines.push('  // paused, failed, and resume edges are code-owned overlays');
+  lines.push(
+    '  // paused, failed, blocked, and resume edges are code-owned overlays',
+  );
   lines.push('}');
 
   return lines.join('\n');

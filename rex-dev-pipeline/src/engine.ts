@@ -3,9 +3,9 @@ import { randomUUID } from 'node:crypto';
 import type { PipelineAdapter } from './adapters/types';
 import { hashSources } from './context';
 import { parseArtifact } from './evidence';
-import { formatGraphText } from './graph';
+import { formatGraphText, isDocumentedTransition } from './graph';
 import { buildPrompt } from './prompt';
-import { createLog, redactValue, type PipelineLog } from './redact';
+import { createLog, isRecord, redactValue, type PipelineLog } from './redact';
 import { PipelineStore } from './store';
 import {
   isActiveState,
@@ -220,6 +220,15 @@ export class DevPipeline {
           return this.stopped(this.must(runId), 'reconciling', dispatched);
         }
 
+        if (action === 'paused') {
+          return this.stopped(
+            this.must(runId),
+            'paused',
+            dispatched,
+            'paused_no_effect',
+          );
+        }
+
         continue;
       }
 
@@ -270,6 +279,10 @@ export class DevPipeline {
       return this.refuse(run, 'approval_effect_invalid', 'approval');
     }
 
+    if (!Number.isFinite(input.expiresAt)) {
+      return this.refuse(run, 'approval_expiry_invalid', 'approval');
+    }
+
     if (input.expiresAt <= this.now()) {
       this.block(run, 'approval_expired');
       return this.refuse(this.must(runId), 'approval_expired', 'approval');
@@ -311,6 +324,22 @@ export class DevPipeline {
         run,
         run.state === 'verified' ? 'verified' : 'failed',
         [],
+      );
+    }
+
+    const promotable =
+      run.state === 'guarded_merge' ||
+      run.state === 'human_merge_approval' ||
+      (run.state === 'blocked' &&
+        (run.blockReason === 'approval_missing' ||
+          run.blockReason === 'approval_expired'));
+
+    if (!promotable) {
+      return this.stopped(
+        run,
+        run.state === 'blocked' ? 'blocked' : 'awaiting_approval',
+        [],
+        run.blockReason ?? 'merge_not_due',
       );
     }
 
@@ -405,11 +434,7 @@ export class DevPipeline {
       return this.refuse(run, 'commit_sha_invalid', 'commit_advanced');
     }
 
-    if (
-      run.state === 'paused' ||
-      run.state === 'failed' ||
-      run.state === 'verified'
-    ) {
+    if (run.state !== 'human_merge_approval') {
       return this.refuse(run, 'commit_change_refused', 'commit_advanced');
     }
 
@@ -430,6 +455,15 @@ export class DevPipeline {
 
   invalidateContext(runId: string, reason: string): ApplyResult {
     const run = this.must(runId);
+
+    if (isTerminalState(run.state)) {
+      return this.refuse(run, 'terminal', 'invalidate_context');
+    }
+
+    if (run.state === 'paused') {
+      return this.refuse(run, 'paused_no_effect', 'invalidate_context');
+    }
+
     const contract = run.contract;
 
     if (!contract) {
@@ -939,6 +973,22 @@ export class DevPipeline {
       return { effectId, stop: 'failed', reason: 'effect_missing' };
     }
 
+    // Pause during the await must win. The effect stays unknown until resume.
+    if (this.must(run.id).state === 'paused' && !latest.terminal) {
+      if ('externalId' in result && result.externalId) {
+        latest.externalId = result.externalId;
+      }
+
+      latest.status = 'unknown';
+      latest.outcome = { outcome: result.outcome, held: 'paused' };
+      this.store.saveEffect(latest);
+      this.markLatestOutbox(effectId, 'unknown', {
+        outcome: result.outcome,
+        held: 'paused',
+      });
+      return { effectId, stop: 'paused', reason: 'paused_no_effect' };
+    }
+
     if (latest.terminal) {
       this.rememberExternalId(latest, result, role);
       this.markLatestOutbox(effectId, 'duplicate', {
@@ -964,6 +1014,23 @@ export class DevPipeline {
       this.finishEffect(latest, 'refused', { reason: result.reason });
       this.markLatestOutbox(effectId, 'delivered', result);
       return { effectId, stop: 'result_refused', reason: result.reason };
+    }
+
+    if (
+      role === 'reviewer' &&
+      result.outcome === 'accepted' &&
+      result.externalId === this.must(run.id).writerExternalId
+    ) {
+      latest.externalId = result.externalId;
+      this.finishEffect(latest, 'refused', { reason: 'writer_cannot_review' });
+      this.markLatestOutbox(effectId, 'delivered', {
+        reason: 'writer_cannot_review',
+      });
+      return {
+        effectId,
+        stop: 'result_refused',
+        reason: 'writer_cannot_review',
+      };
     }
 
     this.rememberExternalId(latest, result, role);
@@ -1004,7 +1071,9 @@ export class DevPipeline {
     return { effectId, stop: 'awaiting_result' };
   }
 
-  private async reconcile(effectId: string): Promise<'stay' | 'continue'> {
+  private async reconcile(
+    effectId: string,
+  ): Promise<'stay' | 'continue' | 'paused'> {
     // A lost response may still have created the agent or delivered a follow-up.
     // Cursor follow-ups have no idempotency key, so this read happens before any resend.
     const effect = this.store.findEffect(effectId);
@@ -1024,6 +1093,10 @@ export class DevPipeline {
     }
 
     this.log.write(`reconcile ${effect.id} ${result.outcome}`);
+
+    if (this.must(effect.runId).state === 'paused') {
+      return 'paused';
+    }
 
     if (result.outcome === 'uncertain') {
       effect.status = 'unknown';
@@ -1091,6 +1164,21 @@ export class DevPipeline {
     artifact: ArtifactPayload,
   ): ApplyResult {
     const run = this.must(effect.runId);
+
+    if (!artifactMatchesEffect(effect, artifact)) {
+      this.finishEffect(effect, 'refused', {
+        reason: 'artifact_effect_mismatch',
+      });
+      return this.result(run, false, 'refused', 'artifact_effect_mismatch');
+    }
+
+    if (!artifactStateAllowed(run.state, artifact.kind)) {
+      this.finishEffect(effect, 'refused', {
+        reason: 'artifact_state_mismatch',
+      });
+      return this.result(run, false, 'refused', 'artifact_state_mismatch');
+    }
+
     this.countAgent(this.store.findEffect(effect.id) ?? effect);
 
     if (artifact.kind === 'implementation') {
@@ -1135,6 +1223,13 @@ export class DevPipeline {
     ) {
       this.finishEffect(effect, 'refused', { reason: 'stale_context' });
       return this.result(run, false, 'refused', 'stale_context');
+    }
+
+    if (run.state === 'blocked') {
+      this.finishEffect(effect, 'refused', {
+        reason: run.blockReason ?? 'blocked',
+      });
+      return this.result(run, false, 'refused', run.blockReason ?? 'blocked');
     }
 
     if (run.headSha && run.headSha !== artifact.commitSha) {
@@ -1247,8 +1342,23 @@ export class DevPipeline {
       return this.result(run, false, 'refused', 'reviewer_not_assigned');
     }
 
+    const storedEffect = this.store.findEffect(effect.id) ?? effect;
+
+    if (
+      storedEffect.externalId !== null &&
+      storedEffect.externalId === run.writerExternalId
+    ) {
+      this.finishEffect(effect, 'refused', { reason: 'writer_cannot_review' });
+      return this.result(run, false, 'refused', 'writer_cannot_review');
+    }
+
     if (!run.headSha || artifact.commitSha !== run.headSha) {
       return this.result(run, false, 'refused', 'stale_sha');
+    }
+
+    if (!this.freshPassingTests(run)) {
+      this.finishEffect(effect, 'refused', { reason: 'tests_required' });
+      return this.result(run, false, 'refused', 'tests_required');
     }
 
     this.store.insertArtifact({
@@ -1318,6 +1428,12 @@ export class DevPipeline {
         'refused',
         blocked.blockReason ?? 'approval_missing',
       );
+    }
+
+    if (!this.freshPassingTests(run) || !this.freshAcceptReview(run)) {
+      this.finishEffect(effect, 'refused', { reason: 'evidence_required' });
+      const blocked = this.block(this.must(run.id), 'evidence_required');
+      return this.result(blocked, false, 'refused', 'evidence_required');
     }
 
     if (
@@ -1444,6 +1560,53 @@ export class DevPipeline {
     return 'approval_missing';
   }
 
+  private freshPassingTests(run: RunRecord): boolean {
+    const artifact = this.store
+      .listArtifacts(run.id)
+      .filter(
+        (entry) =>
+          entry.kind === 'test_evidence' &&
+          !entry.stale &&
+          entry.commitSha === run.headSha,
+      )
+      .at(-1);
+
+    if (!artifact || !isRecord(artifact.payload)) {
+      return false;
+    }
+
+    const { exitCode, failed, passed } = artifact.payload;
+
+    return (
+      exitCode === 0 &&
+      failed === 0 &&
+      typeof passed === 'number' &&
+      passed >= 1
+    );
+  }
+
+  private freshAcceptReview(run: RunRecord): boolean {
+    const artifact = this.store
+      .listArtifacts(run.id)
+      .filter(
+        (entry) =>
+          entry.kind === 'review' &&
+          !entry.stale &&
+          entry.commitSha === run.headSha,
+      )
+      .at(-1);
+
+    if (!artifact || !isRecord(artifact.payload)) {
+      return false;
+    }
+
+    return (
+      artifact.payload.verdict === 'accept' &&
+      artifact.payload.reviewerId === run.config.reviewerId &&
+      artifact.payload.reviewerId !== run.config.writerId
+    );
+  }
+
   private tick(run: RunRecord): RunRecord {
     if (!isActiveState(run.state)) {
       return run;
@@ -1472,6 +1635,12 @@ export class DevPipeline {
     to: PipelineState,
     reason: string,
   ): RunRecord {
+    if (!isDocumentedTransition(run.state, to)) {
+      throw new Error(
+        `undocumented transition ${run.state} -> ${to} (${reason})`,
+      );
+    }
+
     const next: RunRecord = {
       ...run,
       state: to,
@@ -1794,6 +1963,53 @@ function validateCreate(input: CreateRunInput): string | undefined {
   }
 
   return undefined;
+}
+
+function artifactMatchesEffect(
+  effect: EffectRecord,
+  artifact: ArtifactPayload,
+): boolean {
+  if (artifact.kind === 'implementation') {
+    return (
+      effect.role === 'writer' &&
+      (effect.kind === 'agent_launch' || effect.kind === 'agent_follow_up')
+    );
+  }
+
+  if (artifact.kind === 'test_evidence') {
+    return effect.kind === 'trusted_tests' && effect.role === 'test';
+  }
+
+  if (artifact.kind === 'review') {
+    return effect.kind === 'agent_launch' && effect.role === 'reviewer';
+  }
+
+  return effect.kind === 'guarded_merge' && effect.role === 'merge';
+}
+
+function artifactStateAllowed(
+  state: PipelineState,
+  kind: ArtifactPayload['kind'],
+): boolean {
+  if (kind === 'implementation') {
+    return (
+      state === 'pinned_contract' ||
+      state === 'implementation' ||
+      state === 'bounded_repair' ||
+      state === 'reconciling' ||
+      state === 'blocked'
+    );
+  }
+
+  if (kind === 'test_evidence') {
+    return state === 'trusted_tests' || state === 'reconciling';
+  }
+
+  if (kind === 'review') {
+    return state === 'independent_review' || state === 'reconciling';
+  }
+
+  return state === 'guarded_merge' || state === 'reconciling';
 }
 
 function waitingState(

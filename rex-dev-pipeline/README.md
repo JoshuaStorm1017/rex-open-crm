@@ -31,11 +31,18 @@ authorized_intake -> pinned_contract -> implementation -> trusted_tests
 independent_review -> bounded_repair -> implementation
 trusted_tests -> blocked            (compile or tests failed)
 independent_review -> failed        (repair cap)
+pinned_contract -> reconciling -> pinned_contract
+                                  (unknown launch, then confirmed absent)
+guarded_merge -> reconciling -> guarded_merge
+human_merge_approval -> trusted_tests
+                                  (commit advanced; no other state)
 any active -> paused | reconciling | failed
 paused -> the state that was paused, only after an explicit resume
 ```
 
-`paused` is resumable and performs no adapter call. `reconciling` is resumable and only reads. `blocked` is resumable for a missing or expired approval and for an invalidated context. A test failure blocks review and merge; this pilot does not auto-repair a red test. `failed` and `verified` are terminal.
+`paused` is resumable and performs no adapter call. An in-flight result that returns after pause is held as unknown and read back on resume; it does not move the run. `reconciling` is resumable and only reads. `blocked` is resumable for a missing or expired approval and for an invalidated context. A test failure blocks review and merge; this pilot does not auto-repair a red test. `failed` and `verified` are terminal.
+
+A completion is applied only when its kind matches the open effect and the current state. A review artifact cannot stand in for test evidence, and a merge artifact cannot stand in for a review. `advanceCommit` is only `human_merge_approval -> trusted_tests`. `transition` throws if the state pair is not in the edge list or the pause, fail, block, or resume overlays.
 
 `npm run graph` prints the edge list.
 
