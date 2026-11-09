@@ -727,6 +727,299 @@ describe('dev pipeline', () => {
         (node) => node.state,
       ),
     ).toEqual(['implementation', 'independent_review', 'bounded_repair']);
+    expect(isDocumentedTransition('pinned_contract', 'reconciling')).toBe(
+      true,
+    );
+    expect(isDocumentedTransition('reconciling', 'pinned_contract')).toBe(
+      true,
+    );
+    expect(isDocumentedTransition('guarded_merge', 'reconciling')).toBe(true);
+    expect(isDocumentedTransition('reconciling', 'guarded_merge')).toBe(true);
+    expect(
+      isDocumentedTransition('trusted_tests', 'human_merge_approval'),
+    ).toBe(false);
+    expect(isDocumentedTransition('blocked', 'trusted_tests')).toBe(false);
+    expect(isDocumentedTransition('verified', 'blocked')).toBe(false);
+    expect(isDocumentedTransition('paused', 'verified')).toBe(false);
+    expect(isDocumentedTransition('pinned_contract', 'verified')).toBe(false);
+  });
+
+  it('does not accept a review or merge artifact on the wrong effect', async () => {
+    const reviewOnTest = new ScriptedAdapter([
+      writerPlan(HEAD),
+      {
+        kind: 'trusted_tests',
+        role: 'test',
+        outcome: 'accepted',
+        artifact: (request: EffectRequest) => review(request, 'accept'),
+      },
+      reviewPlan('accept'),
+      mergePlan(),
+    ]);
+    const pipeline = open(reviewOnTest);
+    const runId = mustCreate(pipeline);
+    const pumped = await pipeline.pump(runId);
+    expect(pumped.reason).toBe('artifact_effect_mismatch');
+    expect(pumped.state).toBe('trusted_tests');
+    expect(reviewOnTest.calls.some((call) => call.role === 'reviewer')).toBe(
+      false,
+    );
+    expect((await pipeline.requestMerge(runId)).state).toBe('trusted_tests');
+    pipeline.close();
+
+    const mergeOnReview = new ScriptedAdapter([
+      writerPlan(HEAD),
+      testPlan(),
+      {
+        kind: 'agent_launch',
+        role: 'reviewer',
+        outcome: 'accepted',
+        artifact: (request: EffectRequest): MergeArtifact => ({
+          kind: 'merge',
+          commitSha: request.headSha ?? HEAD,
+          verified: true,
+        }),
+      },
+    ]);
+    const second = open(mergeOnReview);
+    const secondId = mustCreate(second);
+    const reviewed = await second.pump(secondId);
+    expect(reviewed.reason).toBe('artifact_effect_mismatch');
+    expect(second.inspect(secondId).state).toBe('independent_review');
+    expect(reviewed.state).not.toBe('verified');
+    second.close();
+  });
+
+  it('does not let the writer effect approve its own change', async () => {
+    const adapter = new ScriptedAdapter([
+      { kind: 'agent_launch', role: 'writer', outcome: 'accepted' },
+    ]);
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    await pipeline.pump(runId);
+    expect(pipeline.inspect(runId).state).toBe('implementation');
+    expect(pipeline.advanceCommit(runId, NEXT).reason).toBe(
+      'commit_change_refused',
+    );
+    expect(pipeline.inspect(runId).state).toBe('implementation');
+    const request = adapter.calls[0];
+    expect(request).toBeDefined();
+    if (!request) {
+      return;
+    }
+
+    const delivered = pipeline.deliverCompletion({
+      id: 'writer-review',
+      effectId: pipeline.inspect(runId).ledger[0]?.id ?? '',
+      artifact: review(request, 'accept'),
+    });
+    expect(delivered.reason).toBe('artifact_effect_mismatch');
+    expect(pipeline.inspect(runId).state).toBe('implementation');
+    pipeline.close();
+  });
+
+  it('refuses a reviewer launch that reuses the writer agent', async () => {
+    const adapter = new ScriptedAdapter([
+      {
+        kind: 'agent_launch',
+        role: 'writer',
+        outcome: 'accepted',
+        externalId: 'same-agent',
+        artifact: (request: EffectRequest) => implementation(request, HEAD),
+      },
+      testPlan(),
+      {
+        kind: 'agent_launch',
+        role: 'reviewer',
+        outcome: 'accepted',
+        externalId: 'same-agent',
+        artifact: (request: EffectRequest) => review(request, 'accept'),
+      },
+    ]);
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    const pumped = await pipeline.pump(runId);
+    expect(pumped.reason).toBe('writer_cannot_review');
+    expect(pipeline.inspect(runId).state).toBe('independent_review');
+    expect((await pipeline.requestMerge(runId)).state).not.toBe('verified');
+    pipeline.close();
+  });
+
+  it('keeps a test failure blocked when the commit is advanced', async () => {
+    const adapter = new ScriptedAdapter([
+      writerPlan(HEAD),
+      testPlan({ exitCode: 2, passed: 0, failed: 1 }),
+      reviewPlan('accept'),
+      mergePlan(),
+    ]);
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    expect((await pipeline.pump(runId)).reason).toBe('tests_failed');
+    expect(pipeline.advanceCommit(runId, NEXT).reason).toBe(
+      'commit_change_refused',
+    );
+    expect(pipeline.inspect(runId).state).toBe('blocked');
+    const merge = await pipeline.requestMerge(runId);
+    expect(merge.state).toBe('blocked');
+    expect(merge.reason).toBe('tests_failed');
+    expect(adapter.calls.some((call) => call.kind === 'guarded_merge')).toBe(
+      false,
+    );
+    pipeline.close();
+  });
+
+  it('does not merge a run whose context was invalidated after approval', async () => {
+    const adapter = new ScriptedAdapter(happyPlans());
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    await pipeline.pump(runId);
+    expect(
+      pipeline.submitApproval(runId, {
+        approverId: OWNER,
+        commitSha: HEAD,
+        effect: 'guarded_merge',
+        expiresAt: 60_000,
+      }).ok,
+    ).toBe(true);
+    expect(pipeline.invalidateContext(runId, 'source changed').reason).toBe(
+      'context_invalidated',
+    );
+    const merged = await pipeline.requestMerge(runId);
+    expect(merged.state).toBe('blocked');
+    expect(merged.reason).toBe('context_invalidated');
+    expect(adapter.calls.some((call) => call.kind === 'guarded_merge')).toBe(
+      false,
+    );
+    pipeline.close();
+  });
+
+  it('keeps verified terminal and ignores pause-time invalidation', async () => {
+    const adapter = new ScriptedAdapter(happyPlans());
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    await pipeline.pump(runId);
+    pipeline.submitApproval(runId, {
+      approverId: OWNER,
+      commitSha: HEAD,
+      effect: 'guarded_merge',
+      expiresAt: 60_000,
+    });
+    expect((await pipeline.pump(runId)).state).toBe('verified');
+    expect(pipeline.invalidateContext(runId, 'later').reason).toBe('terminal');
+    expect(pipeline.pause(runId, 'operator').reason).toBe('terminal');
+    expect(pipeline.inspect(runId).state).toBe('verified');
+    pipeline.close();
+
+    const waiting = new ScriptedAdapter([
+      { kind: 'agent_launch', role: 'writer', outcome: 'accepted' },
+    ]);
+    const paused = open(waiting);
+    const pausedId = mustCreate(paused);
+    await paused.pump(pausedId);
+    paused.pause(pausedId, 'operator');
+    expect(paused.invalidateContext(pausedId, 'later').reason).toBe(
+      'paused_no_effect',
+    );
+    expect(paused.inspect(pausedId).state).toBe('paused');
+    paused.close();
+  });
+
+  it('holds an in-flight launch when the operator pauses', async () => {
+    const holder: { pipeline?: DevPipeline; runId?: string } = {};
+    const adapter = new ScriptedAdapter([
+      {
+        kind: 'agent_launch',
+        role: 'writer',
+        outcome: 'unknown',
+        record: true,
+        externalId: 'sim-landed',
+        beforeReturn: () => {
+          if (holder.pipeline && holder.runId) {
+            holder.pipeline.pause(holder.runId, 'operator');
+          }
+        },
+      },
+    ]);
+    const pipeline = open(adapter);
+    holder.pipeline = pipeline;
+    const runId = mustCreate(pipeline);
+    holder.runId = runId;
+    const first = await pipeline.pump(runId);
+    expect(first.state).toBe('paused');
+    expect(first.reason).toBe('paused_no_effect');
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.trace).toEqual(['dispatch']);
+    expect(
+      pipeline.inspect(runId).versions.map((version) => version.state),
+    ).not.toContain('reconciling');
+    expect((await pipeline.pump(runId)).state).toBe('paused');
+    expect(adapter.trace).toEqual(['dispatch']);
+    expect(pipeline.resume(runId).ok).toBe(true);
+    const continued = await pipeline.pump(runId);
+    expect(continued.state).toBe('implementation');
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.trace).toEqual(['dispatch', 'reconcile']);
+    pipeline.close();
+  });
+
+  it('refuses a non-owner, a non-finite expiry, and a YES review', async () => {
+    const approvals = open(new ScriptedAdapter(happyPlans()));
+    const approvalId = mustCreate(approvals);
+    await approvals.pump(approvalId);
+    const stranger = approvals.submitApproval(approvalId, {
+      approverId: 'intruder',
+      commitSha: HEAD,
+      effect: 'guarded_merge',
+      expiresAt: 60_000,
+    });
+    expect(stranger.reason).toBe('approver_not_owner');
+    expect(stranger.state).toBe('human_merge_approval');
+    const forever = approvals.submitApproval(approvalId, {
+      approverId: OWNER,
+      commitSha: HEAD,
+      effect: 'guarded_merge',
+      expiresAt: Number.POSITIVE_INFINITY,
+    });
+    expect(forever.reason).toBe('approval_expiry_invalid');
+    expect(approvals.inspect(approvalId).state).toBe('human_merge_approval');
+    approvals.close();
+
+    const adapter = new ScriptedAdapter([
+      writerPlan(HEAD),
+      testPlan(),
+      { kind: 'agent_launch', role: 'reviewer', outcome: 'accepted' },
+    ]);
+    const pipeline = open(adapter);
+    const runId = mustCreate(pipeline);
+    await pipeline.pump(runId);
+    const effectId = pipeline.inspect(runId).ledger.at(-1)?.id ?? '';
+    const yes = pipeline.deliverCompletion({
+      id: 'yes-review',
+      effectId,
+      artifact: {
+        kind: 'review',
+        commitSha: HEAD,
+        reviewerId: REVIEWER,
+        writerId: WRITER,
+        verdict: 'YES',
+        findings: [],
+      },
+    });
+    expect(yes.reason).toBe('review_artifact_invalid');
+    expect(pipeline.inspect(runId).state).toBe('independent_review');
+    pipeline.close();
+  });
+
+  it('redacts cursor-shaped and slack-shaped tokens', () => {
+    const log = createLog();
+    log.write(
+      'crsr_abcdefghijklmnopqrstuvwxyz key_abcdefghijklmnopqrstuvwxyz xoxb-1234567890-abcdef',
+    );
+    const line = log.lines.join('\n');
+    expect(line).not.toContain('crsr_abcdefghijklmnopqrstuvwxyz');
+    expect(line).not.toContain('key_abcdefghijklmnopqrstuvwxyz');
+    expect(line).not.toContain('xoxb-1234567890-abcdef');
+    expect(line).toContain('[redacted]');
   });
 });
 
